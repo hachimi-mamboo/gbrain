@@ -19,8 +19,10 @@ import {
 } from '../core/brain-repo-durability.ts';
 import { divergenceSafePull, detectDefaultBranch, isInsideGitRepo } from '../core/git-remote.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
-import { existsSync } from 'fs';
-import { join } from 'path';
+import {
+  assertClientSourceCheckout,
+  resolveClientSourcePath,
+} from '../core/source-resolver.ts';
 
 interface SourceRow { id: string; local_path: string | null; config: unknown; }
 
@@ -81,15 +83,18 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
 
   const reports: DurabilityReport[] = [];
   for (const row of rows) {
+    const clientPath = all ? null : resolveClientSourcePath(row.id);
+    if (clientPath) assertClientSourceCheckout(row.id, clientPath, row.config);
+    const repoPath = clientPath ?? row.local_path;
     // A source may be a SUBDIRECTORY of a git repo (the bootstrap workspace
     // registers brain/); the durability core resolves the root itself, so the
     // gate only needs "inside a repo", not ".git right here" [CX2-3].
-    if (!row.local_path || !isInsideGitRepo(row.local_path)) {
-      console.error(`[${row.id}] skipped — no local git repo at ${row.local_path ?? '(none)'}`);
+    if (!repoPath || !isInsideGitRepo(repoPath)) {
+      console.error(`[${row.id}] skipped — no local git repo at ${repoPath ?? '(none)'}`);
       continue;
     }
     const report = await hardenBrainRepo({
-      repoPath: row.local_path, sourceId: row.id, branch,
+      repoPath, sourceId: row.id, branch,
       pat: pat?.token, installCron, verify, dryRun,
       logger: json ? undefined : (l) => console.error(`  ${l}`),
     });
@@ -134,11 +139,18 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
       process.exit(2);
     }
     const rows = await engine.executeRaw<SourceRow>(`SELECT id, local_path, config FROM sources WHERE id = $1`, [id]);
-    if (rows.length === 0 || !rows[0].local_path) {
+    if (rows.length === 0) {
+      console.error(`Source "${id}" not found.`);
+      process.exit(1);
+    }
+    const clientPath = resolveClientSourcePath(id);
+    if (clientPath) assertClientSourceCheckout(id, clientPath, rows[0].config);
+    const resolvedPath = clientPath ?? rows[0].local_path;
+    if (!resolvedPath) {
       console.error(`Source "${id}" not found or has no local_path.`);
       process.exit(1);
     }
-    repoPath = rows[0].local_path;
+    repoPath = resolvedPath;
   }
 
   if (!isInsideGitRepo(repoPath)) {
@@ -170,8 +182,11 @@ export async function runUnharden(engine: BrainEngine, args: string[]): Promise<
     console.error(`Source "${id}" not found.`);
     process.exit(1);
   }
+  const clientPath = resolveClientSourcePath(rows[0].id);
+  if (clientPath) assertClientSourceCheckout(rows[0].id, clientPath, rows[0].config);
+  const repoPath = clientPath ?? rows[0].local_path ?? '';
   const steps = await unhardenBrainRepo({
-    repoPath: rows[0].local_path ?? '',
+    repoPath,
     sourceId: rows[0].id,
     logger: (l) => console.error(l),
   });
