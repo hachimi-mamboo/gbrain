@@ -29,6 +29,7 @@ import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
 import { isWriteTargetContained } from './path-confine.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from './brain-repo-durability.ts';
 import { assertClientSourceCheckout, resolveClientSourcePath } from './source-resolver.ts';
+import { prepareClientSourceBinding } from './sources-ops.ts';
 
 /** Minimal logger surface — structurally compatible with operations.ts `Logger`. */
 export interface WriteThroughLogger {
@@ -106,12 +107,16 @@ export async function writePageThrough(
     //      git repo (the reported bug). Skip instead.
     let filePath: string;
     let writeRoot: string;
+    const operationRoot = opts.operationRoot ? resolve(opts.operationRoot) : null;
+    const boundClientPath = resolveClientSourcePath(sourceId);
+    if (boundClientPath) {
+      await prepareClientSourceBinding(engine, sourceId);
+    }
     const srcRows = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
       `SELECT local_path, config FROM sources WHERE id = $1`,
       [sourceId],
     );
-    const operationRoot = opts.operationRoot ? resolve(opts.operationRoot) : null;
-    const clientLocalPath = operationRoot ? null : resolveClientSourcePath(sourceId);
+    const clientLocalPath = operationRoot ? null : boundClientPath;
     if (clientLocalPath) {
       assertClientSourceCheckout(sourceId, clientLocalPath, srcRows[0]?.config);
     }

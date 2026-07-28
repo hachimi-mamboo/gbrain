@@ -1185,6 +1185,18 @@ const put_page: Operation = {
 
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug };
 
+    // A client-local source binding owns its checkout only in this process.
+    // Validate the shared remote identity and retire any historical shared
+    // paths before importFromContent can persist the page. This must fail
+    // closed here; writePageThrough is intentionally best-effort and runs
+    // after the DB write.
+    const sourceId = ctx.sourceId ?? 'default';
+    const { resolveClientSourcePath } = await import('./source-resolver.ts');
+    if (resolveClientSourcePath(sourceId)) {
+      const { prepareClientSourceBinding } = await import('./sources-ops.ts');
+      await prepareClientSourceBinding(ctx.engine, sourceId);
+    }
+
     // Empty-overwrite guard: empty/whitespace-only content over an existing
     // non-empty page is almost always an input-plumbing failure (e.g. a
     // caller that meant file input — put has no --file flag — so the missing
@@ -1327,7 +1339,6 @@ const put_page: Operation = {
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
     if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
-      const sourceId = ctx.sourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
       // --save`). Renders the file from the saved DB row and writes it
@@ -4522,6 +4533,33 @@ const sources_status: Operation = {
   cliHints: { name: 'sources_status', hidden: true },
 };
 
+const sources_prepare_client: Operation = {
+  name: 'sources_prepare_client',
+  description:
+    'Local-only client-binding entry seam. Requires matching GBRAIN_SOURCE and ' +
+    'absolute GBRAIN_SOURCE_PATH, validates the source remote identity, then ' +
+    'idempotently retires historical client paths from shared source/config/' +
+    'ingest/job state without changing source identity, commit, or bookmarks.',
+  params: {
+    id: {
+      type: 'string',
+      required: true,
+      description: 'Existing source id bound by GBRAIN_SOURCE.',
+    },
+  },
+  mutating: true,
+  scope: 'sources_admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'sources_prepare_client', source_id: p.id };
+    }
+    const { prepareClientSourceBinding } = await import('./sources-ops.ts');
+    return prepareClientSourceBinding(ctx.engine, p.id as string);
+  },
+  cliHints: { name: 'sources_prepare_client', hidden: true },
+};
+
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
 // ============================================================
@@ -6726,7 +6764,7 @@ export const operations: Operation[] = [
   // v0.30: calibration aggregates over takes
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
-  whoami, sources_add, sources_list, sources_remove, sources_status,
+  whoami, sources_add, sources_list, sources_remove, sources_status, sources_prepare_client,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.42.x (#2390): Life Chronicle timeline reads

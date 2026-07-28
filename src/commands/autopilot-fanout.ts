@@ -392,7 +392,7 @@ export async function dispatchPerSource(
     // (default source) and pre-v0.18 brains without the sources table.
     const job = await queue.add(
       'autopilot-cycle',
-      { repoPath: opts.repoPath },
+      {},
       {
         queue: 'default',
         idempotency_key: `autopilot-cycle:${opts.slot}`,
@@ -435,7 +435,6 @@ export async function dispatchPerSource(
       const job = await queue.add(
         'autopilot-cycle',
         {
-          repoPath: opts.repoPath,
           source_id: src.id,
           pull: shouldPull,
           // #2194 fix #3 (cycle split): per-source cycles run ONLY source-scoped
@@ -552,7 +551,7 @@ export async function dispatchGlobalMaintenance(
 
   const job = await queue.add(
     'autopilot-global-maintenance',
-    { repoPath: opts.repoPath, phases: GLOBAL_PHASES },
+    { phases: GLOBAL_PHASES },
     {
       queue: 'default',
       // Structural single-flight: one global job per slot; maxWaiting:1 coalesces

@@ -55,6 +55,10 @@ import {
   MIGRATE_PAUSE_MARKER_PREFIX,
 } from '../core/autopilot-paths.ts';
 export { autopilotLockPath, autopilotDisabledMarkerPath, autopilotPausedMarkerPath, autopilotLaunchdLabel };
+import {
+  resolveClientSourcePath,
+  resolveSourceWithTier,
+} from '../core/source-resolver.ts';
 
 /**
  * v0.37.7.0 #1162 — classify autopilot reconnect-loop errors.
@@ -476,7 +480,21 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     return;
   }
 
-  const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
+  let clientLocalPath: string | null = null;
+  let clientLocalSourceId: string | null = null;
+  if (process.env.GBRAIN_SOURCE_PATH) {
+    const resolved = await resolveSourceWithTier(engine, null);
+    clientLocalSourceId = resolved.source_id;
+    clientLocalPath = resolveClientSourcePath(resolved.source_id);
+    if (clientLocalPath) {
+      const { prepareClientSourceBinding } = await import('../core/sources-ops.ts');
+      await prepareClientSourceBinding(engine, resolved.source_id);
+    }
+  }
+  const repoPath =
+    parseArg(args, '--repo') ||
+    clientLocalPath ||
+    await engine.getConfig('sync.repo_path');
   // Same NaN guard as the status path: a typo'd interval would otherwise
   // reach setTimeout(NaN) → 0ms and busy-loop the daemon against the DB.
   const rawBaseInterval = parseInt(parseArg(args, '--interval') || '300', 10);
@@ -520,6 +538,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   const engineType = cfg?.engine ?? 'pglite';
   const useMinionsDispatch = mode !== 'off' && engineType === 'postgres' && !forceInline;
   const spawnManagedWorker = useMinionsDispatch && !noWorker;
+  if (useMinionsDispatch && clientLocalPath) {
+    console.error(
+      `Client-local source "${clientLocalSourceId}" cannot dispatch filesystem work to a queued worker, ` +
+      `because GBRAIN_SOURCE_PATH is process-local. Run: gbrain autopilot --inline`,
+    );
+    process.exit(2);
+  }
 
   // Engine identity at boot, re-checked every tick. A cross-engine migration
   // flips config.json at the END of its copy; this long-lived process would
@@ -908,7 +933,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         try {
           const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
           if (await isFederatedV2Enabled(engine)) {
-            const { loadAllSources, sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
+            const { loadAllSources } = await import('../core/sources-load.ts');
             const sources = await loadAllSources(engine);
             const intervalMs = baseInterval * 1000;
             const now = Date.now();
@@ -922,8 +947,6 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                   'sync',
                   {
                     sourceId: src.id,
-                    repoPath: src.local_path,
-                    pull: sourceConfigHasRemoteUrl(src.config),
                     auto_embed_backfill: true,
                     embed_reason: 'autopilot_freshness',
                   },

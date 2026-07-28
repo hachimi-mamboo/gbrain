@@ -304,6 +304,41 @@ export function validateRepoState(
 }
 
 /**
+ * Classify a client-local checkout against the remote identity literally
+ * recorded in .git/config.
+ *
+ * Unlike `git remote get-url`, `git config --local --get` does not expand
+ * test- or client-local `url.*.insteadOf` transport rewrites. That keeps a
+ * stable shared remote identity comparable without treating the local
+ * transport target as source metadata.
+ */
+export function validateRepoRawRemoteState(
+  repoPath: string,
+  expectedRemoteUrl: string,
+): RepoState {
+  const state = validateRepoState(repoPath);
+  if (state !== 'healthy') return state;
+
+  let remoteUrl: string;
+  try {
+    const out = execFileSync(
+      'git',
+      ['-C', repoPath, 'config', '--local', '--get', 'remote.origin.url'],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000,
+        env: { ...process.env, ...GIT_ENV },
+      },
+    );
+    remoteUrl = out.toString().trim();
+  } catch {
+    return 'corrupted';
+  }
+
+  return remoteUrl === expectedRemoteUrl ? 'healthy' : 'url-drift';
+}
+
+/**
  * True if `path` is itself a git repo OR a subdirectory of one, per
  * `git rev-parse --show-toplevel`. Mirrors the walk-up discovery
  * `sync.ts:discoverGitRoot` performs at sync time (#753/#774 — subdir-of-git

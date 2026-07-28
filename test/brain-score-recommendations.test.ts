@@ -189,6 +189,18 @@ describe('computeRecommendations', () => {
     expect(extract?.depends_on).toContain('sync.repo');
   });
 
+  test('sync remediation queues stable source identity, never the checkout path', () => {
+    const health = makeHealth({ stale_pages: 10 });
+    const recs = computeRecommendations(health, {
+      repoPath: '/clients/a/wiki',
+      sourceId: 'wiki',
+      embeddingProviderConfigured: true,
+    });
+    const sync = recs.find((r) => r.id === 'sync.repo')!;
+    expect(sync.params).toEqual({ sourceId: 'wiki', noEmbed: true });
+    expect(sync.params.repoPath).toBeUndefined();
+  });
+
   test('embed.stale depends on sync.repo when sync also needed', () => {
     const health = makeHealth({
       stale_pages: 10,

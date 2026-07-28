@@ -54,10 +54,12 @@ import {
 import { gbrainPath } from './config.ts';
 import { isValidSourceId } from './source-id.ts';
 import {
+  assertClientSourceCheckout,
   resolveClientSourcePath,
   resolveSourceWithTier,
   type SourceTier,
 } from './source-resolver.ts';
+import { isUndefinedTableError } from './utils.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -169,6 +171,29 @@ export interface RemoveSourceOpts {
   keepStorage?: boolean;
 }
 
+export interface PrepareClientSourceBindingResult {
+  source_id: string;
+  cleared_source_local_path: boolean;
+  cleared_legacy_repo_path: boolean;
+  sanitized_ingest_log_count: number;
+  sanitized_job_ids: number[];
+  cancelled_job_ids: number[];
+}
+
+const CLIENT_BOUND_FILESYSTEM_JOB_NAMES = new Set([
+  'sync',
+  'autopilot-cycle',
+]);
+const LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES = new Set([
+  'sync',
+  'autopilot-cycle',
+  'autopilot-global-maintenance',
+]);
+const LEGACY_GLOBAL_INVALIDATE_JOB_NAMES = new Set([
+  'sync',
+  'autopilot-cycle',
+]);
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
@@ -221,6 +246,128 @@ function getRemoteUrl(config: unknown): string | null {
   return typeof v === 'string' ? v : null;
 }
 
+function uniquePathSpellings(paths: Array<string | null>): string[] {
+  const values = new Set<string>();
+  for (const path of paths) {
+    if (!path) continue;
+    values.add(path);
+    values.add(resolvePath(path));
+  }
+  return [...values].sort((a, b) => b.length - a.length);
+}
+
+function pathBelongsToRoot(candidate: unknown, roots: string[]): boolean {
+  if (typeof candidate !== 'string' || candidate.length === 0) return false;
+  const normalized = resolvePath(candidate);
+  return roots.some((root) => normalized === resolvePath(root) || normalized.startsWith(resolvePath(root) + '/'));
+}
+
+function textContainsRoot(candidate: unknown, roots: string[]): boolean {
+  return typeof candidate === 'string' && roots.some((root) => candidate.includes(root));
+}
+
+function isClientPathShapedText(value: string): boolean {
+  return (
+    // Historical locator schemes, including file:/// and directory:/ forms.
+    /(?:^|[^A-Za-z0-9+.-])(?:file|directory|git|path):(?:\/\/)?[\\/]/i.test(value) ||
+    // A POSIX path at the start or after a free-text/key-value boundary.
+    /(?:^|[\s="'([{=,])\/(?!\/)/.test(value) ||
+    // Forward-slash UNC/network paths at a boundary; exclude URL schemes.
+    /(?:^|[\s="'([{=,])\/\/[^/\s]+\/[^/\s]+/.test(value) ||
+    // A prefixed POSIX path such as "checkout:/srv/wiki", but not https://.
+    /:\/(?!\/)/.test(value) ||
+    // Windows drive paths, raw or embedded in a small provenance phrase.
+    /(?:^|[\s="'([{=,:])[A-Za-z]:[\\/]/.test(value) ||
+    // UNC paths, raw or embedded.
+    /(?:^|[\s="'([{=,:])\\\\[^\\/\s]+[\\/]/.test(value)
+  );
+}
+
+function parseSharedJson(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function redactKnownRoots(
+  value: unknown,
+  roots: string[],
+  dropRepoPath = false,
+): unknown {
+  if (typeof value === 'string') {
+    const redacted = roots.reduce(
+      (redacted, root) => redacted.split(root).join('[client-local-path]'),
+      value,
+    );
+    return isClientPathShapedText(redacted) ? '[client-local-path]' : redacted;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactKnownRoots(entry, roots, dropRepoPath));
+  }
+  if (value && typeof value === 'object') {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (dropRepoPath && key === 'repoPath') continue;
+      const sanitizedKey = redactKnownRoots(key, roots) as string;
+      sanitized[sanitizedKey] = redactKnownRoots(entry, roots, dropRepoPath);
+    }
+    return sanitized;
+  }
+  return value;
+}
+
+function structuredValueContainsClientPath(value: unknown, roots: string[]): boolean {
+  if (typeof value === 'string') {
+    return textContainsRoot(value, roots) || isClientPathShapedText(value);
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => structuredValueContainsClientPath(entry, roots));
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>).some(
+      ([key, entry]) =>
+        key === 'repoPath' ||
+        structuredValueContainsClientPath(key, roots) ||
+        structuredValueContainsClientPath(entry, roots),
+    );
+  }
+  return false;
+}
+
+function parseJobData(data: Record<string, unknown> | string): Record<string, unknown> {
+  if (typeof data !== 'string') return data;
+  try {
+    const parsed = JSON.parse(data);
+    return typeof parsed === 'object' && parsed !== null
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Historical directory/import writers stored either a raw absolute path or a
+ * small path URI in source_ref. Keep any trailing commit/ref marker, but
+ * replace the machine locator with the stable source identity.
+ */
+export function sanitizeClientPathSourceRef(
+  sourceId: string,
+  sourceRef: string,
+): string | null {
+  const value = sourceRef.trim();
+  if (!isClientPathShapedText(value)) return null;
+
+  const suffixMatch = value.match(
+    /\s+@\s+([A-Za-z0-9][A-Za-z0-9._~^/-]{0,255})\s*$/,
+  );
+  const suffix = suffixMatch ? ` @ ${suffixMatch[1]}` : '';
+  return `source:${sourceId}${suffix}`;
+}
+
 async function fetchSourceRow(engine: BrainEngine, id: string): Promise<SourceRow | null> {
   const rows = await engine.executeRaw<{
     id: string;
@@ -246,6 +393,349 @@ async function countAllPages(engine: BrainEngine, id: string): Promise<number> {
     [id],
   );
   return rows[0]?.n ?? 0;
+}
+
+/**
+ * Retire machine-local state before one client uses GBRAIN_SOURCE_PATH.
+ *
+ * This is the public/native ownership seam for client-local source bindings.
+ * It deliberately leaves ordinary `sources add --path` registrations alone:
+ * callers must opt in with a matching `GBRAIN_SOURCE` + absolute
+ * `GBRAIN_SOURCE_PATH`. The operation is idempotent and preserves source
+ * identity, config (including remote identity), last_commit, and sync
+ * bookmarks while removing historical checkout roots from shared state.
+ */
+export async function prepareClientSourceBinding(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<PrepareClientSourceBindingResult> {
+  validateSourceId(sourceId);
+  const source = await fetchSourceRow(engine, sourceId);
+  if (!source) {
+    throw new SourceOpError('not_found', `Source "${sourceId}" not found.`);
+  }
+
+  const clientPath = resolveClientSourcePath(sourceId);
+  if (!clientPath) {
+    throw new Error(
+      `Client-local binding for source "${sourceId}" requires matching ` +
+      `GBRAIN_SOURCE=${sourceId} and an absolute GBRAIN_SOURCE_PATH.`,
+    );
+  }
+  assertClientSourceCheckout(sourceId, clientPath, source.config);
+
+  const legacyRepoPath = await engine.getConfig('sync.repo_path');
+  const sourceRoots = uniquePathSpellings([
+    source.local_path,
+    clientPath,
+  ]);
+  const clearLegacyRepoPath =
+    legacyRepoPath !== null &&
+    (sourceId === 'default' || pathBelongsToRoot(legacyRepoPath, sourceRoots));
+  const sharedRoots = uniquePathSpellings([
+    source.local_path,
+    clientPath,
+    clearLegacyRepoPath ? legacyRepoPath : null,
+  ]);
+  const retiringLegacyBinding =
+    source.local_path !== null || clearLegacyRepoPath;
+
+  let hasMinionJobs = true;
+  let hasMinionInbox = true;
+  try {
+    await engine.executeRaw(`SELECT 1 FROM minion_jobs LIMIT 1`);
+  } catch (error) {
+    if (!isUndefinedTableError(error)) throw error;
+    hasMinionJobs = false;
+  }
+  try {
+    await engine.executeRaw(`SELECT 1 FROM minion_inbox LIMIT 1`);
+  } catch (error) {
+    if (!isUndefinedTableError(error)) throw error;
+    hasMinionInbox = false;
+  }
+
+  return engine.transaction(async (tx) => {
+    const sanitizedJobIds: number[] = [];
+    const cancelledJobIds: number[] = [];
+
+    if (hasMinionJobs) {
+      const nonterminal = new Set([
+        'waiting',
+        'active',
+        'delayed',
+        'waiting-children',
+        'paused',
+      ]);
+      const rows = await tx.executeRaw<{
+        id: number;
+        name: string;
+        status: string;
+        data: Record<string, unknown> | string;
+        parent_job_id: number | null;
+        result: unknown;
+        progress: unknown;
+        error_text: string | null;
+        stacktrace: unknown;
+      }>(
+        `SELECT id, name, status, data, parent_job_id,
+                result, progress, error_text, stacktrace
+           FROM minion_jobs
+          WHERE data->>'sourceId' = $1
+             OR data->>'source_id' = $1
+             OR data ? 'repoPath'
+             OR name = ANY($2::text[])
+          FOR UPDATE`,
+        [sourceId, [...LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES]],
+      );
+      const candidateIds = rows.map((row) => row.id);
+      const candidateInboxPathIds = new Set<number>();
+      if (hasMinionInbox && candidateIds.length > 0) {
+        const candidateInbox = await tx.executeRaw<{
+          job_id: number;
+          payload: unknown;
+        }>(
+          `SELECT job_id, payload
+             FROM minion_inbox
+            WHERE job_id = ANY($1::int[])
+               OR payload->>'child_id' = ANY($2::text[])`,
+          [candidateIds, candidateIds.map(String)],
+        );
+        for (const inbox of candidateInbox) {
+          const payload = parseSharedJson(inbox.payload);
+          if (!structuredValueContainsClientPath(payload, sharedRoots)) continue;
+          if (candidateIds.includes(inbox.job_id)) {
+            candidateInboxPathIds.add(inbox.job_id);
+          }
+          if (payload && typeof payload === 'object') {
+            const childId = (payload as Record<string, unknown>).child_id;
+            if (typeof childId === 'number' && candidateIds.includes(childId)) {
+              candidateInboxPathIds.add(childId);
+            }
+          }
+        }
+      }
+      const targetRows = rows.filter((row) => {
+        const data = parseJobData(row.data);
+        const matchesSource =
+          data.sourceId === sourceId || data.source_id === sourceId;
+        const hasExplicitSource =
+          typeof data.sourceId === 'string' || typeof data.source_id === 'string';
+        const isLegacyGlobalFilesystemJob =
+          !hasExplicitSource && LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES.has(row.name);
+        const repoPathMatches = pathBelongsToRoot(data.repoPath, sharedRoots);
+        const hasStructuredPath = [
+          data,
+          row.result,
+          row.progress,
+          row.stacktrace,
+          row.error_text,
+        ].some((value) =>
+          structuredValueContainsClientPath(parseSharedJson(value), sharedRoots));
+        return (
+          repoPathMatches ||
+          (
+            isLegacyGlobalFilesystemJob &&
+            clearLegacyRepoPath &&
+            (hasStructuredPath || candidateInboxPathIds.has(row.id))
+          ) ||
+          (
+            matchesSource &&
+            (
+              hasStructuredPath ||
+              candidateInboxPathIds.has(row.id) ||
+              (
+                retiringLegacyBinding &&
+                CLIENT_BOUND_FILESYSTEM_JOB_NAMES.has(row.name) &&
+                nonterminal.has(row.status)
+              )
+            )
+          ) ||
+          (
+            isLegacyGlobalFilesystemJob &&
+            LEGACY_GLOBAL_INVALIDATE_JOB_NAMES.has(row.name) &&
+            clearLegacyRepoPath &&
+            nonterminal.has(row.status)
+          )
+        );
+      });
+      const targetIds = targetRows.map((row) => row.id).sort((a, b) => a - b);
+      const cancelIds = targetRows
+        .filter((row) => nonterminal.has(row.status))
+        .map((row) => row.id)
+        .sort((a, b) => a - b);
+      const cancelIdSet = new Set(cancelIds);
+      const allTargetRoots = uniquePathSpellings([
+        ...sharedRoots,
+        ...targetRows.map((row) => {
+          const repoPath = parseJobData(row.data).repoPath;
+          return typeof repoPath === 'string' ? repoPath : null;
+        }),
+      ]);
+
+      if (targetIds.length > 0) {
+        await tx.executeRaw(
+          `UPDATE minion_jobs
+              SET status = CASE
+                    WHEN id = ANY($2::int[]) THEN 'cancelled'
+                    ELSE status
+                  END,
+                  lock_token = CASE WHEN id = ANY($2::int[]) THEN NULL ELSE lock_token END,
+                  lock_until = CASE WHEN id = ANY($2::int[]) THEN NULL ELSE lock_until END,
+                  delay_until = CASE WHEN id = ANY($2::int[]) THEN NULL ELSE delay_until END,
+                  finished_at = CASE WHEN id = ANY($2::int[]) THEN now() ELSE finished_at END,
+                  updated_at = now()
+            WHERE id = ANY($1::int[])`,
+          [targetIds, cancelIds],
+        );
+      }
+
+      for (const row of targetRows) {
+        const data = parseJobData(row.data);
+        const repoPath = typeof data.repoPath === 'string' ? data.repoPath : null;
+        const rowRoots = uniquePathSpellings([...allTargetRoots, repoPath]);
+        const pathShapedError = structuredValueContainsClientPath(
+          row.error_text,
+          rowRoots,
+        );
+        const errorText = cancelIdSet.has(row.id)
+          ? 'cancelled: client-local source binding retired queued checkout path'
+          : pathShapedError || textContainsRoot(row.error_text, rowRoots)
+            ? 'client-local source binding retired checkout path from historical job state'
+            : row.error_text;
+
+        await tx.executeRaw(
+          `UPDATE minion_jobs
+              SET data = $1::text::jsonb,
+                  result = $2::text::jsonb,
+                  progress = $3::text::jsonb,
+                  error_text = $4,
+                  stacktrace = $5::text::jsonb
+            WHERE id = $6`,
+          [
+            JSON.stringify(redactKnownRoots(data, rowRoots, true)),
+            row.result === null
+              ? null
+              : JSON.stringify(redactKnownRoots(parseSharedJson(row.result), rowRoots, true)),
+            row.progress === null
+              ? null
+              : JSON.stringify(redactKnownRoots(parseSharedJson(row.progress), rowRoots, true)),
+            errorText,
+            JSON.stringify(
+              redactKnownRoots(parseSharedJson(row.stacktrace) ?? [], rowRoots, true),
+            ),
+            row.id,
+          ],
+        );
+      }
+
+      if (hasMinionInbox && targetIds.length > 0) {
+        const inboxRows = await tx.executeRaw<{
+          id: number;
+          payload: unknown;
+        }>(
+          `SELECT id, payload
+             FROM minion_inbox
+            WHERE job_id = ANY($1::int[])
+               OR payload->>'child_id' = ANY($2::text[])
+            FOR UPDATE`,
+          [targetIds, targetIds.map(String)],
+        );
+        for (const row of inboxRows) {
+          await tx.executeRaw(
+            `UPDATE minion_inbox SET payload = $1::text::jsonb WHERE id = $2`,
+            [
+              JSON.stringify(
+                redactKnownRoots(
+                  parseSharedJson(row.payload),
+                  allTargetRoots,
+                  true,
+                ),
+              ),
+              row.id,
+            ],
+          );
+        }
+      }
+
+      const cancelledChildren = targetRows.filter(
+        (row) => cancelIdSet.has(row.id) && row.parent_job_id !== null,
+      );
+      const parentIds = new Set<number>();
+      for (const row of cancelledChildren) {
+        const parentId = row.parent_job_id!;
+        parentIds.add(parentId);
+        if (hasMinionInbox) {
+          await tx.executeRaw(
+            `INSERT INTO minion_inbox (job_id, sender, payload)
+             SELECT $1, 'minions', $2::text::jsonb
+              WHERE EXISTS (
+                SELECT 1 FROM minion_jobs
+                 WHERE id = $1
+                   AND status NOT IN ('completed','failed','dead','cancelled')
+              )`,
+            [
+              parentId,
+              JSON.stringify({
+                type: 'child_done',
+                child_id: row.id,
+                job_name: row.name,
+                result: null,
+                outcome: 'cancelled',
+                error: 'cancelled',
+              }),
+            ],
+          );
+        }
+      }
+      for (const parentId of parentIds) {
+        await tx.executeRaw(
+          `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
+            WHERE id = $1 AND status = 'waiting-children'
+              AND NOT EXISTS (
+                SELECT 1 FROM minion_jobs
+                 WHERE parent_job_id = $1
+                   AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
+              )`,
+          [parentId],
+        );
+      }
+      sanitizedJobIds.push(...targetIds);
+      cancelledJobIds.push(...cancelIds);
+    }
+
+    const ingestRows = await tx.executeRaw<{ id: number; source_ref: string }>(
+      `SELECT id, source_ref FROM ingest_log WHERE source_id = $1 FOR UPDATE`,
+      [sourceId],
+    );
+    const sanitizedIngestIds: number[] = [];
+    for (const row of ingestRows) {
+      const sanitized = sanitizeClientPathSourceRef(sourceId, row.source_ref);
+      if (sanitized === null || sanitized === row.source_ref) continue;
+      await tx.executeRaw(
+        `UPDATE ingest_log SET source_ref = $1 WHERE id = $2`,
+        [sanitized, row.id],
+      );
+      sanitizedIngestIds.push(row.id);
+    }
+
+    await tx.executeRaw(
+      `UPDATE sources SET local_path = NULL WHERE id = $1`,
+      [sourceId],
+    );
+    if (clearLegacyRepoPath) {
+      await tx.unsetConfig('sync.repo_path');
+    }
+
+    return {
+      source_id: sourceId,
+      cleared_source_local_path: source.local_path !== null,
+      cleared_legacy_repo_path: clearLegacyRepoPath,
+      sanitized_ingest_log_count: sanitizedIngestIds.length,
+      sanitized_job_ids: sanitizedJobIds,
+      cancelled_job_ids: cancelledJobIds,
+    };
+  });
 }
 
 async function countVisiblePages(engine: BrainEngine, id: string): Promise<number> {

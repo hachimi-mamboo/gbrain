@@ -14,6 +14,7 @@ import {
 import { runHarden, runPull } from '../src/commands/sources-harden.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 const PAT = 'ghp_TESTSECRETTOKEN0123456789abcdef';
 
@@ -71,39 +72,117 @@ afterEach(() => {
 
 describe('hardenBrainRepo', () => {
   test('client-local harden and pull never write the checkout path to shared state', async () => {
-    const queries: string[] = [];
-    const engine = {
-      executeRaw: async (sql: string) => {
-        queries.push(sql);
-        return [{
-          id: 'wiki',
-          local_path: null,
-          config: { remote_url: bare },
-        }];
-      },
-      setConfig: async () => {
-        throw new Error('unexpected shared config write');
-      },
-      logIngest: async () => {
-        throw new Error('unexpected shared ingest write');
-      },
-    } as unknown as BrainEngine;
-
-    await withEnv({
-      GBRAIN_SOURCE: 'wiki',
-      GBRAIN_SOURCE_PATH: work,
-      GBRAIN_GITHUB_PAT: undefined,
-    }, async () => {
-      await runHarden(engine, [
-        'wiki', '--dry-run', '--no-cron', '--no-verify', '--json',
-      ]);
-      await runPull(engine, ['wiki']);
+    const stableRemote = 'https://git.example.invalid/private/wiki.git';
+    const clientA = join(root, 'client-a');
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'clone', '-q', bare, clientA], {
+      stdio: 'ignore',
     });
+    for (const checkout of [work, clientA]) {
+      git(checkout, 'remote', 'set-url', 'origin', stableRemote);
+      git(checkout, 'config', `url.file://${bare}.insteadOf`, stableRemote);
+    }
+    const stableCommit = git(work, 'rev-parse', 'HEAD');
+    const dbEngine = new PGLiteEngine();
+    await dbEngine.connect({});
+    await dbEngine.initSchema();
 
-    expect(queries.length).toBeGreaterThanOrEqual(2);
-    for (const sql of queries) {
-      expect(sql.trimStart().toUpperCase().startsWith('SELECT')).toBe(true);
-      expect(sql).not.toContain(work);
+    const seedStaleState = async (marker: string): Promise<void> => {
+      await dbEngine.executeRaw(
+        `INSERT INTO sources (id, name, local_path, last_commit, config)
+         VALUES ('wiki', 'Wiki', $1, $2, $3::jsonb)
+         ON CONFLICT (id) DO UPDATE SET
+           local_path = EXCLUDED.local_path,
+           last_commit = EXCLUDED.last_commit,
+           config = EXCLUDED.config`,
+        [
+          clientA,
+          stableCommit,
+          JSON.stringify({ remote_url: stableRemote, tracked_branch: 'main' }),
+        ],
+      );
+      await dbEngine.setConfig('sync.repo_path', clientA);
+      await dbEngine.setConfig('sync.last_commit', 'stable-bookmark');
+      await dbEngine.executeRaw(
+        `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
+         VALUES ('wiki', 'directory', $1, $2)`,
+        [clientA, marker],
+      );
+      await dbEngine.executeRaw(
+        `INSERT INTO minion_jobs (name, status, data, error_text)
+         VALUES ('sync', 'waiting', $1::jsonb, $2)`,
+        [JSON.stringify({
+          sourceId: 'wiki',
+          repoPath: clientA,
+          commit: marker,
+        }), `failed at ${clientA}`],
+      );
+    };
+
+    const assertStaleStateRetired = async (marker: string): Promise<void> => {
+      const sourceRows = await dbEngine.executeRaw<{
+        id: string;
+        local_path: string | null;
+        last_commit: string | null;
+        config: Record<string, unknown>;
+      }>(`SELECT id, local_path, last_commit, config FROM sources WHERE id = 'wiki'`);
+      expect(sourceRows[0]).toEqual({
+        id: 'wiki',
+        local_path: null,
+        last_commit: stableCommit,
+        config: { remote_url: stableRemote, tracked_branch: 'main' },
+      });
+      expect(await dbEngine.getConfig('sync.repo_path')).toBeNull();
+      expect(await dbEngine.getConfig('sync.last_commit')).toBe('stable-bookmark');
+
+      const logs = await dbEngine.executeRaw<{ source_ref: string }>(
+        `SELECT source_ref FROM ingest_log WHERE summary = $1`,
+        [marker],
+      );
+      expect(logs).toEqual([{ source_ref: 'source:wiki' }]);
+      const jobs = await dbEngine.executeRaw<{
+        status: string;
+        data: Record<string, unknown>;
+        error_text: string | null;
+      }>(
+        `SELECT status, data, error_text FROM minion_jobs WHERE data->>'commit' = $1`,
+        [marker],
+      );
+      expect(jobs).toEqual([{
+        status: 'cancelled',
+        data: { sourceId: 'wiki', commit: marker },
+        error_text: 'cancelled: client-local source binding retired queued checkout path',
+      }]);
+
+      const sharedState = JSON.stringify({
+        source: sourceRows,
+        config: await dbEngine.executeRaw(`SELECT key, value FROM config`),
+        logs,
+        jobs,
+      });
+      expect(sharedState).not.toContain(clientA);
+      expect(sharedState).not.toContain(work);
+      expect(sharedState).not.toContain(bare);
+      expect(sharedState).not.toContain(root);
+    };
+
+    try {
+      await withEnv({
+        GBRAIN_SOURCE: 'wiki',
+        GBRAIN_SOURCE_PATH: work,
+        GBRAIN_GITHUB_PAT: undefined,
+      }, async () => {
+        await seedStaleState('harden-entry');
+        await runHarden(dbEngine, [
+          'wiki', '--dry-run', '--no-cron', '--no-verify', '--json',
+        ]);
+        await assertStaleStateRetired('harden-entry');
+
+        await seedStaleState('pull-entry');
+        await runPull(dbEngine, ['wiki']);
+        await assertStaleStateRetired('pull-entry');
+      });
+    } finally {
+      await dbEngine.disconnect();
     }
   });
 
@@ -130,6 +209,24 @@ describe('hardenBrainRepo', () => {
 
     expect(git(work, 'rev-parse', 'HEAD')).toBe(before);
     expect(existsSync(join(work, '.git', 'hooks', 'post-commit'))).toBe(false);
+  });
+
+  test('harden --all rejects a process-local checkout binding before reading sources', async () => {
+    const engine = {
+      executeRaw: async () => {
+        throw new Error('source rows must not be read');
+      },
+    } as unknown as BrainEngine;
+
+    await withEnv({
+      GBRAIN_SOURCE: 'wiki',
+      GBRAIN_SOURCE_PATH: work,
+      GBRAIN_GITHUB_PAT: undefined,
+    }, async () => {
+      await expect(
+        runHarden(engine, ['--all', '--dry-run', '--no-cron', '--no-verify']),
+      ).rejects.toThrow(/--all cannot be combined with GBRAIN_SOURCE_PATH/);
+    });
   });
 
   test('installs hook (local, untracked, +x), helper, and AGENTS rules', async () => {

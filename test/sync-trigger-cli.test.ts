@@ -101,14 +101,39 @@ describe('runSyncTrigger', () => {
     const job = jobs[0];
     expect(job.priority).toBe(-10);
     expect((job.data as { sourceId: string }).sourceId).toBe('default');
+    expect((job.data as { repoPath?: string }).repoPath).toBeUndefined();
     expect((job.data as { noExtract: boolean }).noExtract).toBe(false);
     expect((job.data as { auto_embed_backfill: boolean }).auto_embed_backfill).toBe(true);
   });
 
   test('matching client-local checkout requires inline sync', async () => {
+    const stalePath = '/tmp/gbrain-client-a-trigger-test';
+    const clientPath = '/tmp/gbrain-client-b-trigger-test';
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1, last_commit = 'stable-commit'
+        WHERE id = 'default'`,
+      [stalePath],
+    );
+    await engine.setConfig('sync.repo_path', stalePath);
+    await engine.setConfig('sync.last_commit', 'stable-bookmark');
+    await engine.executeRaw(
+      `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
+       VALUES ('default', 'directory', $1, 'legacy-trigger')`,
+      [stalePath],
+    );
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES ('sync', 'waiting', $1::jsonb)`,
+      [JSON.stringify({
+        sourceId: 'default',
+        repoPath: stalePath,
+        commit: 'queued-commit',
+      })],
+    );
+
     await withEnv({
       GBRAIN_SOURCE: 'default',
-      GBRAIN_SOURCE_PATH: '/tmp/gbrain-client-local-trigger-test',
+      GBRAIN_SOURCE_PATH: clientPath,
     }, async () => {
       const { stderr, exitCode } = await capture(['--source', 'default']);
       expect(exitCode).toBe(2);
@@ -117,8 +142,36 @@ describe('runSyncTrigger', () => {
 
       const queue = new MinionQueue(engine);
       const jobs = await queue.getJobs({ name: 'sync', limit: 5 });
-      expect(jobs).toHaveLength(0);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].status).toBe('cancelled');
+      expect(jobs[0].data).toEqual({
+        sourceId: 'default',
+        commit: 'queued-commit',
+      });
     });
+
+    const source = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+    }>(`SELECT local_path, last_commit FROM sources WHERE id = 'default'`);
+    expect(source[0]).toEqual({
+      local_path: null,
+      last_commit: 'stable-commit',
+    });
+    expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    expect(await engine.getConfig('sync.last_commit')).toBe('stable-bookmark');
+    const logs = await engine.executeRaw<{ source_ref: string }>(
+      `SELECT source_ref FROM ingest_log WHERE summary = 'legacy-trigger'`,
+    );
+    expect(logs).toEqual([{ source_ref: 'source:default' }]);
+    const sharedState = JSON.stringify({
+      source,
+      config: await engine.executeRaw(`SELECT key, value FROM config`),
+      logs,
+      jobs: await new MinionQueue(engine).getJobs({ name: 'sync', limit: 5 }),
+    });
+    expect(sharedState).not.toContain(stalePath);
+    expect(sharedState).not.toContain(clientPath);
   });
 
   test('--priority normal maps to 0', async () => {

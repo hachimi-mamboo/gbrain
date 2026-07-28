@@ -19,7 +19,7 @@ import type { BrainEngine } from './engine.ts';
 import { isSourceFederated, parseSourceConfig } from './sources-load.ts';
 import { SOURCE_ID_RE, isValidSourceId, ALL_SOURCES } from './source-id.ts';
 import { isTrustedDotfile, realpathOrResolve } from './path-confine.ts';
-import { validateRepoState } from './git-remote.ts';
+import { validateRepoRawRemoteState } from './git-remote.ts';
 import { parseSourceConfig } from './sources-load.ts';
 
 // Re-export so scope-resolution call sites can import the sentinel from
@@ -320,7 +320,7 @@ export function assertClientSourceCheckout(
       : null;
   if (!expectedRemote) return;
 
-  const state = validateRepoState(localPath, expectedRemote);
+  const state = validateRepoRawRemoteState(localPath, expectedRemote);
   if (state !== 'healthy') {
     throw new Error(
       `Client-local checkout for source "${sourceId}" at ${localPath} is ${state}; ` +

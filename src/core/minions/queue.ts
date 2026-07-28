@@ -25,6 +25,7 @@ import {
   logBatchRetry as auditLogBatchRetry,
   logBatchExhausted as auditLogBatchExhausted,
 } from '../audit/batch-retry-audit.ts';
+import { resolveClientSourcePath } from '../source-resolver.ts';
 
 /** Options for opting into protected-job-name submission. Passed as a separate
  *  4th arg to `MinionQueue.add()` (NOT folded into `opts`) so user-spread
@@ -91,6 +92,22 @@ export class MinionQueue {
       throw new Error(
         `protected job name '${jobName}' requires CLI or operation-local submitter ` +
         `(pass {allowProtectedSubmit: true} as the 4th arg to MinionQueue.add)`,
+      );
+    }
+    const boundSourceId = process.env.GBRAIN_SOURCE;
+    const boundClientPath = process.env.GBRAIN_SOURCE_PATH;
+    const queuedRepoPath = data?.repoPath;
+    const activeClientPath =
+      typeof queuedRepoPath === 'string' && boundSourceId && boundClientPath
+        ? resolveClientSourcePath(boundSourceId)
+        : null;
+    if (
+      activeClientPath &&
+      typeof queuedRepoPath === 'string'
+    ) {
+      throw new Error(
+        `Client-local source "${boundSourceId}" must not persist data.repoPath in queued work. ` +
+        `Queue stable source identity/commit only, or run the filesystem operation inline.`,
       );
     }
     // v0.38 (S1.7 + D6) — capability-based gate replaces the v0.31.12 Anthropic

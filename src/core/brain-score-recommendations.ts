@@ -207,7 +207,7 @@ export function computeRecommendations(
   // sync.repo — fires when sync hasn't run recently OR pages are stale
   // ---------------------------------------------------------------------
   if (ctx.repoPath && health.stale_pages > 0) {
-    const params = { repoPath: ctx.repoPath, sourceId: ctx.sourceId, noEmbed: true };
+    const params = { sourceId: source, noEmbed: true };
     out.push({
       id: 'sync.repo',
       job: 'sync',
