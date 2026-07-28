@@ -3657,7 +3657,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // client's checkout path in shared provenance.
     source_id: ingestSourceId,
     source_type: 'git_sync',
-    source_ref: `source:${ingestSourceId} @ ${headCommit.slice(0, 8)}`,
+    source_ref: `source:${ingestSourceId} @ ${pin.slice(0, 8)}`,
     pages_updated: pagesAffected,
     summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
   });

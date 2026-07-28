@@ -14,7 +14,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -82,8 +82,7 @@ describe('import --source-id (#1167)', () => {
     const logs = await engine.getIngestLog({ limit: 10 });
     const directoryLog = logs.find((entry) => entry.source_type === 'directory');
     expect(directoryLog?.source_id).toBe('dept-x');
-    expect(directoryLog?.source_ref).toBe('source:dept-x');
-    expect(directoryLog?.source_ref).not.toContain(scratchDir);
+    expect(directoryLog?.source_ref).toBe(realpathSync(scratchDir));
   });
 
   test('--source-id value is NOT treated as a positional dir arg', async () => {

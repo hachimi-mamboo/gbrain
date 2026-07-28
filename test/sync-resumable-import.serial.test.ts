@@ -208,6 +208,10 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     expect(await engine.getPage('notes/x')).not.toBeNull();
     expect(await engine.getPage('notes/y')).toBeNull(); // past the pin, not yet
     expect(await lastCommitConfig()).toBe(r1.toCommit);
+    const firstRunLog = (await engine.getIngestLog({ limit: 10 }))
+      .find((entry) => entry.source_type === 'git_sync');
+    expect(firstRunLog?.source_ref).toBe(`source:default @ ${c1.slice(0, 8)}`);
+    expect(firstRunLog?.source_ref).not.toContain(c2.slice(0, 8));
 
     // Run 2: now anchored at C1, diff C1..C2 picks up y.
     const r2 = await performSync(engine, { repoPath, noPull: true, noEmbed: true });

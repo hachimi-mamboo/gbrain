@@ -542,13 +542,15 @@ export async function runImport(
     }
   }
 
-  // Shared audit provenance names the logical source (and optional Git
-  // commit), never this client's absolute import directory.
+  // A full sync is client-local and must not persist its checkout path.
+  // Standalone direct import keeps the explicitly approved corpus path.
   const ingestSourceId = sourceId ?? 'default';
   await engine.logIngest({
     source_id: ingestSourceId,
     source_type: 'directory',
-    source_ref: `source:${ingestSourceId}${opts.commit ? ` @ ${opts.commit.slice(0, 8)}` : ''}`,
+    source_ref: opts.managedBookmark
+      ? `source:${ingestSourceId}${opts.commit ? ` @ ${opts.commit.slice(0, 8)}` : ''}`
+      : dir,
     pages_updated: importedSlugs,
     summary: `Imported ${imported} pages, ${skipped} skipped, ${chunksCreated} chunks`,
   });
