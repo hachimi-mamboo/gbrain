@@ -313,8 +313,14 @@ export function dimsProviderOptions(
       // this path: Ollama's colon-tag form (`qwen3-embedding:4b`) and the
       // hyphenated hub form used by OpenRouter/HF-style routers
       // (`qwen/qwen3-embedding-8b` — org prefix stripped to
-      // `qwen3-embedding-8b` above). Match both.
-      if (bareModelId === 'qwen3-embedding' || bareModelId.startsWith('qwen3-embedding:') || bareModelId.startsWith('qwen3-embedding-')) {
+      // `qwen3-embedding-8b` above). Match both case-insensitively while
+      // preserving the original model id passed to the provider.
+      const normalizedBareModelId = bareModelId.toLowerCase();
+      if (
+        normalizedBareModelId === 'qwen3-embedding' ||
+        normalizedBareModelId.startsWith('qwen3-embedding:') ||
+        normalizedBareModelId.startsWith('qwen3-embedding-')
+      ) {
         // Only send `dimensions` when it actually differs from the model's
         // native width. Fixed-dim OpenAI-compatible backends serving this
         // family (e.g. vLLM) reject the parameter outright with HTTP 400
@@ -330,7 +336,7 @@ export function dimsProviderOptions(
           'qwen3-embedding-4b': 2560,
           'qwen3-embedding-8b': 4096,
         };
-        if (QWEN3_EMBEDDING_NATIVE_DIMS[bareModelId] === dims) return undefined;
+        if (QWEN3_EMBEDDING_NATIVE_DIMS[normalizedBareModelId] === dims) return undefined;
         return { openaiCompatible: { dimensions: dims } };
       }
       // MiniMax embo-01 takes a `type: 'db' | 'query'` field for asymmetric

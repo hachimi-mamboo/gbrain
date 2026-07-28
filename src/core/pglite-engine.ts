@@ -95,6 +95,7 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from './search/embedding-column.ts';
 import { hasCJK, escapeLikePattern } from './cjk.ts';
+import { assertClientBoundStructuredWrite } from './client-local-write.ts';
 
 type PGLiteDB = PGlite;
 
@@ -5770,6 +5771,11 @@ export class PGLiteEngine implements BrainEngine {
     // v0.31.2 (codex P1 #3): source_id threaded so multi-source brains can
     // scope ingest_log queries. Default 'default' matches the column DEFAULT.
     const sourceId = entry.source_id ?? 'default';
+    await assertClientBoundStructuredWrite(
+      this,
+      entry,
+      'ingest log fields',
+    );
     await this.db.query(
       `INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
        VALUES ($1, $2, $3, $4::jsonb, $5)`,

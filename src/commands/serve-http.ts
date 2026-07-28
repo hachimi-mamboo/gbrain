@@ -50,6 +50,8 @@ import {
 } from '../core/ingestion/types.ts';
 import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
+import { resolveClientSourcePath } from '../core/source-resolver.ts';
+import { isClientPathShapedText } from '../core/client-local-path.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -58,6 +60,45 @@ import { registerCleanup } from '../core/process-cleanup.ts';
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
+
+function activeClientBindingPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const sourceId = env.GBRAIN_SOURCE;
+  if (!sourceId || !env.GBRAIN_SOURCE_PATH) return null;
+  return resolveClientSourcePath(sourceId, env);
+}
+
+/** Client-local binding always wins over the operator's raw audit opt-in. */
+export function allowFullMcpAuditParams(
+  requested: boolean | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return requested === true && activeClientBindingPath(env) === null;
+}
+
+/** Keep path-bearing failures useful to callers without sharing the path. */
+export function redactClientLocalMcpAuditError(
+  message: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const clientPath = activeClientBindingPath(env);
+  if (!clientPath || !isClientPathShapedText(message, [clientPath])) {
+    return message;
+  }
+  return 'client-local path omitted from MCP audit error';
+}
+
+export function redactClientLocalMcpAuditOperation(
+  operation: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const clientPath = activeClientBindingPath(env);
+  if (!clientPath || !isClientPathShapedText(operation, [clientPath])) {
+    return operation;
+  }
+  return 'unknown_operation';
+}
 
 /**
  * The narrowest contract this module actually consumes: subscribe, unsubscribe.
@@ -451,7 +492,9 @@ interface ServeHttpOptions {
    *
    * Operators running gbrain on their own laptop and debugging agent behavior
    * can flip this on with `--log-full-params`. The flag prints a loud warning
-   * at startup so the privacy posture change is visible.
+   * at startup so the privacy posture change is visible. An active
+   * client-local source binding overrides this opt-in and keeps both the
+   * shared audit row and SSE event summarized.
    */
   logFullParams?: boolean;
   /**
@@ -616,6 +659,7 @@ export async function embeddingWidthStartupWarning(engine: BrainEngine): Promise
 
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
+  const effectiveLogFullParams = allowFullMcpAuditParams(logFullParams);
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
   // gbrain's primary use case is a personal-knowledge brain on a laptop;
   // the pre-v0.34 default exposed brains on every interface. Server
@@ -626,9 +670,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   const bind = options.bind ?? '127.0.0.1';
   const config = loadConfig() || { engine: 'pglite' as const };
 
-  if (logFullParams) {
+  if (logFullParams && effectiveLogFullParams) {
     console.error(
       '[serve-http] WARNING: --log-full-params writes raw request payloads to mcp_request_log + SSE feed. Disable for shared dashboards or production.',
+    );
+  } else if (logFullParams) {
+    console.error(
+      '[serve-http] --log-full-params ignored while a client-local source binding is active; audit payloads remain summarized.',
     );
   }
 
@@ -1950,22 +1998,29 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // misbehaving agents need to see the full attempt log, not just
         // valid-op success/error.
         const latency = Date.now() - startTime;
+        const auditOperation = redactClientLocalMcpAuditOperation(name);
+        const auditErrorMessage = redactClientLocalMcpAuditError(
+          `unknown_operation: ${name}`,
+        );
         try {
           await executeRawJsonb(
             engine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`],
+            [authInfo.clientId, agentName, auditOperation, latency, 'error', auditErrorMessage],
             [null],
           );
         } catch { /* best effort */ }
         broadcastEvent({
           agent: agentName,
-          operation: name,
+          operation: auditOperation,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'error',
-          error: { code: 'unknown_operation', message: `Unknown: ${name}` },
+          error: {
+            code: 'unknown_operation',
+            message: redactClientLocalMcpAuditError(`Unknown: ${name}`),
+          },
           timestamp: new Date().toISOString(),
         });
         return { content: [{ type: 'text', text: JSON.stringify({ error: 'unknown_operation', message: `Unknown: ${name}` }) }], isError: true };
@@ -2028,10 +2083,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // 'tools/list'. Pre-existing string-shaped rows are normalized by
       // migration v41 in src/core/migrate.ts.
       const safeParamsSummary = summarizeMcpParams(name, params);
-      const logParamsObj: unknown = logFullParams
+      const logParamsObj: unknown = effectiveLogFullParams
         ? (params || null)
         : (safeParamsSummary || null);
-      const broadcastParams = logFullParams ? (params || {}) : safeParamsSummary;
+      const broadcastParams = effectiveLogFullParams
+        ? (params || {})
+        : safeParamsSummary;
 
       // v0.31 (D12 / eE1): refactor the inlined op.handler call to go through
       // src/mcp/dispatch.ts so HTTP MCP shares the same dispatch path as
@@ -2086,12 +2143,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // real object, not a JSON-encoded string.
         const latency = Date.now() - startTime;
         const errorPayload = serializeError(e);
+        const auditErrorMessage = redactClientLocalMcpAuditError(
+          errorPayload.message,
+        );
         try {
           await executeRawJsonb(
             engine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message],
+            [authInfo.clientId, agentName, name, latency, 'error', auditErrorMessage],
             [logParamsObj],
           );
         } catch { /* best effort */ }
@@ -2102,7 +2162,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'error',
-          error: errorPayload,
+          error: { ...errorPayload, message: auditErrorMessage },
           timestamp: new Date().toISOString(),
         });
         return { content: [{ type: 'text', text: JSON.stringify({ error: errorPayload }) }], isError: true };
@@ -2118,6 +2178,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           const parsed = JSON.parse(toolResult.content[0]?.text ?? '{}');
           errMsg = parsed.error?.message ?? parsed.message ?? errMsg;
         } catch { /* ignore */ }
+        errMsg = redactClientLocalMcpAuditError(errMsg);
         try {
           await executeRawJsonb(
             engine,
