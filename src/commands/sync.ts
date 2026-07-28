@@ -3415,12 +3415,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   }
 
   // Log ingest
+  const ingestSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
   await engine.logIngest({
-    // #3242 (attribution sub-bug): credit the sync to the source it wrote
-    // to, not the shared 'default' bucket.
-    ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
+    // Credit the sync to the source it wrote to, without persisting this
+    // client's checkout path in shared provenance.
+    source_id: ingestSourceId,
     source_type: 'git_sync',
-    source_ref: `${repoPath} @ ${headCommit.slice(0, 8)}`,
+    source_ref: `source:${ingestSourceId} @ ${headCommit.slice(0, 8)}`,
     pages_updated: pagesAffected,
     summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
   });
@@ -4193,6 +4194,13 @@ See also:
   const syncAll = args.includes('--all');
   const jsonOut = args.includes('--json');
   const yesFlag = args.includes('--yes');
+  if (syncAll && repoPath) {
+    console.error(
+      '--repo cannot be combined with --all because it names one checkout. ' +
+      'Run one source explicitly with --source <id> --repo <path>.',
+    );
+    process.exit(1);
+  }
   // v0.41.6.0 D3: lock-recovery flags. --break-lock (safe) verifies the
   // holder is local-host + (TTL-expired OR PID-dead+60s-old) before
   // deleting the row. --force-break-lock skips the liveness check. Both

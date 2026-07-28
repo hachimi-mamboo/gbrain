@@ -80,15 +80,24 @@ afterEach(() => {
   if (repoPath) rmSync(repoPath, { recursive: true, force: true });
 });
 
-/** Run runSync(args) with process.exit + console.log captured. */
-async function runSyncCaptured(args: string[]): Promise<{ exitCode: number | undefined; stdout: string }> {
+/** Run runSync(args) with process.exit + console output captured. */
+async function runSyncCaptured(args: string[]): Promise<{
+  exitCode: number | undefined;
+  stdout: string;
+  stderr: string;
+}> {
   const { runSync } = await import('../src/commands/sync.ts');
   const origExit = process.exit;
   const origLog = console.log.bind(console);
+  const origError = console.error.bind(console);
   const out: string[] = [];
+  const err: string[] = [];
   let exitCode: number | undefined;
   console.log = (...a: unknown[]) => {
     out.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '));
+  };
+  console.error = (...a: unknown[]) => {
+    err.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '));
   };
   process.exit = ((code?: number) => {
     exitCode = code;
@@ -101,11 +110,21 @@ async function runSyncCaptured(args: string[]): Promise<{ exitCode: number | und
   } finally {
     process.exit = origExit;
     console.log = origLog;
+    console.error = origError;
   }
-  return { exitCode, stdout: out.join('\n') };
+  return { exitCode, stdout: out.join('\n'), stderr: err.join('\n') };
 }
 
 describe('v0.41.31 — sync --all cost gate wiring', () => {
+  test('--all rejects an explicit --repo instead of silently ignoring it', async () => {
+    const { exitCode, stderr } = await runSyncCaptured([
+      '--all', '--repo', repoPath, '--no-embed',
+    ]);
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--repo cannot be combined with --all');
+  });
+
   test('R-1: deferred sync --all (non-TTY) emits deferred_notice and never exit 2', async () => {
     await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
     // Make the fan-out a clean no-op: last_commit == HEAD so performSync
@@ -266,5 +285,44 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
       `SELECT local_path FROM sources WHERE id = 'vault'`,
     );
     expect(rows[0]?.local_path).toBe(sharedPath);
+
+    const logs = await engine.getIngestLog({ limit: 10 });
+    const directoryLog = logs.find((entry) => entry.source_type === 'directory');
+    expect(directoryLog?.source_id).toBe('vault');
+    expect(directoryLog?.source_ref).toBe(`source:vault @ ${headSha.slice(0, 8)}`);
+    expect(directoryLog?.source_ref).not.toContain(repoPath);
+  }, 60_000);
+
+  test('incremental client-local sync logs stable source provenance without its checkout path', async () => {
+    await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    const sharedPath = `${repoPath}-other-client`;
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'vault'`,
+      [sharedPath],
+    );
+
+    await withEnv(
+      { GBRAIN_SOURCE: 'vault', GBRAIN_SOURCE_PATH: repoPath },
+      () => runSyncCaptured(['--source', 'vault', '--no-embed', '--no-pull']),
+    );
+
+    writeFileSync(
+      join(repoPath, 'topics/foo.md'),
+      ['---', 'type: concept', 'title: Foo', '---', '', 'updated client-local content.'].join('\n'),
+    );
+    execSync('git add -A && git commit -m incremental', { cwd: repoPath, stdio: 'pipe' });
+    const incrementalHead = execSync('git rev-parse HEAD', { cwd: repoPath, stdio: 'pipe' }).toString().trim();
+
+    const { exitCode } = await withEnv(
+      { GBRAIN_SOURCE: 'vault', GBRAIN_SOURCE_PATH: repoPath },
+      () => runSyncCaptured(['--source', 'vault', '--no-embed', '--no-pull']),
+    );
+
+    expect(exitCode).not.toBe(1);
+    const logs = await engine.getIngestLog({ limit: 10 });
+    const syncLog = logs.find((entry) => entry.source_type === 'git_sync');
+    expect(syncLog?.source_id).toBe('vault');
+    expect(syncLog?.source_ref).toBe(`source:vault @ ${incrementalHead.slice(0, 8)}`);
+    expect(syncLog?.source_ref).not.toContain(repoPath);
   }, 60_000);
 });

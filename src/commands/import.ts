@@ -478,10 +478,13 @@ export async function runImport(
     }
   }
 
-  // Log the ingest
+  // Shared audit provenance names the logical source (and optional Git
+  // commit), never this client's absolute import directory.
+  const ingestSourceId = sourceId ?? 'default';
   await engine.logIngest({
+    source_id: ingestSourceId,
     source_type: 'directory',
-    source_ref: dir,
+    source_ref: `source:${ingestSourceId}${opts.commit ? ` @ ${opts.commit.slice(0, 8)}` : ''}`,
     pages_updated: importedSlugs,
     summary: `Imported ${imported} pages, ${skipped} skipped, ${chunksCreated} chunks`,
   });
