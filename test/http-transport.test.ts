@@ -621,4 +621,40 @@ describe('http-transport: mcp_request_log audit', () => {
       expect(row.status).toBe('auth_failed');
     } finally { srv.stop(); }
   });
+
+  test('23. active client binding redacts path-bearing legacy token and method identities', async () => {
+    const TOK = 'path-audit-tok';
+    const previousSource = process.env.GBRAIN_SOURCE;
+    const previousSourcePath = process.env.GBRAIN_SOURCE_PATH;
+    process.env.GBRAIN_SOURCE = 'default';
+    process.env.GBRAIN_SOURCE_PATH = '/clients/b/wiki';
+    const srv = await startTest({
+      validTokens: new Map([[
+        hash(TOK),
+        { id: 'path-audit-id', name: '/clients/a/wiki' },
+      ]]),
+    });
+    try {
+      await fetch(`${srv.url}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${TOK}`,
+          'Content-Type': 'application/json',
+        },
+        body: rpc('/clients/b/wiki/unknown-method'),
+      });
+      await new Promise(r => setTimeout(r, 10));
+      const row = srv.engine.audit[srv.engine.audit.length - 1];
+      expect(row.token_name).toBe('client-local-identity');
+      expect(row.operation).toBe('unknown_operation');
+      expect(JSON.stringify(row)).not.toContain('/clients/a/wiki');
+      expect(JSON.stringify(row)).not.toContain('/clients/b/wiki');
+    } finally {
+      srv.stop();
+      if (previousSource === undefined) delete process.env.GBRAIN_SOURCE;
+      else process.env.GBRAIN_SOURCE = previousSource;
+      if (previousSourcePath === undefined) delete process.env.GBRAIN_SOURCE_PATH;
+      else process.env.GBRAIN_SOURCE_PATH = previousSourcePath;
+    }
+  });
 });

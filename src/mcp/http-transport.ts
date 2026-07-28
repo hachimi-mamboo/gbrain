@@ -35,6 +35,7 @@ import { dispatchToolCall } from './dispatch.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
+import { sanitizeClientLocalMcpAuditFields } from '../core/mcp-audit.ts';
 export { parseLegacyTokenScope };
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
@@ -247,8 +248,15 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   }
 
   function logRequest(tokenName: string | null, operation: string, status: string, latencyMs: number) {
+    const safeFields = sanitizeClientLocalMcpAuditFields({
+      tokenName,
+      agentName: null,
+      operation,
+      params: null,
+      errorMessage: null,
+    });
     sql`INSERT INTO mcp_request_log (token_name, operation, latency_ms, status)
-        VALUES (${tokenName}, ${operation}, ${latencyMs}, ${status})`
+        VALUES (${safeFields.tokenName}, ${safeFields.operation}, ${latencyMs}, ${status})`
       .catch(() => { /* best-effort */ });
   }
 
