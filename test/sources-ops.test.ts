@@ -257,6 +257,61 @@ describe('prepareClientSourceBinding', () => {
     expect(await engine.getConfig('sync.last_commit')).toBe('legacy-bookmark');
   });
 
+  test('removes legacy local remote_url locators while preserving the rest of source config', async () => {
+    await withEnv2(async () => {
+      const cases = [
+        ['legacy-file', 'file:/Users/alice/wiki'],
+        ['legacy-posix', '/Users/alice/wiki'],
+        ['legacy-drive', String.raw`C:\Users\alice\wiki`],
+        ['legacy-unc', String.raw`\\server\share\wiki`],
+        ['legacy-prefixed', 'directory:/Users/alice/wiki'],
+      ] as const;
+
+      for (const [sourceId, remoteUrl] of cases) {
+        const oldPath = join(GBRAIN_HOME, `${sourceId}-old`);
+        const clientPath = join(GBRAIN_HOME, `${sourceId}-client`);
+        mkdirSync(oldPath, { recursive: true });
+        mkdirSync(clientPath, { recursive: true });
+        await engine.executeRaw(
+          `INSERT INTO sources (id, name, local_path, last_commit, config)
+           VALUES ($1, $1, $2, 'stable-commit', $3::jsonb)`,
+          [
+            sourceId,
+            oldPath,
+            JSON.stringify({
+              remote_url: remoteUrl,
+              tracked_branch: 'main',
+              federated: true,
+            }),
+          ],
+        );
+
+        await withEnv(
+          { GBRAIN_SOURCE: sourceId, GBRAIN_SOURCE_PATH: clientPath },
+          () => prepareClientSourceBinding(engine, sourceId),
+        );
+
+        const rows = await engine.executeRaw<{
+          local_path: string | null;
+          last_commit: string | null;
+          config: Record<string, unknown>;
+        }>(
+          `SELECT local_path, last_commit, config FROM sources WHERE id = $1`,
+          [sourceId],
+        );
+        expect(rows).toEqual([{
+          local_path: null,
+          last_commit: 'stable-commit',
+          config: {
+            tracked_branch: 'main',
+            federated: true,
+          },
+        }]);
+        expect(JSON.stringify(rows)).not.toContain(remoteUrl);
+      }
+    });
+  });
+
   test('clears only client-local path state and invalidates matching queued jobs', async () => {
     await withEnv({ GBRAIN_HOME, PATH: REAL_PATH }, async () => {
       const stableRemote = 'https://git.example.invalid/private/wiki.git';

@@ -4113,7 +4113,7 @@ const sources_prepare_client: Operation = {
   name: 'sources_prepare_client',
   description:
     'Local-only client-binding entry seam. Requires matching GBRAIN_SOURCE and ' +
-    'absolute GBRAIN_SOURCE_PATH, validates the source remote identity, then ' +
+    'absolute GBRAIN_SOURCE_PATH, validates any stable source remote identity, then ' +
     'idempotently retires historical client paths from shared source/config/' +
     'ingest/job state without changing source identity, commit, or bookmarks.',
   params: {

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { operations } from '../../src/core/operations.ts';
@@ -397,5 +397,46 @@ describePostgres('client source binding native seam — Postgres', () => {
     expect(sharedState).not.toContain(clientB);
     expect(sharedState).not.toContain(remote);
     expect(sharedState).not.toContain(root);
+
+    const legacySourceId = 'legacy-local-remote-pg';
+    const legacyClientPath = join(root, 'legacy-client');
+    mkdirSync(legacyClientPath, { recursive: true });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, last_commit, config)
+       VALUES ($1, 'Legacy Local Remote PG', $2, 'stable-legacy-commit', $3::text::jsonb)`,
+      [
+        legacySourceId,
+        clientA,
+        JSON.stringify({
+          remote_url: `file://${clientA}`,
+          tracked_branch: 'main',
+          federated: true,
+        }),
+      ],
+    );
+    await withEnv(
+      { GBRAIN_SOURCE: legacySourceId, GBRAIN_SOURCE_PATH: legacyClientPath },
+      () => operation.handler(
+        { engine, remote: false, dryRun: false } as never,
+        { id: legacySourceId },
+      ),
+    );
+    const legacySource = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+      config: Record<string, unknown>;
+    }>(
+      `SELECT local_path, last_commit, config FROM sources WHERE id = $1`,
+      [legacySourceId],
+    );
+    expect(legacySource).toEqual([{
+      local_path: null,
+      last_commit: 'stable-legacy-commit',
+      config: {
+        tracked_branch: 'main',
+        federated: true,
+      },
+    }]);
+    expect(JSON.stringify(legacySource)).not.toContain(clientA);
   });
 });

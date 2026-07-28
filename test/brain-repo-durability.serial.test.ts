@@ -189,7 +189,7 @@ describe('hardenBrainRepo', () => {
       executeRaw: async () => [{
         id: 'wiki',
         local_path: null,
-        config: { remote_url: join(root, 'other.git') },
+        config: { remote_url: 'https://git.example.invalid/other.git' },
       }],
     } as unknown as BrainEngine;
     const before = git(work, 'rev-parse', 'HEAD');
