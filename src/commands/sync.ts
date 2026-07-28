@@ -1932,7 +1932,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     opts.repoPath ||
     clientSourcePath ||
     await readSyncAnchor(engine, opts.sourceId, 'repo_path');
-  const persistRepoPath = clientSourcePath === null;
+  const persistRepoPath = !opts.repoPath && clientSourcePath === null;
   if (!repoPath) {
     const hint = opts.sourceId
       ? `Source "${opts.sourceId}" has no local_path. Run: gbrain sources add ${opts.sourceId} --path <path>`
