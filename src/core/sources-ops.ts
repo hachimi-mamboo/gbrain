@@ -404,8 +404,8 @@ async function countAllPages(engine: BrainEngine, id: string): Promise<number> {
  * It deliberately leaves ordinary `sources add --path` registrations alone:
  * callers must opt in with a matching `GBRAIN_SOURCE` + absolute
  * `GBRAIN_SOURCE_PATH`. The operation is idempotent and preserves source
- * identity, config (including remote identity), last_commit, and sync
- * bookmarks while removing historical checkout roots from shared state.
+ * identity, valid stable remote/config fields, last_commit, and sync bookmarks
+ * while removing historical checkout roots from shared state.
  */
 export async function prepareClientSourceBinding(
   engine: BrainEngine,
@@ -424,7 +424,17 @@ export async function prepareClientSourceBinding(
       `GBRAIN_SOURCE=${sourceId} and an absolute GBRAIN_SOURCE_PATH.`,
     );
   }
-  assertClientSourceCheckout(sourceId, clientPath, source.config);
+  const preparedSourceConfig = { ...parseConfig(source.config) };
+  const clearsLocalRemoteLocator =
+    typeof preparedSourceConfig.remote_url === 'string' &&
+    isClientPathShapedText(preparedSourceConfig.remote_url);
+  const localRemoteLocator = clearsLocalRemoteLocator
+    ? preparedSourceConfig.remote_url as string
+    : null;
+  if (clearsLocalRemoteLocator) {
+    delete preparedSourceConfig.remote_url;
+  }
+  assertClientSourceCheckout(sourceId, clientPath, preparedSourceConfig);
 
   const legacyRepoPath = await engine.getConfig('sync.repo_path');
   const sourceRoots = uniquePathSpellings([
@@ -757,10 +767,27 @@ export async function prepareClientSourceBinding(
       sanitizedIngestIds.push(row.id);
     }
 
-    await tx.executeRaw(
-      `UPDATE sources SET local_path = NULL WHERE id = $1`,
-      [sourceId],
-    );
+    if (clearsLocalRemoteLocator) {
+      const updated = await tx.executeRaw<{ id: string }>(
+        `UPDATE sources
+            SET local_path = NULL,
+                config = config - 'remote_url'
+          WHERE id = $1
+            AND config->>'remote_url' = $2
+        RETURNING id`,
+        [sourceId, localRemoteLocator],
+      );
+      if (updated.length !== 1) {
+        throw new Error(
+          `Source "${sourceId}" config changed while preparing the client-local binding; retry.`,
+        );
+      }
+    } else {
+      await tx.executeRaw(
+        `UPDATE sources SET local_path = NULL WHERE id = $1`,
+        [sourceId],
+      );
+    }
     if (clearLegacyRepoPath) {
       await tx.unsetConfig('sync.repo_path');
     }
