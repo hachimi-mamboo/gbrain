@@ -521,6 +521,110 @@ describe('prepareClientSourceBinding', () => {
     });
   });
 
+  test('recursively sanitizes every MCP request-log field and preserves stable remote locators', async () => {
+    await withEnv2(async () => {
+      const oldPath = join(GBRAIN_HOME, 'mcp-client-a');
+      const clientPath = join(GBRAIN_HOME, 'mcp-client-b');
+      const stableHttps = 'https://example.com/C:/repo.git';
+      const stableSsh = 'ssh://git@example.com/path:/repo.git';
+      const stableScp = 'git@example.com:C:/repo.git';
+      mkdirSync(oldPath, { recursive: true });
+      mkdirSync(clientPath, { recursive: true });
+      await engine.executeRaw(
+        `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+        [oldPath],
+      );
+      await engine.setConfig('sync.repo_path', oldPath);
+      await engine.executeRaw(
+        `INSERT INTO mcp_request_log (
+           token_name, agent_name, operation, latency_ms, status, params, error_message
+         )
+         VALUES
+           ($1, $2, $3, 12, 'error', $4::jsonb, $5),
+           ($6, $7, $8, 8, 'success', $9::jsonb, $10)`,
+        [
+          `token:${oldPath}`,
+          `agent ${clientPath}`,
+          `query:${oldPath}`,
+          JSON.stringify({
+            [oldPath]: {
+              nested: [
+                { cwd: clientPath },
+                stableHttps,
+              ],
+            },
+            stable: stableSsh,
+          }),
+          `failed at ${clientPath}`,
+          stableHttps,
+          stableSsh,
+          stableScp,
+          JSON.stringify({
+            locator: stableHttps,
+            nested: [stableSsh, stableScp],
+          }),
+          `mirrored from ${stableHttps}`,
+        ],
+      );
+
+      await withEnv(
+        { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'default'),
+      );
+
+      const rows = await engine.executeRaw<{
+        token_name: string | null;
+        agent_name: string | null;
+        operation: string;
+        params: unknown;
+        error_message: string | null;
+      }>(
+        `SELECT token_name, agent_name, operation, params, error_message
+           FROM mcp_request_log
+          ORDER BY id`,
+      );
+      expect(rows).toEqual([
+        {
+          token_name: 'token:[client-local-path]',
+          agent_name: 'agent [client-local-path]',
+          operation: 'query:[client-local-path]',
+          params: {
+            '[client-local-path]': {
+              nested: [
+                { cwd: '[client-local-path]' },
+                stableHttps,
+              ],
+            },
+            stable: stableSsh,
+          },
+          error_message: 'failed at [client-local-path]',
+        },
+        {
+          token_name: stableHttps,
+          agent_name: stableSsh,
+          operation: stableScp,
+          params: {
+            locator: stableHttps,
+            nested: [stableSsh, stableScp],
+          },
+          error_message: `mirrored from ${stableHttps}`,
+        },
+      ]);
+      expect(JSON.stringify(rows)).not.toContain(oldPath);
+      expect(JSON.stringify(rows)).not.toContain(clientPath);
+
+      await withEnv(
+        { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'default'),
+      );
+      expect(await engine.executeRaw(
+        `SELECT token_name, agent_name, operation, params, error_message
+           FROM mcp_request_log
+          ORDER BY id`,
+      )).toEqual(rows);
+    });
+  });
+
   test('public log_ingest runs cleanup first and direct engine writes reject every controlled path field', async () => {
     await withEnv2(async () => {
       const oldPath = join(GBRAIN_HOME, 'log-client-a');
@@ -1321,6 +1425,19 @@ describe('prepareClientSourceBinding', () => {
          VALUES ('arbitrary-cas', 'waiting', $1::jsonb)`,
         [JSON.stringify({ nested: [{ repoPath: oldPath }] })],
       );
+      await engine.executeRaw(
+        `INSERT INTO mcp_request_log (
+           token_name, agent_name, operation, params, error_message
+         )
+         VALUES ($1, $2, $3, $4::jsonb, $5)`,
+        [
+          `token:${oldPath}`,
+          `agent:${clientPath}`,
+          `query:${oldPath}`,
+          JSON.stringify({ nested: [{ cwd: clientPath }] }),
+          `failed at ${oldPath}`,
+        ],
+      );
 
       const originalTransaction = engine.transaction.bind(engine);
       (engine as unknown as {
@@ -1373,6 +1490,16 @@ describe('prepareClientSourceBinding', () => {
       )).toEqual([{
         status: 'waiting',
         data: { nested: [{ repoPath: oldPath }] },
+      }]);
+      expect(await engine.executeRaw(
+        `SELECT token_name, agent_name, operation, params, error_message
+           FROM mcp_request_log`,
+      )).toEqual([{
+        token_name: `token:${oldPath}`,
+        agent_name: `agent:${clientPath}`,
+        operation: `query:${oldPath}`,
+        params: { nested: [{ cwd: clientPath }] },
+        error_message: `failed at ${oldPath}`,
       }]);
     });
   });

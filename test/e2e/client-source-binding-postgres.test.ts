@@ -28,6 +28,9 @@ describePostgres('client source binding native seam — Postgres', () => {
     const sourceId = 'client-binding-pg';
     const otherSourceId = 'client-binding-other-pg';
     const stableRemote = 'https://git.example.invalid/private/wiki.git';
+    const stableAuditHttps = 'https://example.com/C:/repo.git';
+    const stableAuditSsh = 'ssh://git@example.com/path:/repo.git';
+    const stableAuditScp = 'git@example.com:C:/repo.git';
     const remote = join(root, 'origin.git');
     const clientA = join(root, 'client-a');
     const clientB = join(root, 'client-b');
@@ -59,6 +62,7 @@ describePostgres('client source binding native seam — Postgres', () => {
 
     await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [sourceId]);
     await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [otherSourceId]);
+    await engine.executeRaw(`DELETE FROM mcp_request_log`);
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, last_commit, config)
        VALUES ($1, 'Client Binding PG', $2, $3, $4::text::jsonb)`,
@@ -91,6 +95,34 @@ describePostgres('client source binding native seam — Postgres', () => {
         otherSourceId,
         JSON.stringify([{ nested: [{ repoPath: clientA }] }]),
         `misattributed legacy import from ${clientA}`,
+      ],
+    );
+    await engine.executeRaw(
+      `INSERT INTO mcp_request_log (
+         token_name, agent_name, operation, latency_ms, status, params, error_message
+       )
+       VALUES
+         ($1, $2, $3, 12, 'error', $4::text::jsonb, $5),
+         ($6, $7, $8, 8, 'success', $9::text::jsonb, $10)`,
+      [
+        `token:${clientA}`,
+        `agent:${clientB}`,
+        `query:${clientA}`,
+        JSON.stringify({
+          [clientA]: {
+            nested: [{ cwd: clientB }, stableAuditHttps],
+          },
+          stable: stableAuditSsh,
+        }),
+        `failed at ${clientB}`,
+        stableAuditHttps,
+        stableAuditSsh,
+        stableAuditScp,
+        JSON.stringify({
+          locator: stableAuditHttps,
+          nested: [stableAuditSsh, stableAuditScp],
+        }),
+        `mirrored from ${stableAuditHttps}`,
       ],
     );
     const parent = await engine.executeRaw<{ id: number }>(
@@ -264,6 +296,41 @@ describePostgres('client source binding native seam — Postgres', () => {
       arbitraryNested[0].id,
       inboxOnly[0].id,
     ]);
+    const mcpAfterFirst = await engine.executeRaw<{
+      token_name: string | null;
+      agent_name: string | null;
+      operation: string;
+      params: unknown;
+      error_message: string | null;
+    }>(
+      `SELECT token_name, agent_name, operation, params, error_message
+         FROM mcp_request_log
+        ORDER BY id`,
+    );
+    expect(mcpAfterFirst).toEqual([
+      {
+        token_name: 'token:[client-local-path]',
+        agent_name: 'agent:[client-local-path]',
+        operation: 'query:[client-local-path]',
+        params: {
+          '[client-local-path]': {
+            nested: [{ cwd: '[client-local-path]' }, stableAuditHttps],
+          },
+          stable: stableAuditSsh,
+        },
+        error_message: 'failed at [client-local-path]',
+      },
+      {
+        token_name: stableAuditHttps,
+        agent_name: stableAuditSsh,
+        operation: stableAuditScp,
+        params: {
+          locator: stableAuditHttps,
+          nested: [stableAuditSsh, stableAuditScp],
+        },
+        error_message: `mirrored from ${stableAuditHttps}`,
+      },
+    ]);
     await withEnv(
       { GBRAIN_SOURCE: sourceId, GBRAIN_SOURCE_PATH: clientB },
       async () => {
@@ -321,6 +388,12 @@ describePostgres('client source binding native seam — Postgres', () => {
       ],
       cancelled_job_ids: [],
     });
+    const mcp = await engine.executeRaw(
+      `SELECT token_name, agent_name, operation, params, error_message
+         FROM mcp_request_log
+        ORDER BY id`,
+    );
+    expect(mcp).toEqual(mcpAfterFirst);
 
     const source = await engine.executeRaw<{
       id: string;
@@ -489,6 +562,7 @@ describePostgres('client source binding native seam — Postgres', () => {
       ingest,
       jobs,
       inbox,
+      mcp,
     });
     expect(sharedState).not.toContain(clientA);
     expect(sharedState).not.toContain(clientB);

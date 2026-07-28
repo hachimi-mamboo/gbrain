@@ -882,6 +882,90 @@ export async function prepareClientSourceBinding(
       sanitizedIngestIds.push(row.id);
     }
 
+    type ClientBindingMcpRequestRow = {
+      id: number;
+      token_name: string | null;
+      agent_name: string | null;
+      operation: string;
+      params: unknown;
+      error_message: string | null;
+    };
+    const mcpRequestValue = (row: ClientBindingMcpRequestRow): unknown => ({
+      token_name: row.token_name,
+      agent_name: row.agent_name,
+      operation: row.operation,
+      params: parseSharedJson(row.params),
+      error_message: row.error_message,
+    });
+    // MCP identity and audit fields historically accepted free strings.
+    // Discover recursively without locking the whole log, then lock and
+    // re-check only rows carrying a current or retired client path.
+    const scannedMcpRequestRows = await tx.executeRaw<ClientBindingMcpRequestRow>(
+      `SELECT id, token_name, agent_name, operation, params, error_message
+         FROM mcp_request_log`,
+    );
+    const mcpRequestCandidateIds = scannedMcpRequestRows
+      .filter((row) =>
+        structuredValueContainsClientPath(mcpRequestValue(row), sharedRoots))
+      .map((row) => row.id)
+      .sort((a, b) => a - b);
+    const mcpRequestRows = mcpRequestCandidateIds.length > 0
+      ? await tx.executeRaw<ClientBindingMcpRequestRow>(
+        `SELECT id, token_name, agent_name, operation, params, error_message
+           FROM mcp_request_log
+          WHERE id = ANY($1::int[])
+          FOR UPDATE`,
+        [mcpRequestCandidateIds],
+      )
+      : [];
+    for (const row of mcpRequestRows) {
+      if (!structuredValueContainsClientPath(
+        mcpRequestValue(row),
+        sharedRoots,
+      )) {
+        continue;
+      }
+      const tokenName = row.token_name === null
+        ? null
+        : redactKnownRoots(row.token_name, sharedRoots) as string;
+      const agentName = row.agent_name === null
+        ? null
+        : redactKnownRoots(row.agent_name, sharedRoots) as string;
+      const operation = redactKnownRoots(row.operation, sharedRoots) as string;
+      const params = row.params === null
+        ? null
+        : redactKnownRoots(parseSharedJson(row.params), sharedRoots);
+      const errorMessage = row.error_message === null
+        ? null
+        : redactKnownRoots(row.error_message, sharedRoots) as string;
+      if (
+        tokenName === row.token_name &&
+        agentName === row.agent_name &&
+        operation === row.operation &&
+        JSON.stringify(params) === JSON.stringify(parseSharedJson(row.params)) &&
+        errorMessage === row.error_message
+      ) {
+        continue;
+      }
+      await tx.executeRaw(
+        `UPDATE mcp_request_log
+            SET token_name = $1,
+                agent_name = $2,
+                operation = $3,
+                params = $4::text::jsonb,
+                error_message = $5
+          WHERE id = $6`,
+        [
+          tokenName,
+          agentName,
+          operation,
+          params === null ? null : JSON.stringify(params),
+          errorMessage,
+          row.id,
+        ],
+      );
+    }
+
     if (clearsLocalRemoteLocator) {
       const updated = await tx.executeRaw<{ id: string }>(
         `UPDATE sources
