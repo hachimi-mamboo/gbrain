@@ -248,6 +248,19 @@ function getRemoteUrl(config: unknown): string | null {
   return typeof v === 'string' ? v : null;
 }
 
+function isClientLocalRemoteLocator(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const locator = value.trim();
+  if (/^https:\/\//i.test(locator)) return false;
+  return (
+    /^(?:file|directory|path):/i.test(locator) ||
+    /^git:[\\/](?![\\/])/i.test(locator) ||
+    locator.startsWith('/') ||
+    /^[A-Za-z]:[\\/]/.test(locator) ||
+    locator.startsWith('\\\\')
+  );
+}
+
 function uniquePathSpellings(paths: Array<string | null>): string[] {
   const values = new Set<string>();
   for (const path of paths) {
@@ -426,8 +439,7 @@ export async function prepareClientSourceBinding(
   }
   const preparedSourceConfig = { ...parseConfig(source.config) };
   const clearsLocalRemoteLocator =
-    typeof preparedSourceConfig.remote_url === 'string' &&
-    isClientPathShapedText(preparedSourceConfig.remote_url);
+    isClientLocalRemoteLocator(preparedSourceConfig.remote_url);
   const localRemoteLocator = clearsLocalRemoteLocator
     ? preparedSourceConfig.remote_url as string
     : null;
