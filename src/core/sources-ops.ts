@@ -192,7 +192,9 @@ const LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES = new Set([
 const LEGACY_GLOBAL_INVALIDATE_JOB_NAMES = new Set([
   'sync',
   'autopilot-cycle',
+  'autopilot-global-maintenance',
 ]);
+const CLIENT_BINDING_MARKER_KEY = 'clientBindingSourceId';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -439,6 +441,8 @@ export async function prepareClientSourceBinding(
   ]);
   const retiringLegacyBinding =
     source.local_path !== null || clearLegacyRepoPath;
+  const retireLegacyGlobalState =
+    clearLegacyRepoPath || sourceId === 'default';
 
   let hasMinionJobs = true;
   let hasMinionInbox = true;
@@ -483,6 +487,7 @@ export async function prepareClientSourceBinding(
            FROM minion_jobs
           WHERE data->>'sourceId' = $1
              OR data->>'source_id' = $1
+             OR data->>'clientBindingSourceId' = $1
              OR data ? 'repoPath'
              OR name = ANY($2::text[])
           FOR UPDATE`,
@@ -519,11 +524,18 @@ export async function prepareClientSourceBinding(
         const data = parseJobData(row.data);
         const matchesSource =
           data.sourceId === sourceId || data.source_id === sourceId;
+        const matchesClientBinding =
+          data[CLIENT_BINDING_MARKER_KEY] === sourceId;
         const hasExplicitSource =
           typeof data.sourceId === 'string' || typeof data.source_id === 'string';
         const isLegacyGlobalFilesystemJob =
           !hasExplicitSource && LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES.has(row.name);
-        const repoPathMatches = pathBelongsToRoot(data.repoPath, sharedRoots);
+        const hasClientRepoPath =
+          typeof data.repoPath === 'string' &&
+          (
+            pathBelongsToRoot(data.repoPath, sharedRoots) ||
+            isClientPathShapedText(data.repoPath)
+          );
         const hasStructuredPath = [
           data,
           row.result,
@@ -533,18 +545,19 @@ export async function prepareClientSourceBinding(
         ].some((value) =>
           structuredValueContainsClientPath(parseSharedJson(value), sharedRoots));
         return (
-          repoPathMatches ||
+          hasClientRepoPath ||
           (
             isLegacyGlobalFilesystemJob &&
-            clearLegacyRepoPath &&
+            retireLegacyGlobalState &&
             (hasStructuredPath || candidateInboxPathIds.has(row.id))
           ) ||
           (
-            matchesSource &&
+            (matchesSource || matchesClientBinding) &&
             (
               hasStructuredPath ||
               candidateInboxPathIds.has(row.id) ||
               (
+                matchesSource &&
                 retiringLegacyBinding &&
                 CLIENT_BOUND_FILESYSTEM_JOB_NAMES.has(row.name) &&
                 nonterminal.has(row.status)
@@ -554,7 +567,8 @@ export async function prepareClientSourceBinding(
           (
             isLegacyGlobalFilesystemJob &&
             LEGACY_GLOBAL_INVALIDATE_JOB_NAMES.has(row.name) &&
-            clearLegacyRepoPath &&
+            retireLegacyGlobalState &&
+            retiringLegacyBinding &&
             nonterminal.has(row.status)
           )
         );
@@ -594,6 +608,30 @@ export async function prepareClientSourceBinding(
         const data = parseJobData(row.data);
         const repoPath = typeof data.repoPath === 'string' ? data.repoPath : null;
         const rowRoots = uniquePathSpellings([...allTargetRoots, repoPath]);
+        const sanitizedData = redactKnownRoots(data, rowRoots, true) as Record<string, unknown>;
+        const hasExplicitSource =
+          typeof data.sourceId === 'string' || typeof data.source_id === 'string';
+        const matchesSource =
+          data.sourceId === sourceId || data.source_id === sourceId;
+        if (!hasExplicitSource) {
+          const ownsRepoPath = pathBelongsToRoot(repoPath, sharedRoots);
+          const ownsLegacyGlobal =
+            LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES.has(row.name) &&
+            retireLegacyGlobalState;
+          if (ownsRepoPath || ownsLegacyGlobal) {
+            sanitizedData.sourceId = sourceId;
+          } else {
+            // An arbitrary absolute repoPath is enough to require cleanup, but
+            // not enough to infer product source ownership. Keep only a stable
+            // cleanup marker so a racing late result is caught on the next
+            // idempotent call without fabricating sourceId semantics.
+            sanitizedData[CLIENT_BINDING_MARKER_KEY] = sourceId;
+          }
+        } else if (!matchesSource) {
+          // Preserve the row's original source identity, but retain the
+          // path-cleanup binding independently for a possible late result.
+          sanitizedData[CLIENT_BINDING_MARKER_KEY] = sourceId;
+        }
         const pathShapedError = structuredValueContainsClientPath(
           row.error_text,
           rowRoots,
@@ -613,7 +651,7 @@ export async function prepareClientSourceBinding(
                   stacktrace = $5::text::jsonb
             WHERE id = $6`,
           [
-            JSON.stringify(redactKnownRoots(data, rowRoots, true)),
+            JSON.stringify(sanitizedData),
             row.result === null
               ? null
               : JSON.stringify(redactKnownRoots(parseSharedJson(row.result), rowRoots, true)),
