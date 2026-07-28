@@ -78,6 +78,12 @@ describe('import --source-id (#1167)', () => {
     for (const r of rows) {
       expect(r.source_id).toBe('dept-x');
     }
+
+    const logs = await engine.getIngestLog({ limit: 10 });
+    const directoryLog = logs.find((entry) => entry.source_type === 'directory');
+    expect(directoryLog?.source_id).toBe('dept-x');
+    expect(directoryLog?.source_ref).toBe('source:dept-x');
+    expect(directoryLog?.source_ref).not.toContain(scratchDir);
   });
 
   test('--source-id value is NOT treated as a positional dir arg', async () => {
