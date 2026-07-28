@@ -109,10 +109,20 @@ describe('put_page write-through — happy path', () => {
     expect(result.write_through).toMatchObject({ written: true, path: clientFile });
     expect(fs.existsSync(clientFile)).toBe(true);
     expect(fs.existsSync(path.join(sharedDir, 'inbox/client-bound.md'))).toBe(false);
-    const rows = await engine.executeRaw<{ local_path: string | null }>(
-      `SELECT local_path FROM sources WHERE id = 'default'`,
+    const rows = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+      `SELECT local_path, config FROM sources WHERE id = 'default'`,
     );
     expect(rows[0]?.local_path).toBe(sharedDir);
+    expect(JSON.stringify(rows[0]?.config)).not.toContain(clientDir);
+
+    const config = await engine.executeRaw<{ value: unknown }>(`SELECT value FROM config`);
+    for (const row of config) {
+      expect(JSON.stringify(row.value)).not.toContain(clientDir);
+    }
+    const logs = await engine.getIngestLog({ limit: 10 });
+    for (const row of logs) {
+      expect(row.source_ref).not.toContain(clientDir);
+    }
   });
 
   test('client-local binding refuses a checkout whose remote identity drifted', async () => {

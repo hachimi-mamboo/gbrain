@@ -17,7 +17,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -115,6 +115,28 @@ async function runSyncCaptured(args: string[]): Promise<{
   return { exitCode, stdout: out.join('\n'), stderr: err.join('\n') };
 }
 
+async function expectClientPathAbsentFromSharedState(clientPath: string): Promise<void> {
+  const sources = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+    `SELECT local_path, config FROM sources`,
+  );
+  for (const row of sources) {
+    expect(row.local_path).not.toBe(clientPath);
+    expect(JSON.stringify(row.config)).not.toContain(clientPath);
+  }
+
+  const config = await engine.executeRaw<{ key: string; value: unknown }>(
+    `SELECT key, value FROM config`,
+  );
+  for (const row of config) {
+    expect(JSON.stringify(row.value)).not.toContain(clientPath);
+  }
+
+  const logs = await engine.getIngestLog({ limit: 100 });
+  for (const row of logs) {
+    expect(row.source_ref).not.toContain(clientPath);
+  }
+}
+
 describe('v0.41.31 — sync --all cost gate wiring', () => {
   test('--all rejects an explicit --repo instead of silently ignoring it', async () => {
     const { exitCode, stderr } = await runSyncCaptured([
@@ -124,6 +146,40 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
     expect(exitCode).toBe(1);
     expect(stderr).toContain('--repo cannot be combined with --all');
   });
+
+  test('explicit --repo stays client-local across bootstrap, full sync, and restore', async () => {
+    const commonArgs = [
+      '--source', 'default', '--no-embed', '--no-pull',
+    ];
+
+    const bootstrap = await runSyncCaptured([
+      '--repo', repoPath, ...commonArgs,
+    ]);
+    expect(bootstrap.exitCode).not.toBe(1);
+    await expectClientPathAbsentFromSharedState(repoPath);
+
+    const full = await runSyncCaptured([
+      '--repo', repoPath, '--full', ...commonArgs,
+    ]);
+    expect(full.exitCode).not.toBe(1);
+    await expectClientPathAbsentFromSharedState(repoPath);
+
+    const restoreRoot = mkdtempSync(join(tmpdir(), 'gbrain-costgate-restore-'));
+    const restorePath = join(restoreRoot, 'checkout');
+    try {
+      execFileSync('git', ['clone', '--quiet', repoPath, restorePath]);
+      await resetPgliteState(engine);
+
+      const restore = await runSyncCaptured([
+        '--repo', restorePath, ...commonArgs,
+      ]);
+      expect(restore.exitCode).not.toBe(1);
+      expect(await engine.getPage('topics/foo', { sourceId: 'default' })).not.toBeNull();
+      await expectClientPathAbsentFromSharedState(restorePath);
+    } finally {
+      rmSync(restoreRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test('R-1: deferred sync --all (non-TTY) emits deferred_notice and never exit 2', async () => {
     await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);

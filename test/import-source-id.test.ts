@@ -14,7 +14,8 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -37,6 +38,9 @@ async function truncatePages(): Promise<void> {
     await (engine as any).db.exec(`DELETE FROM ${t}`);
   }
   await (engine as any).db.exec(`DELETE FROM sources WHERE id <> 'default'`);
+  await engine.executeRaw(
+    `DELETE FROM config WHERE key IN ('sync.repo_path', 'sync.last_commit', 'sync.last_run')`,
+  );
 }
 
 describe('import --source-id (#1167)', () => {
@@ -67,10 +71,27 @@ describe('import --source-id (#1167)', () => {
     for (const r of rows) {
       expect(r.source_id).toBe('default');
     }
+
+    const logs = await engine.getIngestLog({ limit: 10 });
+    const directoryLog = logs.find((entry) => entry.source_type === 'directory');
+    expect(directoryLog?.source_id).toBe('default');
+    expect(directoryLog?.source_ref).toBe('source:default');
+    expect(directoryLog?.source_ref).not.toContain(scratchDir);
   });
 
-  test('--source-id dept-x routes pages to dept-x source', async () => {
-    await runImport(engine, [scratchDir, '--source-id', 'dept-x', '--no-embed', '--json']);
+  test('standalone Git import routes to dept-x without sharing its corpus path', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: scratchDir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: scratchDir });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: scratchDir });
+    execFileSync('git', ['add', '-A'], { cwd: scratchDir });
+    execFileSync('git', ['commit', '--quiet', '-m', 'initial'], { cwd: scratchDir });
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: scratchDir,
+      encoding: 'utf-8',
+    }).trim();
+    const corpusDir = join(scratchDir, 'wiki');
+
+    await runImport(engine, [corpusDir, '--source-id', 'dept-x', '--no-embed', '--json']);
     const rows = await engine.executeRaw<{ source_id: string; slug: string }>(
       `SELECT source_id, slug FROM pages ORDER BY slug`,
     );
@@ -82,7 +103,15 @@ describe('import --source-id (#1167)', () => {
     const logs = await engine.getIngestLog({ limit: 10 });
     const directoryLog = logs.find((entry) => entry.source_type === 'directory');
     expect(directoryLog?.source_id).toBe('dept-x');
-    expect(directoryLog?.source_ref).toBe(realpathSync(scratchDir));
+    expect(directoryLog?.source_ref).toBe(`source:dept-x @ ${head.slice(0, 8)}`);
+    expect(directoryLog?.source_ref).not.toContain(corpusDir);
+
+    const config = await engine.executeRaw<{ value: unknown }>(
+      `SELECT value FROM config`,
+    );
+    for (const row of config) {
+      expect(JSON.stringify(row.value)).not.toContain(corpusDir);
+    }
   });
 
   test('--source-id value is NOT treated as a positional dir arg', async () => {

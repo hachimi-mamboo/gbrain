@@ -68,6 +68,43 @@ afterEach(() => {
 });
 
 describe('hardenBrainRepo', () => {
+  test('client-local harden and pull never write the checkout path to shared state', async () => {
+    const queries: string[] = [];
+    const engine = {
+      executeRaw: async (sql: string) => {
+        queries.push(sql);
+        return [{
+          id: 'wiki',
+          local_path: null,
+          config: { remote_url: bare },
+        }];
+      },
+      setConfig: async () => {
+        throw new Error('unexpected shared config write');
+      },
+      logIngest: async () => {
+        throw new Error('unexpected shared ingest write');
+      },
+    } as unknown as BrainEngine;
+
+    await withEnv({
+      GBRAIN_SOURCE: 'wiki',
+      GBRAIN_SOURCE_PATH: work,
+      GBRAIN_GITHUB_PAT: undefined,
+    }, async () => {
+      await runHarden(engine, [
+        'wiki', '--dry-run', '--no-cron', '--no-verify', '--json',
+      ]);
+      await runPull(engine, ['wiki']);
+    });
+
+    expect(queries.length).toBeGreaterThanOrEqual(2);
+    for (const sql of queries) {
+      expect(sql.trimStart().toUpperCase().startsWith('SELECT')).toBe(true);
+      expect(sql).not.toContain(work);
+    }
+  });
+
   test('source commands reject a client checkout whose origin does not match the shared source', async () => {
     const engine = {
       executeRaw: async () => [{
