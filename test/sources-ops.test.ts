@@ -17,11 +17,14 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { MinionQueue } from '../src/core/minions/queue.ts';
 import {
   addSource,
   listSources,
   removeSource,
   getSourceStatus,
+  prepareClientSourceBinding,
+  sanitizeClientPathSourceRef,
   recloneIfMissing,
   isPathContained,
   isOwnedClone,
@@ -31,6 +34,8 @@ import {
 } from '../src/core/sources-ops.ts';
 import { readdirSync } from 'fs';
 import { runSources } from '../src/commands/sources.ts';
+import { operations } from '../src/core/operations.ts';
+import { MIGRATIONS } from '../src/core/migrate.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -39,6 +44,7 @@ import { withEnv } from './helpers/with-env.ts';
 let engine: PGLiteEngine;
 const FAKE_GIT_DIR = join(tmpdir(), `gbrain-sources-ops-test-${process.pid}`);
 const GBRAIN_HOME = join(FAKE_GIT_DIR, 'gbrain-home');
+const REAL_PATH = process.env.PATH ?? '';
 // gbrainPath() appends `.gbrain` to GBRAIN_HOME, so the actual clone root the
 // production code resolves to is $GBRAIN_HOME/.gbrain/clones/. Tests that
 // hand-craft path fixtures must use this, NOT $GBRAIN_HOME/clones/.
@@ -163,6 +169,513 @@ describe('addSource — Q4 pre-flight collision', () => {
         expect(e).toBeInstanceOf(SourceOpError);
         expect((e as SourceOpError).code).toBe('invalid_id');
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// prepareClientSourceBinding — retire historical shared client paths
+// ---------------------------------------------------------------------------
+
+describe('prepareClientSourceBinding', () => {
+  test('sanitizes absolute checkout locators without changing stable provenance', () => {
+    const pathRefs = [
+      '/Users/alice/wiki @ abc123',
+      'directory:/Users/alice/wiki @ refs/heads/main',
+      'checkout=/Users/alice/wiki @ feature/one',
+      'imported from /Users/alice/wiki @ deadbeef',
+      'file:///Users/alice/wiki @ abc123',
+      String.raw`C:\Users\alice\wiki @ abc123`,
+      String.raw`checkout=C:\Users\alice\wiki @ abc123`,
+      String.raw`\\server\share\wiki @ abc123`,
+      String.raw`checkout=\\server\share\wiki @ abc123`,
+      '//server/share/wiki @ abc123',
+      'checkout=//server/share/wiki @ abc123',
+    ];
+    for (const sourceRef of pathRefs) {
+      const expectedSuffix = sourceRef.match(/\s@\s(\S+)$/)?.[1];
+      expect(sanitizeClientPathSourceRef('wiki', sourceRef)).toBe(
+        `source:wiki${expectedSuffix ? ` @ ${expectedSuffix}` : ''}`,
+      );
+    }
+
+    for (const sourceRef of [
+      'https://git.example.invalid/private/wiki.git',
+      'source:wiki @ abc123',
+      'git@example.invalid:private/wiki.git',
+      'wiki/main',
+      'directory:relative/wiki',
+    ]) {
+      expect(sanitizeClientPathSourceRef('wiki', sourceRef)).toBeNull();
+    }
+  });
+
+  test('retires the checkout path inherited through the real v20 legacy upgrade', async () => {
+    const legacyPath = join(GBRAIN_HOME, 'legacy-client-a');
+    const clientPath = join(GBRAIN_HOME, 'client-b');
+    mkdirSync(legacyPath, { recursive: true });
+    mkdirSync(clientPath, { recursive: true });
+
+    await engine.executeRaw(`DELETE FROM sources WHERE id = 'default'`);
+    await engine.setConfig('sync.repo_path', legacyPath);
+    await engine.setConfig('sync.last_commit', 'legacy-bookmark');
+    const migration = MIGRATIONS.find(
+      (candidate) => candidate.version === 20 && candidate.name === 'sources_table_additive',
+    );
+    expect(migration?.sql).toBeTruthy();
+    await engine.runMigration(20, migration!.sql!);
+
+    const inherited = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+    }>(
+      `SELECT local_path, last_commit FROM sources WHERE id = 'default'`,
+    );
+    expect(inherited).toEqual([{
+      local_path: legacyPath,
+      last_commit: 'legacy-bookmark',
+    }]);
+
+    const result = await withEnv(
+      { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+      () => prepareClientSourceBinding(engine, 'default'),
+    );
+    expect(result.cleared_source_local_path).toBe(true);
+    expect(result.cleared_legacy_repo_path).toBe(true);
+
+    const prepared = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+    }>(
+      `SELECT local_path, last_commit FROM sources WHERE id = 'default'`,
+    );
+    expect(prepared).toEqual([{
+      local_path: null,
+      last_commit: 'legacy-bookmark',
+    }]);
+    expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    expect(await engine.getConfig('sync.last_commit')).toBe('legacy-bookmark');
+  });
+
+  test('clears only client-local path state and invalidates matching queued jobs', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: REAL_PATH }, async () => {
+      const stableRemote = 'https://git.example.invalid/private/wiki.git';
+      const remotePath = join(GBRAIN_HOME, 'origin.git');
+      const oldPath = join(GBRAIN_HOME, 'client-a-checkout');
+      const clientPath = join(GBRAIN_HOME, 'client-b-checkout');
+      const corpusPath = join(GBRAIN_HOME, 'client-a-approved-corpus');
+      execFileSync('git', ['init', '--bare', '--initial-branch=main', remotePath]);
+      execFileSync('git', ['clone', remotePath, oldPath]);
+      execFileSync('git', ['-C', oldPath, 'config', 'user.email', 'test@example.com']);
+      execFileSync('git', ['-C', oldPath, 'config', 'user.name', 'Test']);
+      writeFileSync(join(oldPath, 'README.md'), '# binding fixture\n');
+      execFileSync('git', ['-C', oldPath, 'add', 'README.md']);
+      execFileSync('git', ['-C', oldPath, 'commit', '-m', 'initial']);
+      execFileSync('git', ['-C', oldPath, 'push', 'origin', 'main']);
+      execFileSync('git', ['clone', remotePath, clientPath]);
+      for (const checkout of [oldPath, clientPath]) {
+        execFileSync('git', ['-C', checkout, 'remote', 'set-url', 'origin', stableRemote]);
+        execFileSync('git', [
+          '-C',
+          checkout,
+          'config',
+          `url.file://${remotePath}.insteadOf`,
+          stableRemote,
+        ]);
+      }
+      const stableCommit = execFileSync(
+        'git',
+        ['-C', oldPath, 'rev-parse', 'HEAD'],
+        { encoding: 'utf8' },
+      ).trim();
+
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, local_path, last_commit, last_sync_at, config)
+         VALUES ('binding', 'Binding', $1, $2, '2026-07-27T12:00:00Z', $3::jsonb)`,
+        [
+          oldPath,
+          stableCommit,
+          JSON.stringify({
+            remote_url: stableRemote,
+            managed_clone: false,
+            tracked_branch: 'main',
+          }),
+        ],
+      );
+      await engine.setConfig('sync.repo_path', oldPath);
+      await engine.setConfig('sync.last_commit', stableCommit);
+      await engine.executeRaw(
+        `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
+         VALUES
+           ('binding', 'git_sync', $1, 'legacy client A sync'),
+           ('binding', 'directory', $2, 'legacy approved corpus import')`,
+        [
+          `${oldPath} @ historical-commit`,
+          corpusPath,
+        ],
+      );
+
+      const insertJob = async (
+        name: string,
+        status: string,
+        data: Record<string, unknown>,
+        errorText: string | null = null,
+      ): Promise<number> => {
+        const rows = await engine.executeRaw<{ id: number }>(
+          `INSERT INTO minion_jobs (name, status, data, delay_until, error_text)
+           VALUES (
+             $1,
+             $2,
+             $3::jsonb,
+             CASE WHEN $2 = 'delayed' THEN now() + interval '1 hour' ELSE NULL END,
+             $4
+           )
+           RETURNING id`,
+          [name, status, JSON.stringify(data), errorText],
+        );
+        return rows[0].id;
+      };
+
+      const parentId = await insertJob('subagent-aggregator', 'waiting-children', {
+        children_ids: [],
+      });
+      const waitingId = await insertJob('sync', 'waiting', {
+        sourceId: 'binding',
+        commit: 'queued-commit',
+      }, `failed while reading ${oldPath}`);
+      const delayedId = await insertJob('autopilot-cycle', 'delayed', {
+        source_id: 'binding',
+      }, `retry ${clientPath}`);
+      const completedId = await insertJob('extract-atoms-drain', 'completed', {
+        repoPath: oldPath,
+        commit: 'completed-commit',
+      }, `historical failure at ${corpusPath}`);
+      const legacyGlobalId = await insertJob(
+        'autopilot-global-maintenance',
+        'completed',
+        { phases: ['embed'] },
+      );
+      const legacyActiveId = await insertJob('sync', 'active', {});
+      const safeDbJobId = await insertJob('embed-backfill', 'waiting', {
+        sourceId: 'binding',
+        reason: 'safe-db-only',
+      });
+      const unrelatedId = await insertJob('unrelated', 'waiting', {
+        sourceId: 'other',
+        repoPath: '/srv/shared-other',
+      }, 'unrelated /srv/shared-other');
+      await engine.executeRaw(
+        `UPDATE minion_jobs
+            SET parent_job_id = $1,
+                result = $2::jsonb,
+                progress = $3::jsonb,
+                stacktrace = $4::jsonb
+          WHERE id = $5`,
+        [
+          parentId,
+          JSON.stringify({ report: { brain_dir: oldPath } }),
+          JSON.stringify({ repoPath: clientPath, phase: 'done' }),
+          JSON.stringify([`failed in ${oldPath}`]),
+          completedId,
+        ],
+      );
+      await engine.executeRaw(
+        `UPDATE minion_jobs
+            SET result = $1::jsonb,
+                progress = $2::jsonb,
+                stacktrace = $3::jsonb
+          WHERE id = $4`,
+        [
+          JSON.stringify({ report: { brain_dir: oldPath } }),
+          JSON.stringify({ checkout: clientPath }),
+          JSON.stringify([`global maintenance at ${corpusPath}`]),
+          legacyGlobalId,
+        ],
+      );
+      await engine.executeRaw(
+        `UPDATE minion_jobs SET parent_job_id = $1 WHERE id = $2`,
+        [parentId, waitingId],
+      );
+      await engine.executeRaw(
+        `UPDATE minion_jobs
+            SET data = jsonb_set(data, '{children_ids}', $1::jsonb)
+          WHERE id = $2`,
+        [JSON.stringify([waitingId, completedId]), parentId],
+      );
+      await engine.executeRaw(
+        `INSERT INTO minion_inbox (job_id, sender, payload)
+         VALUES
+           ($1, 'minions', $2::jsonb),
+           ($3, 'worker', $4::jsonb),
+           ($1, 'minions', $5::jsonb)`,
+        [
+          parentId,
+          JSON.stringify({
+            type: 'child_done',
+            child_id: completedId,
+            result: { report: { brain_dir: oldPath } },
+            outcome: 'complete',
+          }),
+          completedId,
+          JSON.stringify({ checkout: clientPath }),
+          JSON.stringify({
+            type: 'child_done',
+            child_id: legacyGlobalId,
+            result: { report: { brain_dir: oldPath } },
+            outcome: 'complete',
+          }),
+        ],
+      );
+
+      const result = await withEnv(
+        { GBRAIN_SOURCE: 'binding', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'binding'),
+      );
+
+      expect(result).toEqual({
+        source_id: 'binding',
+        cleared_source_local_path: true,
+        cleared_legacy_repo_path: true,
+        sanitized_ingest_log_count: 2,
+        sanitized_job_ids: [
+          waitingId,
+          delayedId,
+          completedId,
+          legacyGlobalId,
+          legacyActiveId,
+        ],
+        cancelled_job_ids: [waitingId, delayedId, legacyActiveId],
+      });
+
+      const sourceRows = await engine.executeRaw<{
+        id: string;
+        local_path: string | null;
+        last_commit: string | null;
+        last_sync_at: string | Date | null;
+        config: Record<string, unknown>;
+      }>(
+        `SELECT id, local_path, last_commit, last_sync_at, config
+           FROM sources WHERE id = 'binding'`,
+      );
+      expect(sourceRows[0].id).toBe('binding');
+      expect(sourceRows[0].local_path).toBeNull();
+      expect(sourceRows[0].last_commit).toBe(stableCommit);
+      expect(new Date(sourceRows[0].last_sync_at!).toISOString()).toBe('2026-07-27T12:00:00.000Z');
+      expect(sourceRows[0].config).toEqual({
+        remote_url: stableRemote,
+        managed_clone: false,
+        tracked_branch: 'main',
+      });
+      expect(await engine.getConfig('sync.repo_path')).toBeNull();
+      expect(await engine.getConfig('sync.last_commit')).toBe(stableCommit);
+
+      const ingestRows = await engine.executeRaw<{ source_ref: string }>(
+        `SELECT source_ref FROM ingest_log WHERE source_id = 'binding' ORDER BY id`,
+      );
+      expect(ingestRows).toEqual([
+        { source_ref: 'source:binding @ historical-commit' },
+        { source_ref: 'source:binding' },
+      ]);
+
+      const jobs = await engine.executeRaw<{
+        id: number;
+        status: string;
+        data: Record<string, unknown>;
+        parent_job_id: number | null;
+        result: unknown;
+        progress: unknown;
+        error_text: string | null;
+        stacktrace: unknown;
+      }>(
+        `SELECT id, status, data, parent_job_id, result, progress, error_text, stacktrace
+           FROM minion_jobs
+          WHERE id = ANY($1::int[]) ORDER BY id`,
+        [[
+          parentId,
+          waitingId,
+          delayedId,
+          completedId,
+          legacyGlobalId,
+          legacyActiveId,
+          safeDbJobId,
+          unrelatedId,
+        ]],
+      );
+      const byId = new Map(jobs.map((job) => [job.id, job]));
+
+      expect(byId.get(waitingId)?.status).toBe('cancelled');
+      expect(byId.get(waitingId)?.data).toEqual({
+        sourceId: 'binding',
+        commit: 'queued-commit',
+      });
+      expect(byId.get(waitingId)?.error_text).toBe(
+        'cancelled: client-local source binding retired queued checkout path',
+      );
+      expect(byId.get(delayedId)?.status).toBe('cancelled');
+      expect(byId.get(delayedId)?.data).toEqual({ source_id: 'binding' });
+      expect(byId.get(delayedId)?.error_text).toBe(
+        'cancelled: client-local source binding retired queued checkout path',
+      );
+      expect(byId.get(completedId)?.status).toBe('completed');
+      expect(byId.get(completedId)?.data).toEqual({ commit: 'completed-commit' });
+      expect(byId.get(completedId)?.error_text).toBe(
+        'client-local source binding retired checkout path from historical job state',
+      );
+      expect(byId.get(completedId)?.result).toEqual({
+        report: { brain_dir: '[client-local-path]' },
+      });
+      expect(byId.get(completedId)?.progress).toEqual({ phase: 'done' });
+      expect(byId.get(completedId)?.stacktrace).toEqual([
+        'failed in [client-local-path]',
+      ]);
+      expect(byId.get(legacyGlobalId)).toMatchObject({
+        status: 'completed',
+        data: { phases: ['embed'] },
+        result: { report: { brain_dir: '[client-local-path]' } },
+        progress: { checkout: '[client-local-path]' },
+        stacktrace: ['[client-local-path]'],
+      });
+      expect(byId.get(legacyActiveId)).toMatchObject({
+        status: 'cancelled',
+        data: {},
+        error_text: 'cancelled: client-local source binding retired queued checkout path',
+      });
+      expect(byId.get(parentId)?.status).toBe('waiting');
+      expect(byId.get(safeDbJobId)).toMatchObject({
+        status: 'waiting',
+        data: {
+          sourceId: 'binding',
+          reason: 'safe-db-only',
+        },
+      });
+      expect(byId.get(unrelatedId)?.status).toBe('waiting');
+      expect(byId.get(unrelatedId)?.data).toEqual({
+        sourceId: 'other',
+        repoPath: '/srv/shared-other',
+      });
+      expect(byId.get(unrelatedId)?.error_text).toBe('unrelated /srv/shared-other');
+
+      const inbox = await engine.executeRaw<{
+        job_id: number;
+        payload: Record<string, unknown>;
+      }>(
+        `SELECT job_id, payload FROM minion_inbox
+          WHERE job_id = ANY($1::int[])
+          ORDER BY id`,
+        [[parentId, completedId]],
+      );
+      expect(inbox.some((row) =>
+        row.job_id === parentId &&
+        row.payload.child_id === waitingId &&
+        row.payload.outcome === 'cancelled'
+      )).toBe(true);
+      expect(JSON.stringify(inbox)).toContain('[client-local-path]');
+      const claimed = await new MinionQueue(engine).claim(
+        'client-b-worker',
+        30_000,
+        'default',
+        ['sync', 'autopilot-cycle', 'extract-atoms-drain'],
+      );
+      expect(claimed).toBeNull();
+
+      const sharedState = JSON.stringify({
+        source: sourceRows[0],
+        config: await engine.executeRaw(`SELECT key, value FROM config`),
+        ingest: ingestRows,
+        jobs,
+        inbox,
+      });
+      expect(sharedState).not.toContain(oldPath);
+      expect(sharedState).not.toContain(clientPath);
+      expect(sharedState).not.toContain(corpusPath);
+      expect(sharedState).not.toContain(remotePath);
+      expect(sharedState).not.toContain(GBRAIN_HOME);
+    });
+  });
+
+  test('is idempotent and requires the explicit matching client binding', async () => {
+    await withEnv2(async () => {
+      const clientPath = join(GBRAIN_HOME, 'client-checkout');
+      mkdirSync(clientPath, { recursive: true });
+
+      await expect(prepareClientSourceBinding(engine, 'default')).rejects.toThrow(
+        'GBRAIN_SOURCE_PATH',
+      );
+
+      const unrelatedGlobal = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_jobs (name, status, data, result)
+         VALUES (
+           'autopilot-global-maintenance',
+           'completed',
+           '{}'::jsonb,
+           '{"report":{"brain_dir":"/srv/other-brain"}}'::jsonb
+         )
+         RETURNING id`,
+      );
+      const first = await withEnv(
+        { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'default'),
+      );
+      const stableOnlyJob = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_jobs (name, status, data)
+         VALUES ('sync', 'waiting', '{"sourceId":"default","commit":"safe"}'::jsonb)
+         RETURNING id`,
+      );
+      const output: string[] = [];
+      const originalLog = console.log;
+      console.log = (...args: unknown[]) => output.push(args.join(' '));
+      try {
+        await withEnv(
+          { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+          () => runSources(engine, ['prepare-client', 'default', '--json']),
+        );
+      } finally {
+        console.log = originalLog;
+      }
+      const second = JSON.parse(output.at(-1)!) as typeof first;
+
+      const operation = operations.find((op) => op.name === 'sources_prepare_client')!;
+      expect(operation.localOnly).toBe(true);
+      const third = await withEnv(
+        { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+        () => operation.handler(
+          { engine, remote: false, dryRun: false } as never,
+          { id: 'default' },
+        ),
+      );
+
+      expect(first.cleared_source_local_path).toBe(false);
+      expect(second).toEqual({
+        source_id: 'default',
+        cleared_source_local_path: false,
+        cleared_legacy_repo_path: false,
+        sanitized_ingest_log_count: 0,
+        sanitized_job_ids: [],
+        cancelled_job_ids: [],
+      });
+      expect(third).toEqual(second);
+      const queued = await engine.executeRaw<{
+        status: string;
+        data: Record<string, unknown>;
+      }>(
+        `SELECT status, data FROM minion_jobs WHERE id = $1`,
+        [stableOnlyJob[0].id],
+      );
+      expect(queued).toEqual([{
+        status: 'waiting',
+        data: { sourceId: 'default', commit: 'safe' },
+      }]);
+      const unrelated = await engine.executeRaw<{
+        status: string;
+        result: unknown;
+      }>(
+        `SELECT status, result FROM minion_jobs WHERE id = $1`,
+        [unrelatedGlobal[0].id],
+      );
+      expect(unrelated).toEqual([{
+        status: 'completed',
+        result: { report: { brain_dir: '/srv/other-brain' } },
+      }]);
     });
   });
 });

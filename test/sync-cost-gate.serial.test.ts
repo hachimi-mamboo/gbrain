@@ -138,6 +138,16 @@ async function expectClientPathAbsentFromSharedState(clientPath: string): Promis
 }
 
 describe('v0.41.31 — sync --all cost gate wiring', () => {
+  test('--all rejects a process-local checkout binding', async () => {
+    const result = await withEnv(
+      { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: repoPath },
+      () => runSyncCaptured(['--all', '--no-embed']),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--all cannot be combined with GBRAIN_SOURCE_PATH');
+  });
+
   test('--all rejects an explicit --repo instead of silently ignoring it', async () => {
     const { exitCode, stderr } = await runSyncCaptured([
       '--all', '--repo', repoPath, '--no-embed',
@@ -321,12 +331,29 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
     expect(stdout.toLowerCase()).toContain('imported');
   }, 60_000);
 
-  test('single-source gate and sync use client-local path without rewriting shared local_path', async () => {
+  test('single-source client binding retires stale shared paths before sync', async () => {
     await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
     const sharedPath = `${repoPath}-other-client`;
     await engine.executeRaw(
-      `UPDATE sources SET local_path = $1 WHERE id = 'vault'`,
+      `UPDATE sources SET local_path = $1, last_commit = $2
+        WHERE id = 'vault'`,
+      [sharedPath, headSha],
+    );
+    await engine.setConfig('sync.repo_path', sharedPath);
+    await engine.setConfig('sync.last_commit', 'stable-bookmark');
+    await engine.executeRaw(
+      `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
+       VALUES ('vault', 'directory', $1, 'legacy client import')`,
       [sharedPath],
+    );
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES ('sync', 'waiting', $1::jsonb)`,
+      [JSON.stringify({
+        sourceId: 'vault',
+        repoPath: sharedPath,
+        commit: 'queued-commit',
+      })],
     );
     await engine.setConfig('sync.cost_gate_min_usd', '0');
 
@@ -337,16 +364,41 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
 
     expect(exitCode).not.toBe(2);
     expect(stdout).toContain('"gate":"auto_deferred_embeds"');
-    const rows = await engine.executeRaw<{ local_path: string | null }>(
-      `SELECT local_path FROM sources WHERE id = 'vault'`,
+    const rows = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+    }>(
+      `SELECT local_path, last_commit FROM sources WHERE id = 'vault'`,
     );
-    expect(rows[0]?.local_path).toBe(sharedPath);
+    expect(rows[0]?.local_path).toBeNull();
+    expect(rows[0]?.last_commit).toBe(headSha);
+    expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    expect(await engine.getConfig('sync.last_commit')).toBe('stable-bookmark');
 
     const logs = await engine.getIngestLog({ limit: 10 });
-    const directoryLog = logs.find((entry) => entry.source_type === 'directory');
+    const legacyLog = logs.find((entry) => entry.summary === 'legacy client import');
+    expect(legacyLog?.source_ref).toBe('source:vault');
+    const directoryLog = logs.find(
+      (entry) => entry.source_type === 'directory' && entry.summary !== 'legacy client import',
+    );
     expect(directoryLog?.source_id).toBe('vault');
     expect(directoryLog?.source_ref).toBe(`source:vault @ ${headSha.slice(0, 8)}`);
     expect(directoryLog?.source_ref).not.toContain(repoPath);
+    for (const log of logs) {
+      expect(log.source_ref).not.toContain(sharedPath);
+      expect(log.source_ref).not.toContain(repoPath);
+    }
+
+    const jobs = await engine.executeRaw<{
+      status: string;
+      data: Record<string, unknown>;
+    }>(`SELECT status, data FROM minion_jobs WHERE name = 'sync'`);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe('cancelled');
+    expect(jobs[0].data).toEqual({
+      sourceId: 'vault',
+      commit: 'queued-commit',
+    });
   }, 60_000);
 
   test('incremental client-local sync logs stable source provenance without its checkout path', async () => {

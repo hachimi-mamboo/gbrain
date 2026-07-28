@@ -6,6 +6,7 @@ import { MinionWorker } from '../src/core/minions/worker.ts';
 import { calculateBackoff } from '../src/core/minions/backoff.ts';
 import { UnrecoverableError } from '../src/core/minions/types.ts';
 import type { MinionJob } from '../src/core/minions/types.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let queue: MinionQueue;
@@ -41,6 +42,38 @@ describe('MinionQueue: CRUD', () => {
 
   test('add with empty name throws', async () => {
     await expect(queue.add('', {})).rejects.toThrow('Job name cannot be empty');
+  });
+
+  test('explicit client binding rejects path payloads while generic path sources stay compatible', async () => {
+    await withEnv({
+      GBRAIN_SOURCE: 'default',
+      GBRAIN_SOURCE_PATH: '/clients/a/wiki',
+    }, async () => {
+      for (const [name, sourceKey] of [
+        ['sync', 'sourceId'],
+        ['autopilot-cycle', 'source_id'],
+        ['autopilot-global-maintenance', 'sourceId'],
+      ] as const) {
+        await expect(
+          queue.add(name, {
+            [sourceKey]: 'default',
+            repoPath: '/clients/a/wiki',
+          }),
+        ).rejects.toThrow('must not persist data.repoPath');
+      }
+      await expect(
+        queue.add('sync', { sourceId: 'other', repoPath: '/different/path' }),
+      ).rejects.toThrow('must not persist data.repoPath');
+      await expect(
+        queue.add('autopilot-cycle', { repoPath: '/different/path' }),
+      ).rejects.toThrow('must not persist data.repoPath');
+    });
+
+    const generic = await queue.add('sync', {
+      sourceId: 'server-owned',
+      repoPath: '/srv/gbrain/server-owned',
+    });
+    expect(generic.data.repoPath).toBe('/srv/gbrain/server-owned');
   });
 
   test('getJob returns job by ID', async () => {

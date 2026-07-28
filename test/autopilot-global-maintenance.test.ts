@@ -11,7 +11,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -30,6 +30,8 @@ import {
   dispatchPerSource,
 } from '../src/commands/autopilot-fanout.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { runAutopilot } from '../src/commands/autopilot.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 describe('cycle phase partition (#2194 fix #3)', () => {
   test('GLOBAL ∪ NON_GLOBAL == ALL_PHASES, no overlap', () => {
@@ -88,6 +90,7 @@ describe('dispatchGlobalMaintenance — single-flight gate', () => {
     expect(added[0].opts.idempotency_key).toBe('autopilot-global:s1');
     expect(added[0].opts.maxWaiting).toBe(1); // structural single-flight
     expect(added[0].data.phases).toEqual(GLOBAL_PHASES);
+    expect(added[0].data.repoPath).toBeUndefined();
   });
 
   test('fresh → does NOT dispatch', async () => {
@@ -114,6 +117,7 @@ describe('dispatchPerSource — per-source jobs carry NON_GLOBAL phases (no embe
     for (const j of added) {
       expect(j.data.phases).toEqual(NON_GLOBAL_PHASES);
       expect(j.data.phases).not.toContain('embed');
+      expect(j.data.repoPath).toBeUndefined();
     }
   });
 });
@@ -155,5 +159,86 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     const stamped = await engine.getConfig(LAST_GLOBAL_AT_KEY);
     expect(stamped).not.toBeNull();
     expect(Number.isFinite(new Date(stamped!).getTime())).toBe(true);
+  });
+
+  test('client-local entry retires stale jobs before queued-dispatch refusal', async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'gbrain-autopilot-client-binding-'));
+    const stalePath = join(fixtureRoot, 'client-a');
+    const clientPath = join(fixtureRoot, 'client-b');
+    const configDir = join(fixtureRoot, '.gbrain');
+    mkdirSync(stalePath, { recursive: true });
+    mkdirSync(clientPath, { recursive: true });
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'config.json'),
+      JSON.stringify({
+        engine: 'postgres',
+        database_url: 'postgresql://test.invalid/gbrain_test',
+      }),
+    );
+    writeFileSync(
+      join(configDir, 'preferences.json'),
+      JSON.stringify({ minion_mode: 'pain_triggered' }),
+    );
+
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+       VALUES ('autopilot-bound', 'Autopilot Bound', $1, '{}'::jsonb)`,
+      [stalePath],
+    );
+    await engine.setConfig('sync.repo_path', stalePath);
+    const job = await engine.executeRaw<{ id: number }>(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES (
+         'autopilot-cycle',
+         'waiting',
+         '{"source_id":"autopilot-bound","phases":["sync"]}'::jsonb
+       )
+       RETURNING id`,
+    );
+
+    const originalExit = process.exit;
+    const originalLog = console.log;
+    const originalError = console.error;
+    const errors: string[] = [];
+    let exitCode: number | undefined;
+    process.exit = ((code?: number) => {
+      exitCode = code;
+      throw new Error('__autopilot_exit__');
+    }) as typeof process.exit;
+    console.log = () => {};
+    console.error = (...args: unknown[]) => errors.push(args.join(' '));
+    try {
+      await expect(withEnv({
+        GBRAIN_HOME: fixtureRoot,
+        GBRAIN_SOURCE: 'autopilot-bound',
+        GBRAIN_SOURCE_PATH: clientPath,
+        GBRAIN_DATABASE_URL: undefined,
+        DATABASE_URL: undefined,
+      }, () => runAutopilot(engine, ['--no-worker']))).rejects.toThrow(
+        '__autopilot_exit__',
+      );
+    } finally {
+      process.exit = originalExit;
+      console.log = originalLog;
+      console.error = originalError;
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+
+    expect(exitCode).toBe(2);
+    expect(errors.join('\n')).toContain('cannot dispatch filesystem work');
+    const source = await engine.executeRaw<{ local_path: string | null }>(
+      `SELECT local_path FROM sources WHERE id = 'autopilot-bound'`,
+    );
+    expect(source).toEqual([{ local_path: null }]);
+    expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    const queued = await engine.executeRaw<{ status: string; data: unknown }>(
+      `SELECT status, data FROM minion_jobs WHERE id = $1`,
+      [job[0].id],
+    );
+    expect(queued).toEqual([{
+      status: 'cancelled',
+      data: { source_id: 'autopilot-bound', phases: ['sync'] },
+    }]);
   });
 });

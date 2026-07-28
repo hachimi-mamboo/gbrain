@@ -87,14 +87,31 @@ function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
 const putPage = operations.find((o) => o.name === 'put_page')!;
 
 describe('put_page write-through — happy path', () => {
-  test('matching client-local source binding overrides shared path without changing it', async () => {
+  test('matching client-local source binding retires stale shared paths before write-through', async () => {
     const clientDir = path.join(tmpRoot, 'client-brain');
     const sharedDir = path.join(tmpRoot, 'shared-db-path');
     fs.mkdirSync(clientDir, { recursive: true });
     fs.mkdirSync(sharedDir, { recursive: true });
     await engine.executeRaw(
-      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      `UPDATE sources SET local_path = $1, last_commit = 'stable-source-commit'
+        WHERE id = 'default'`,
       [sharedDir],
+    );
+    await engine.setConfig('sync.repo_path', sharedDir);
+    await engine.setConfig('sync.last_commit', 'stable-bookmark');
+    await engine.executeRaw(
+      `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
+       VALUES ('default', 'directory', $1, 'legacy client import')`,
+      [sharedDir],
+    );
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES ('sync', 'waiting', $1::jsonb)`,
+      [JSON.stringify({
+        sourceId: 'default',
+        repoPath: sharedDir,
+        commit: 'queued-commit',
+      })],
     );
 
     const result = await withEnv(
@@ -109,20 +126,42 @@ describe('put_page write-through — happy path', () => {
     expect(result.write_through).toMatchObject({ written: true, path: clientFile });
     expect(fs.existsSync(clientFile)).toBe(true);
     expect(fs.existsSync(path.join(sharedDir, 'inbox/client-bound.md'))).toBe(false);
-    const rows = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
-      `SELECT local_path, config FROM sources WHERE id = 'default'`,
+    const rows = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+      config: unknown;
+    }>(
+      `SELECT local_path, last_commit, config FROM sources WHERE id = 'default'`,
     );
-    expect(rows[0]?.local_path).toBe(sharedDir);
+    expect(rows[0]?.local_path).toBeNull();
+    expect(rows[0]?.last_commit).toBe('stable-source-commit');
     expect(JSON.stringify(rows[0]?.config)).not.toContain(clientDir);
+    expect(JSON.stringify(rows[0]?.config)).not.toContain(sharedDir);
+    expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    expect(await engine.getConfig('sync.last_commit')).toBe('stable-bookmark');
 
     const config = await engine.executeRaw<{ value: unknown }>(`SELECT value FROM config`);
     for (const row of config) {
       expect(JSON.stringify(row.value)).not.toContain(clientDir);
+      expect(JSON.stringify(row.value)).not.toContain(sharedDir);
     }
     const logs = await engine.getIngestLog({ limit: 10 });
     for (const row of logs) {
       expect(row.source_ref).not.toContain(clientDir);
+      expect(row.source_ref).not.toContain(sharedDir);
     }
+    expect(logs.some((row) => row.source_ref === 'source:default')).toBe(true);
+
+    const jobs = await engine.executeRaw<{
+      status: string;
+      data: Record<string, unknown>;
+    }>(`SELECT status, data FROM minion_jobs WHERE name = 'sync'`);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe('cancelled');
+    expect(jobs[0].data).toEqual({
+      sourceId: 'default',
+      commit: 'queued-commit',
+    });
   });
 
   test('client-local binding refuses a checkout whose remote identity drifted', async () => {
@@ -138,16 +177,16 @@ describe('put_page write-through — happy path', () => {
       [JSON.stringify({ remote_url: 'https://github.com/example/expected.git' })],
     );
 
-    const result = await withEnv(
+    await expect(withEnv(
       { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientDir },
-      async () => (await putPage.handler(makeCtx(), {
+      async () => putPage.handler(makeCtx(), {
         slug: 'inbox/wrong-remote',
         content: '---\ntitle: Wrong remote\n---\n\nmust not project here',
-      })) as { write_through?: { written: boolean; error?: string } },
-    );
+      }),
+    )).rejects.toThrow(/url-drift/);
 
-    expect(result.write_through?.written).toBe(false);
-    expect(result.write_through?.error).toContain('url-drift');
+    expect(await engine.getPage('inbox/wrong-remote', { sourceId: 'default' })).toBeNull();
+    expect(await engine.getIngestLog({ limit: 10 })).toEqual([]);
     expect(fs.existsSync(path.join(clientDir, 'inbox/wrong-remote.md'))).toBe(false);
   });
 

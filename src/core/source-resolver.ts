@@ -18,7 +18,7 @@ import { join, dirname, isAbsolute, resolve } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { SOURCE_ID_RE, isValidSourceId } from './source-id.ts';
 import { isTrustedDotfile, realpathOrResolve } from './path-confine.ts';
-import { validateRepoState } from './git-remote.ts';
+import { validateRepoRawRemoteState } from './git-remote.ts';
 import { parseSourceConfig } from './sources-load.ts';
 
 const DOTFILE = '.gbrain-source';
@@ -303,7 +303,7 @@ export function assertClientSourceCheckout(
       : null;
   if (!expectedRemote) return;
 
-  const state = validateRepoState(localPath, expectedRemote);
+  const state = validateRepoRawRemoteState(localPath, expectedRemote);
   if (state !== 'healthy') {
     throw new Error(
       `Client-local checkout for source "${sourceId}" at ${localPath} is ${state}; ` +

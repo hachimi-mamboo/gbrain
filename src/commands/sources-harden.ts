@@ -25,6 +25,7 @@ import {
   assertClientSourceCheckout,
   resolveClientSourcePath,
 } from '../core/source-resolver.ts';
+import { prepareClientSourceBinding } from '../core/sources-ops.ts';
 
 interface SourceRow { id: string; local_path: string | null; config: unknown; }
 
@@ -65,6 +66,13 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
   const branch = flagVal(args, '--branch');
   const patFile = flagVal(args, '--pat-file');
 
+  if (all && process.env.GBRAIN_SOURCE_PATH) {
+    throw new Error(
+      'sources harden --all cannot be combined with GBRAIN_SOURCE_PATH because ' +
+      'a client-local checkout is bound to one source. Harden that source explicitly.',
+    );
+  }
+
   const pat = acceptPat({ patFile });
   for (const w of pat?.warnings ?? []) console.error(`[gbrain] ${w}`);
 
@@ -86,7 +94,9 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
   const reports: DurabilityReport[] = [];
   for (const row of rows) {
     const clientPath = all ? null : resolveClientSourcePath(row.id);
-    if (clientPath) assertClientSourceCheckout(row.id, clientPath, row.config);
+    if (clientPath) {
+      await prepareClientSourceBinding(engine, row.id);
+    }
     const repoPath = clientPath ?? row.local_path;
     if (!repoPath || !existsSync(join(repoPath, '.git'))) {
       console.error(`[${row.id}] skipped — no local git repo at ${repoPath ?? '(none)'}`);
@@ -143,7 +153,9 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
       process.exit(1);
     }
     const clientPath = resolveClientSourcePath(id);
-    if (clientPath) assertClientSourceCheckout(id, clientPath, rows[0].config);
+    if (clientPath) {
+      await prepareClientSourceBinding(engine, id);
+    }
     const resolvedPath = clientPath ?? rows[0].local_path;
     if (!resolvedPath) {
       console.error(`Source "${id}" not found or has no local_path.`);

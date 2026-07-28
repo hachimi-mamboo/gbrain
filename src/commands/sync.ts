@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync, statSync, realpathSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join, relative } from 'path';
+import { join, relative, resolve as resolvePath } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile } from '../core/import-file.ts';
@@ -1421,6 +1421,8 @@ See also:
   }
 
   if (resolveClientSourcePath(sourceIdArg)) {
+    const { prepareClientSourceBinding } = await import('../core/sources-ops.ts');
+    await prepareClientSourceBinding(engine, sourceIdArg);
     console.error(
       `Error: source "${sourceIdArg}" uses a client-local checkout. ` +
       `A queued sync cannot inherit GBRAIN_SOURCE_PATH, and GBrain will not persist that local path.`,
@@ -1435,7 +1437,6 @@ See also:
     'sync',
     {
       sourceId: sourceIdArg,
-      repoPath: source.local_path,
       noExtract: false,
       auto_embed_backfill: true,
       embed_reason: 'sync_trigger',
@@ -1804,10 +1805,19 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // "hung with no output" into actionable diagnostic data.
   serr(`[gbrain phase] sync.resolve_repo`);
   // Resolve repo path
-  const clientSourcePath =
-    !opts.repoPath && opts.sourceId
-      ? resolveClientSourcePath(opts.sourceId)
-      : null;
+  const clientSourcePath = opts.sourceId
+    ? resolveClientSourcePath(opts.sourceId)
+    : null;
+  if (clientSourcePath) {
+    if (opts.repoPath && resolvePath(opts.repoPath) !== clientSourcePath) {
+      throw new Error(
+        `--repo ${opts.repoPath} conflicts with GBRAIN_SOURCE_PATH=${clientSourcePath} ` +
+        `for source "${opts.sourceId}".`,
+      );
+    }
+    const { prepareClientSourceBinding } = await import('../core/sources-ops.ts');
+    await prepareClientSourceBinding(engine, opts.sourceId!);
+  }
   const repoPath =
     opts.repoPath ||
     clientSourcePath ||
@@ -4194,6 +4204,13 @@ See also:
   const syncAll = args.includes('--all');
   const jsonOut = args.includes('--json');
   const yesFlag = args.includes('--yes');
+  if (syncAll && process.env.GBRAIN_SOURCE_PATH) {
+    console.error(
+      '--all cannot be combined with GBRAIN_SOURCE_PATH because a client-local ' +
+      'checkout is bound to one source. Run one source explicitly with --source <id>.',
+    );
+    process.exit(1);
+  }
   if (syncAll && repoPath) {
     console.error(
       '--repo cannot be combined with --all because it names one checkout. ' +
