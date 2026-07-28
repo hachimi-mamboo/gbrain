@@ -30,6 +30,7 @@ describePostgres('client source binding native seam — Postgres', () => {
     const remote = join(root, 'origin.git');
     const clientA = join(root, 'client-a');
     const clientB = join(root, 'client-b');
+    const approvedCorpus = join(root, 'approved-corpus');
     execFileSync('git', ['init', '--bare', '--initial-branch=main', remote]);
     execFileSync('git', ['clone', remote, clientA]);
     execFileSync('git', ['-C', clientA, 'config', 'user.email', 'test@example.com']);
@@ -83,7 +84,7 @@ describePostgres('client source binding native seam — Postgres', () => {
        VALUES ('sync', 'waiting', $1::text::jsonb, $2, $3)
        RETURNING id`,
       [
-        JSON.stringify({ sourceId, commit }),
+        JSON.stringify({ sourceId, repoPath: clientA, commit }),
         `failed at ${clientA}`,
         parent[0].id,
       ],
@@ -118,6 +119,12 @@ describePostgres('client source binding native seam — Postgres', () => {
         parent[0].id,
       ],
     );
+    const corpusWaiting = await engine.executeRaw<{ id: number }>(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES ('corpus-scan', 'waiting', $1::text::jsonb)
+       RETURNING id`,
+      [JSON.stringify({ repoPath: approvedCorpus, mode: 'approved-corpus' })],
+    );
     const legacyGlobal = await engine.executeRaw<{ id: number }>(
       `INSERT INTO minion_jobs (
          name, status, data, result, progress, stacktrace
@@ -136,6 +143,15 @@ describePostgres('client source binding native seam — Postgres', () => {
         JSON.stringify({ checkout: clientB }),
         JSON.stringify([`global maintenance at ${clientA}`]),
       ],
+    );
+    const racingGlobal = await engine.executeRaw<{ id: number }>(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES (
+         'autopilot-global-maintenance',
+         'active',
+         '{"phases":["embed"]}'::jsonb
+       )
+       RETURNING id`,
     );
     const legacyActive = await engine.executeRaw<{ id: number }>(
       `INSERT INTO minion_jobs (name, status, data)
@@ -199,6 +215,8 @@ describePostgres('client source binding native seam — Postgres', () => {
     expect(first.cancelled_job_ids).toEqual([
       waiting[0].id,
       autopilot[0].id,
+      corpusWaiting[0].id,
+      racingGlobal[0].id,
       legacyActive[0].id,
     ]);
     const cleanStateSync = await engine.executeRaw<{ id: number }>(
@@ -206,6 +224,28 @@ describePostgres('client source binding native seam — Postgres', () => {
        VALUES ('sync', 'waiting', $1::text::jsonb)
        RETURNING id`,
       [JSON.stringify({ sourceId, commit: 'safe-after-prepare' })],
+    );
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET status = 'completed',
+              result = $1::text::jsonb,
+              finished_at = now()
+        WHERE id = $2`,
+      [
+        JSON.stringify({ report: { brain_dir: clientA } }),
+        racingGlobal[0].id,
+      ],
+    );
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET status = 'completed',
+              result = $1::text::jsonb,
+              finished_at = now()
+        WHERE id = $2`,
+      [
+        JSON.stringify({ scan_root: approvedCorpus }),
+        corpusWaiting[0].id,
+      ],
     );
     const second = await withEnv(
       { GBRAIN_SOURCE: sourceId, GBRAIN_SOURCE_PATH: clientB },
@@ -218,7 +258,10 @@ describePostgres('client source binding native seam — Postgres', () => {
       cleared_source_local_path: false,
       cleared_legacy_repo_path: false,
       sanitized_ingest_log_count: 0,
-      sanitized_job_ids: [],
+      sanitized_job_ids: [
+        corpusWaiting[0].id,
+        racingGlobal[0].id,
+      ],
       cancelled_job_ids: [],
     });
 
@@ -264,7 +307,9 @@ describePostgres('client source binding native seam — Postgres', () => {
         waiting[0].id,
         autopilot[0].id,
         completed[0].id,
+        corpusWaiting[0].id,
         legacyGlobal[0].id,
+        racingGlobal[0].id,
         legacyActive[0].id,
         safeDbJob[0].id,
         cleanStateSync[0].id,
@@ -284,22 +329,36 @@ describePostgres('client source binding native seam — Postgres', () => {
     });
     expect(byId.get(completed[0].id)).toMatchObject({
       status: 'completed',
-      data: { commit: 'completed-commit' },
+      data: { sourceId, commit: 'completed-commit' },
       result: { report: { brain_dir: '[client-local-path]' } },
       progress: { phase: 'done' },
       error_text: 'client-local source binding retired checkout path from historical job state',
       stacktrace: ['stack [client-local-path]'],
     });
+    expect(byId.get(corpusWaiting[0].id)).toMatchObject({
+      status: 'completed',
+      data: {
+        clientBindingSourceId: sourceId,
+        mode: 'approved-corpus',
+      },
+      result: { scan_root: '[client-local-path]' },
+      error_text: 'cancelled: client-local source binding retired queued checkout path',
+    });
     expect(byId.get(legacyGlobal[0].id)).toMatchObject({
       status: 'completed',
-      data: { phases: ['embed'] },
+      data: { phases: ['embed'], sourceId },
       result: { report: { brain_dir: '[client-local-path]' } },
       progress: { checkout: '[client-local-path]' },
       stacktrace: ['global maintenance at [client-local-path]'],
     });
+    expect(byId.get(racingGlobal[0].id)).toMatchObject({
+      status: 'completed',
+      data: { phases: ['embed'], sourceId },
+      result: { report: { brain_dir: '[client-local-path]' } },
+    });
     expect(byId.get(legacyActive[0].id)).toMatchObject({
       status: 'cancelled',
-      data: {},
+      data: { sourceId },
       error_text: 'cancelled: client-local source binding retired queued checkout path',
     });
     expect(byId.get(safeDbJob[0].id)).toMatchObject({

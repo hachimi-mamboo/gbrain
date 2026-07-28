@@ -341,18 +341,32 @@ describe('prepareClientSourceBinding', () => {
       });
       const waitingId = await insertJob('sync', 'waiting', {
         sourceId: 'binding',
+        repoPath: oldPath,
         commit: 'queued-commit',
       }, `failed while reading ${oldPath}`);
+      const stableOnlyStaleId = await insertJob('sync', 'waiting', {
+        sourceId: 'binding',
+        commit: 'stable-only-stale',
+      });
       const delayedId = await insertJob('autopilot-cycle', 'delayed', {
         source_id: 'binding',
       }, `retry ${clientPath}`);
       const completedId = await insertJob('extract-atoms-drain', 'completed', {
-        repoPath: oldPath,
+        repoPath: corpusPath,
         commit: 'completed-commit',
       }, `historical failure at ${corpusPath}`);
+      const corpusWaitingId = await insertJob('corpus-scan', 'waiting', {
+        repoPath: corpusPath,
+        mode: 'approved-corpus',
+      });
       const legacyGlobalId = await insertJob(
         'autopilot-global-maintenance',
         'completed',
+        { phases: ['embed'] },
+      );
+      const racingGlobalId = await insertJob(
+        'autopilot-global-maintenance',
+        'active',
         { phases: ['embed'] },
       );
       const legacyActiveId = await insertJob('sync', 'active', {});
@@ -426,6 +440,27 @@ describe('prepareClientSourceBinding', () => {
           }),
         ],
       );
+      const stableOnlyBefore = await engine.executeRaw<{
+        data: Record<string, unknown>;
+        result: unknown;
+        progress: unknown;
+        error_text: string | null;
+        stacktrace: unknown;
+      }>(
+        `SELECT data, result, progress, error_text, stacktrace
+           FROM minion_jobs WHERE id = $1`,
+        [stableOnlyStaleId],
+      );
+      expect(stableOnlyBefore).toEqual([{
+        data: {
+          sourceId: 'binding',
+          commit: 'stable-only-stale',
+        },
+        result: null,
+        progress: null,
+        error_text: null,
+        stacktrace: [],
+      }]);
 
       const result = await withEnv(
         { GBRAIN_SOURCE: 'binding', GBRAIN_SOURCE_PATH: clientPath },
@@ -439,12 +474,77 @@ describe('prepareClientSourceBinding', () => {
         sanitized_ingest_log_count: 2,
         sanitized_job_ids: [
           waitingId,
+          stableOnlyStaleId,
           delayedId,
           completedId,
+          corpusWaitingId,
           legacyGlobalId,
+          racingGlobalId,
           legacyActiveId,
+          unrelatedId,
         ],
-        cancelled_job_ids: [waitingId, delayedId, legacyActiveId],
+        cancelled_job_ids: [
+          waitingId,
+          stableOnlyStaleId,
+          delayedId,
+          corpusWaitingId,
+          racingGlobalId,
+          legacyActiveId,
+          unrelatedId,
+        ],
+      });
+
+      // A worker may race cancellation and publish its already-computed local
+      // checkout after the first transaction. Stable source ownership retained
+      // in data lets the next idempotent seam scrub that late result.
+      await engine.executeRaw(
+        `UPDATE minion_jobs
+            SET status = 'completed',
+                result = $1::jsonb,
+                finished_at = now()
+          WHERE id = $2`,
+        [
+          JSON.stringify({ report: { brain_dir: oldPath } }),
+          racingGlobalId,
+        ],
+      );
+      await engine.executeRaw(
+        `UPDATE minion_jobs
+            SET status = 'completed',
+                result = $1::jsonb,
+                finished_at = now()
+          WHERE id = $2`,
+        [
+          JSON.stringify({ scan_root: corpusPath }),
+          corpusWaitingId,
+        ],
+      );
+      await engine.executeRaw(
+        `UPDATE minion_jobs
+            SET status = 'completed',
+                result = $1::jsonb,
+                finished_at = now()
+          WHERE id = $2`,
+        [
+          JSON.stringify({ scan_root: '/srv/shared-other' }),
+          unrelatedId,
+        ],
+      );
+      const second = await withEnv(
+        { GBRAIN_SOURCE: 'binding', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'binding'),
+      );
+      expect(second).toEqual({
+        source_id: 'binding',
+        cleared_source_local_path: false,
+        cleared_legacy_repo_path: false,
+        sanitized_ingest_log_count: 0,
+        sanitized_job_ids: [
+          corpusWaitingId,
+          racingGlobalId,
+          unrelatedId,
+        ],
+        cancelled_job_ids: [],
       });
 
       const sourceRows = await engine.executeRaw<{
@@ -493,9 +593,12 @@ describe('prepareClientSourceBinding', () => {
         [[
           parentId,
           waitingId,
+          stableOnlyStaleId,
           delayedId,
           completedId,
+          corpusWaitingId,
           legacyGlobalId,
+          racingGlobalId,
           legacyActiveId,
           safeDbJobId,
           unrelatedId,
@@ -511,13 +614,27 @@ describe('prepareClientSourceBinding', () => {
       expect(byId.get(waitingId)?.error_text).toBe(
         'cancelled: client-local source binding retired queued checkout path',
       );
+      expect(byId.get(stableOnlyStaleId)).toMatchObject({
+        status: 'cancelled',
+        data: {
+          sourceId: 'binding',
+          commit: 'stable-only-stale',
+        },
+        result: null,
+        progress: null,
+        stacktrace: [],
+        error_text: 'cancelled: client-local source binding retired queued checkout path',
+      });
       expect(byId.get(delayedId)?.status).toBe('cancelled');
       expect(byId.get(delayedId)?.data).toEqual({ source_id: 'binding' });
       expect(byId.get(delayedId)?.error_text).toBe(
         'cancelled: client-local source binding retired queued checkout path',
       );
       expect(byId.get(completedId)?.status).toBe('completed');
-      expect(byId.get(completedId)?.data).toEqual({ commit: 'completed-commit' });
+      expect(byId.get(completedId)?.data).toEqual({
+        clientBindingSourceId: 'binding',
+        commit: 'completed-commit',
+      });
       expect(byId.get(completedId)?.error_text).toBe(
         'client-local source binding retired checkout path from historical job state',
       );
@@ -528,16 +645,30 @@ describe('prepareClientSourceBinding', () => {
       expect(byId.get(completedId)?.stacktrace).toEqual([
         'failed in [client-local-path]',
       ]);
+      expect(byId.get(corpusWaitingId)).toMatchObject({
+        status: 'completed',
+        data: {
+          clientBindingSourceId: 'binding',
+          mode: 'approved-corpus',
+        },
+        result: { scan_root: '[client-local-path]' },
+        error_text: 'cancelled: client-local source binding retired queued checkout path',
+      });
       expect(byId.get(legacyGlobalId)).toMatchObject({
         status: 'completed',
-        data: { phases: ['embed'] },
+        data: { phases: ['embed'], sourceId: 'binding' },
         result: { report: { brain_dir: '[client-local-path]' } },
         progress: { checkout: '[client-local-path]' },
-        stacktrace: ['[client-local-path]'],
+        stacktrace: ['global maintenance at [client-local-path]'],
+      });
+      expect(byId.get(racingGlobalId)).toMatchObject({
+        status: 'completed',
+        data: { phases: ['embed'], sourceId: 'binding' },
+        result: { report: { brain_dir: '[client-local-path]' } },
       });
       expect(byId.get(legacyActiveId)).toMatchObject({
         status: 'cancelled',
-        data: {},
+        data: { sourceId: 'binding' },
         error_text: 'cancelled: client-local source binding retired queued checkout path',
       });
       expect(byId.get(parentId)?.status).toBe('waiting');
@@ -548,12 +679,17 @@ describe('prepareClientSourceBinding', () => {
           reason: 'safe-db-only',
         },
       });
-      expect(byId.get(unrelatedId)?.status).toBe('waiting');
+      expect(byId.get(unrelatedId)?.status).toBe('completed');
       expect(byId.get(unrelatedId)?.data).toEqual({
+        clientBindingSourceId: 'binding',
         sourceId: 'other',
-        repoPath: '/srv/shared-other',
       });
-      expect(byId.get(unrelatedId)?.error_text).toBe('unrelated /srv/shared-other');
+      expect(byId.get(unrelatedId)?.result).toEqual({
+        scan_root: '[client-local-path]',
+      });
+      expect(byId.get(unrelatedId)?.error_text).toBe(
+        'cancelled: client-local source binding retired queued checkout path',
+      );
 
       const inbox = await engine.executeRaw<{
         job_id: number;
@@ -593,6 +729,75 @@ describe('prepareClientSourceBinding', () => {
     });
   });
 
+  test('does not claim global work from a non-default local-path-only source transition', async () => {
+    await withEnv2(async () => {
+      const oldPath = join(GBRAIN_HOME, 'retired-client-a');
+      const clientPath = join(GBRAIN_HOME, 'client-b');
+      mkdirSync(oldPath, { recursive: true });
+      mkdirSync(clientPath, { recursive: true });
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('binding', 'Binding', $1, '{}'::jsonb)`,
+        [oldPath],
+      );
+      const racing = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_jobs (name, status, data)
+         VALUES (
+           'autopilot-global-maintenance',
+           'active',
+           '{"phases":["embed"]}'::jsonb
+         )
+         RETURNING id`,
+      );
+      const stableCompleted = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_jobs (name, status, data, result)
+         VALUES (
+           'autopilot-global-maintenance',
+           'completed',
+           '{"phases":["embed"]}'::jsonb,
+           '{"remote":"https://git.example.invalid/private/wiki.git"}'::jsonb
+         )
+         RETURNING id`,
+      );
+
+      const first = await withEnv(
+        { GBRAIN_SOURCE: 'binding', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'binding'),
+      );
+      expect(first.cleared_source_local_path).toBe(true);
+      expect(first.cleared_legacy_repo_path).toBe(false);
+      expect(first.cancelled_job_ids).toEqual([]);
+      expect(first.sanitized_job_ids).toEqual([]);
+
+      const jobs = await engine.executeRaw<{
+        id: number;
+        status: string;
+        data: Record<string, unknown>;
+        result: unknown;
+      }>(
+        `SELECT id, status, data, result
+           FROM minion_jobs
+          WHERE id = ANY($1::int[])
+          ORDER BY id`,
+        [[racing[0].id, stableCompleted[0].id]],
+      );
+      expect(jobs).toEqual([
+        {
+          id: racing[0].id,
+          status: 'active',
+          data: { phases: ['embed'] },
+          result: null,
+        },
+        {
+          id: stableCompleted[0].id,
+          status: 'completed',
+          data: { phases: ['embed'] },
+          result: { remote: 'https://git.example.invalid/private/wiki.git' },
+        },
+      ]);
+    });
+  });
+
   test('is idempotent and requires the explicit matching client binding', async () => {
     await withEnv2(async () => {
       const clientPath = join(GBRAIN_HOME, 'client-checkout');
@@ -602,13 +807,22 @@ describe('prepareClientSourceBinding', () => {
         'GBRAIN_SOURCE_PATH',
       );
 
-      const unrelatedGlobal = await engine.executeRaw<{ id: number }>(
+      const legacyGlobalPathState = await engine.executeRaw<{ id: number }>(
         `INSERT INTO minion_jobs (name, status, data, result)
          VALUES (
            'autopilot-global-maintenance',
            'completed',
            '{}'::jsonb,
            '{"report":{"brain_dir":"/srv/other-brain"}}'::jsonb
+         )
+         RETURNING id`,
+      );
+      const stableGlobal = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_jobs (name, status, data)
+         VALUES (
+           'autopilot-global-maintenance',
+           'active',
+           '{"phases":["embed"]}'::jsonb
          )
          RETURNING id`,
       );
@@ -670,11 +884,22 @@ describe('prepareClientSourceBinding', () => {
         result: unknown;
       }>(
         `SELECT status, result FROM minion_jobs WHERE id = $1`,
-        [unrelatedGlobal[0].id],
+        [legacyGlobalPathState[0].id],
       );
       expect(unrelated).toEqual([{
         status: 'completed',
-        result: { report: { brain_dir: '/srv/other-brain' } },
+        result: { report: { brain_dir: '[client-local-path]' } },
+      }]);
+      const stable = await engine.executeRaw<{
+        status: string;
+        data: Record<string, unknown>;
+      }>(
+        `SELECT status, data FROM minion_jobs WHERE id = $1`,
+        [stableGlobal[0].id],
+      );
+      expect(stable).toEqual([{
+        status: 'active',
+        data: { phases: ['embed'] },
       }]);
     });
   });
