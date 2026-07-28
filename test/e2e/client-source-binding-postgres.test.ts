@@ -26,6 +26,7 @@ describePostgres('client source binding native seam — Postgres', () => {
 
   test('client B idempotently retires client A state through the public local operation', async () => {
     const sourceId = 'client-binding-pg';
+    const otherSourceId = 'client-binding-other-pg';
     const stableRemote = 'https://git.example.invalid/private/wiki.git';
     const remote = join(root, 'origin.git');
     const clientA = join(root, 'client-a');
@@ -57,6 +58,7 @@ describePostgres('client source binding native seam — Postgres', () => {
     ).trim();
 
     await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [sourceId]);
+    await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [otherSourceId]);
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, last_commit, config)
        VALUES ($1, 'Client Binding PG', $2, $3, $4::text::jsonb)`,
@@ -67,12 +69,29 @@ describePostgres('client source binding native seam — Postgres', () => {
         JSON.stringify({ remote_url: stableRemote, tracked_branch: 'main' }),
       ],
     );
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name)
+       VALUES ($1, 'Client Binding Other PG')`,
+      [otherSourceId],
+    );
     await engine.setConfig('sync.repo_path', clientA);
     await engine.setConfig('sync.last_commit', 'stable-bookmark');
     await engine.executeRaw(
-      `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
-       VALUES ($1, 'git_sync', $2, 'legacy-client-a')`,
-      [sourceId, `${clientA} @ ${commit.slice(0, 8)}`],
+      `INSERT INTO ingest_log (
+         source_id, source_type, source_ref, pages_updated, summary
+       )
+       VALUES
+         ($1, 'git_sync', $2, $3::text::jsonb, $4),
+         ($5, 'git_sync', 'source:client-binding-other-pg', $6::text::jsonb, $7)`,
+      [
+        sourceId,
+        `${clientA} @ ${commit.slice(0, 8)}`,
+        JSON.stringify([{ cwd: clientA }]),
+        `legacy import from ${clientA}`,
+        otherSourceId,
+        JSON.stringify([{ nested: [{ repoPath: clientA }] }]),
+        `misattributed legacy import from ${clientA}`,
+      ],
     );
     const parent = await engine.executeRaw<{ id: number }>(
       `INSERT INTO minion_jobs (name, status, data)
@@ -164,6 +183,21 @@ describePostgres('client source binding native seam — Postgres', () => {
        RETURNING id`,
       [JSON.stringify({ sourceId, reason: 'safe-db-only' })],
     );
+    const arbitraryNested = await engine.executeRaw<{ id: number }>(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES ('arbitrary-nested-pg', 'waiting', $1::text::jsonb)
+       RETURNING id`,
+      [JSON.stringify({ nested: [{ cwd: clientA }] })],
+    );
+    const inboxOnly = await engine.executeRaw<{ id: number }>(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES (
+         'arbitrary-inbox-pg',
+         'waiting',
+         '{"commit":"stable-inbox-only"}'::jsonb
+       )
+       RETURNING id`,
+    );
     await engine.executeRaw(
       `UPDATE minion_jobs
           SET data = jsonb_set(data, '{children_ids}', $1::text::jsonb)
@@ -194,6 +228,14 @@ describePostgres('client source binding native seam — Postgres', () => {
         }),
       ],
     );
+    await engine.executeRaw(
+      `INSERT INTO minion_inbox (job_id, sender, payload)
+       VALUES ($1, 'admin', $2::text::jsonb)`,
+      [
+        inboxOnly[0].id,
+        JSON.stringify({ directive: [{ cwd: clientA }] }),
+      ],
+    );
 
     const operation = operations.find((op) => op.name === 'sources_prepare_client')!;
     expect(operation.localOnly).toBe(true);
@@ -211,14 +253,29 @@ describePostgres('client source binding native seam — Postgres', () => {
     };
     expect(first.cleared_source_local_path).toBe(true);
     expect(first.cleared_legacy_repo_path).toBe(true);
-    expect(first.sanitized_ingest_log_count).toBe(1);
+    expect(first.sanitized_ingest_log_count).toBe(2);
     expect(first.cancelled_job_ids).toEqual([
+      parent[0].id,
       waiting[0].id,
       autopilot[0].id,
       corpusWaiting[0].id,
       racingGlobal[0].id,
       legacyActive[0].id,
+      arbitraryNested[0].id,
+      inboxOnly[0].id,
     ]);
+    await withEnv(
+      { GBRAIN_SOURCE: sourceId, GBRAIN_SOURCE_PATH: clientB },
+      async () => {
+        await expect(engine.logIngest({
+          source_id: otherSourceId,
+          source_type: 'git_sync',
+          source_ref: 'source:client-binding-other-pg',
+          pages_updated: ['wiki/stable'],
+          summary: `late failure at ${clientB}`,
+        })).rejects.toThrow('must not persist client-local paths in ingest log fields');
+      },
+    );
     const cleanStateSync = await engine.executeRaw<{ id: number }>(
       `INSERT INTO minion_jobs (name, status, data)
        VALUES ('sync', 'waiting', $1::text::jsonb)
@@ -283,11 +340,31 @@ describePostgres('client source binding native seam — Postgres', () => {
     expect(await engine.getConfig('sync.repo_path')).toBeNull();
     expect(await engine.getConfig('sync.last_commit')).toBe('stable-bookmark');
 
-    const ingest = await engine.executeRaw<{ source_ref: string }>(
-      `SELECT source_ref FROM ingest_log WHERE summary = 'legacy-client-a'`,
+    const ingest = await engine.executeRaw<{
+      source_id: string;
+      source_ref: string;
+      pages_updated: unknown;
+      summary: string;
+    }>(
+      `SELECT source_id, source_ref, pages_updated, summary
+         FROM ingest_log
+        WHERE source_id = ANY($1::text[])
+        ORDER BY id`,
+      [[sourceId, otherSourceId]],
     );
     expect(ingest).toEqual([
-      { source_ref: `source:${sourceId} @ ${commit.slice(0, 8)}` },
+      {
+        source_id: sourceId,
+        source_ref: `source:${sourceId} @ ${commit.slice(0, 8)}`,
+        pages_updated: [{ cwd: '[client-local-path]' }],
+        summary: 'legacy import from [client-local-path]',
+      },
+      {
+        source_id: otherSourceId,
+        source_ref: `source:${otherSourceId}`,
+        pages_updated: [{ nested: [{}] }],
+        summary: 'misattributed legacy import from [client-local-path]',
+      },
     ]);
     const jobs = await engine.executeRaw<{
       id: number;
@@ -312,11 +389,13 @@ describePostgres('client source binding native seam — Postgres', () => {
         racingGlobal[0].id,
         legacyActive[0].id,
         safeDbJob[0].id,
+        arbitraryNested[0].id,
+        inboxOnly[0].id,
         cleanStateSync[0].id,
       ]],
     );
     const byId = new Map(jobs.map((job) => [job.id, job]));
-    expect(byId.get(parent[0].id)?.status).toBe('waiting');
+    expect(byId.get(parent[0].id)?.status).toBe('cancelled');
     expect(byId.get(waiting[0].id)).toMatchObject({
       status: 'cancelled',
       data: { sourceId, commit },
@@ -365,6 +444,20 @@ describePostgres('client source binding native seam — Postgres', () => {
       status: 'waiting',
       data: { sourceId, reason: 'safe-db-only' },
     });
+    expect(byId.get(arbitraryNested[0].id)).toMatchObject({
+      status: 'cancelled',
+      data: {
+        clientBindingSourceId: sourceId,
+        nested: [{ cwd: '[client-local-path]' }],
+      },
+    });
+    expect(byId.get(inboxOnly[0].id)).toMatchObject({
+      status: 'cancelled',
+      data: {
+        clientBindingSourceId: sourceId,
+        commit: 'stable-inbox-only',
+      },
+    });
     expect(byId.get(cleanStateSync[0].id)).toMatchObject({
       status: 'waiting',
       data: { sourceId, commit: 'safe-after-prepare' },
@@ -377,13 +470,17 @@ describePostgres('client source binding native seam — Postgres', () => {
       `SELECT job_id, payload FROM minion_inbox
         WHERE job_id = ANY($1::int[])
         ORDER BY id`,
-      [[parent[0].id, completed[0].id]],
+      [[parent[0].id, completed[0].id, inboxOnly[0].id]],
     );
     expect(inbox.some((row) =>
       row.job_id === parent[0].id &&
       row.payload.child_id === waiting[0].id &&
       row.payload.outcome === 'cancelled'
-    )).toBe(true);
+    )).toBe(false);
+    expect(inbox).toContainEqual({
+      job_id: inboxOnly[0].id,
+      payload: { directive: [{ cwd: '[client-local-path]' }] },
+    });
     expect(JSON.stringify(inbox)).toContain('[client-local-path]');
 
     const sharedState = JSON.stringify({

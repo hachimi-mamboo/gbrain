@@ -60,6 +60,12 @@ import {
   type SourceTier,
 } from './source-resolver.ts';
 import { isUndefinedTableError } from './utils.ts';
+import {
+  ClientLocalStructuredPathError,
+  isClientPathShapedText,
+  structuredValueContainsClientPath,
+  textContainsClientRoot,
+} from './client-local-path.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -277,27 +283,6 @@ function pathBelongsToRoot(candidate: unknown, roots: string[]): boolean {
   return roots.some((root) => normalized === resolvePath(root) || normalized.startsWith(resolvePath(root) + '/'));
 }
 
-function textContainsRoot(candidate: unknown, roots: string[]): boolean {
-  return typeof candidate === 'string' && roots.some((root) => candidate.includes(root));
-}
-
-function isClientPathShapedText(value: string): boolean {
-  return (
-    // Historical locator schemes, including file:/// and directory:/ forms.
-    /(?:^|[^A-Za-z0-9+.-])(?:file|directory|git|path):(?:\/\/)?[\\/]/i.test(value) ||
-    // A POSIX path at the start or after a free-text/key-value boundary.
-    /(?:^|[\s="'([{=,])\/(?!\/)/.test(value) ||
-    // Forward-slash UNC/network paths at a boundary; exclude URL schemes.
-    /(?:^|[\s="'([{=,])\/\/[^/\s]+\/[^/\s]+/.test(value) ||
-    // A prefixed POSIX path such as "checkout:/srv/wiki", but not https://.
-    /:\/(?!\/)/.test(value) ||
-    // Windows drive paths, raw or embedded in a small provenance phrase.
-    /(?:^|[\s="'([{=,:])[A-Za-z]:[\\/]/.test(value) ||
-    // UNC paths, raw or embedded.
-    /(?:^|[\s="'([{=,:])\\\\[^\\/\s]+[\\/]/.test(value)
-  );
-}
-
 function parseSharedJson(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   try {
@@ -317,7 +302,7 @@ function redactKnownRoots(
       (redacted, root) => redacted.split(root).join('[client-local-path]'),
       value,
     );
-    return isClientPathShapedText(redacted) ? '[client-local-path]' : redacted;
+    return isClientPathShapedText(redacted, roots) ? '[client-local-path]' : redacted;
   }
   if (Array.isArray(value)) {
     return value.map((entry) => redactKnownRoots(entry, roots, dropRepoPath));
@@ -332,24 +317,6 @@ function redactKnownRoots(
     return sanitized;
   }
   return value;
-}
-
-function structuredValueContainsClientPath(value: unknown, roots: string[]): boolean {
-  if (typeof value === 'string') {
-    return textContainsRoot(value, roots) || isClientPathShapedText(value);
-  }
-  if (Array.isArray(value)) {
-    return value.some((entry) => structuredValueContainsClientPath(entry, roots));
-  }
-  if (value && typeof value === 'object') {
-    return Object.entries(value as Record<string, unknown>).some(
-      ([key, entry]) =>
-        key === 'repoPath' ||
-        structuredValueContainsClientPath(key, roots) ||
-        structuredValueContainsClientPath(entry, roots),
-    );
-  }
-  return false;
 }
 
 function parseJobData(data: Record<string, unknown> | string): Record<string, unknown> {
@@ -372,15 +339,56 @@ function parseJobData(data: Record<string, unknown> | string): Record<string, un
 export function sanitizeClientPathSourceRef(
   sourceId: string,
   sourceRef: string,
+  roots: readonly string[] = [],
 ): string | null {
   const value = sourceRef.trim();
-  if (!isClientPathShapedText(value)) return null;
+  if (!isClientPathShapedText(value, roots)) return null;
 
   const suffixMatch = value.match(
     /\s+@\s+([A-Za-z0-9][A-Za-z0-9._~^/-]{0,255})\s*$/,
   );
   const suffix = suffixMatch ? ` @ ${suffixMatch[1]}` : '';
   return `source:${sourceId}${suffix}`;
+}
+
+/**
+ * Run the client-binding cleanup seam before a structured shared write, then
+ * reject the write if any key or value carries a current or legacy client path.
+ */
+export async function prepareClientSourceBindingForStructuredWrite(
+  engine: BrainEngine,
+  sourceId: string,
+  value: unknown,
+  fieldLabel: string,
+): Promise<void> {
+  const source = await fetchSourceRow(engine, sourceId);
+  if (!source) {
+    throw new SourceOpError('not_found', `Source "${sourceId}" not found.`);
+  }
+  const clientPath = resolveClientSourcePath(sourceId);
+  if (!clientPath) {
+    throw new Error(
+      `Client-local binding for source "${sourceId}" requires matching ` +
+      `GBRAIN_SOURCE=${sourceId} and an absolute GBRAIN_SOURCE_PATH.`,
+    );
+  }
+  const legacyRepoPath = await engine.getConfig('sync.repo_path');
+  const sourceRoots = uniquePathSpellings([source.local_path, clientPath]);
+  const sharedRoots = uniquePathSpellings([
+    source.local_path,
+    clientPath,
+    legacyRepoPath !== null &&
+      (sourceId === 'default' || pathBelongsToRoot(legacyRepoPath, sourceRoots))
+      ? legacyRepoPath
+      : null,
+  ]);
+
+  await prepareClientSourceBinding(engine, sourceId);
+  if (structuredValueContainsClientPath(value, sharedRoots)) {
+    throw new ClientLocalStructuredPathError(
+      `Client-local source "${sourceId}" must not persist client-local paths in ${fieldLabel}.`,
+    );
+  }
 }
 
 async function fetchSourceRow(engine: BrainEngine, id: string): Promise<SourceRow | null> {
@@ -437,17 +445,6 @@ export async function prepareClientSourceBinding(
       `GBRAIN_SOURCE=${sourceId} and an absolute GBRAIN_SOURCE_PATH.`,
     );
   }
-  const preparedSourceConfig = { ...parseConfig(source.config) };
-  const clearsLocalRemoteLocator =
-    isClientLocalRemoteLocator(preparedSourceConfig.remote_url);
-  const localRemoteLocator = clearsLocalRemoteLocator
-    ? preparedSourceConfig.remote_url as string
-    : null;
-  if (clearsLocalRemoteLocator) {
-    delete preparedSourceConfig.remote_url;
-  }
-  assertClientSourceCheckout(sourceId, clientPath, preparedSourceConfig);
-
   const legacyRepoPath = await engine.getConfig('sync.repo_path');
   const sourceRoots = uniquePathSpellings([
     source.local_path,
@@ -461,6 +458,18 @@ export async function prepareClientSourceBinding(
     clientPath,
     clearLegacyRepoPath ? legacyRepoPath : null,
   ]);
+  const preparedSourceConfig = { ...parseConfig(source.config) };
+  const clearsLocalRemoteLocator =
+    isClientLocalRemoteLocator(preparedSourceConfig.remote_url) ||
+    textContainsClientRoot(preparedSourceConfig.remote_url, sharedRoots);
+  const localRemoteLocator = clearsLocalRemoteLocator
+    ? preparedSourceConfig.remote_url as string
+    : null;
+  if (clearsLocalRemoteLocator) {
+    delete preparedSourceConfig.remote_url;
+  }
+  assertClientSourceCheckout(sourceId, clientPath, preparedSourceConfig);
+
   const retiringLegacyBinding =
     source.local_path !== null || clearLegacyRepoPath;
   const retireLegacyGlobalState =
@@ -493,7 +502,7 @@ export async function prepareClientSourceBinding(
         'waiting-children',
         'paused',
       ]);
-      const rows = await tx.executeRaw<{
+      type ClientBindingJobRow = {
         id: number;
         name: string;
         status: string;
@@ -503,61 +512,59 @@ export async function prepareClientSourceBinding(
         progress: unknown;
         error_text: string | null;
         stacktrace: unknown;
-      }>(
+      };
+      // Discovery is deliberately unlocked: inspect every structured job
+      // field in JavaScript, then lock only rows that actually need cleanup.
+      // A top-level SQL predicate cannot see nested keys/values or inbox-only
+      // leaks and an unbounded FOR UPDATE would stall the whole queue.
+      const scannedRows = await tx.executeRaw<ClientBindingJobRow>(
         `SELECT id, name, status, data, parent_job_id,
                 result, progress, error_text, stacktrace
-           FROM minion_jobs
-          WHERE data->>'sourceId' = $1
-             OR data->>'source_id' = $1
-             OR data->>'clientBindingSourceId' = $1
-             OR data ? 'repoPath'
-             OR name = ANY($2::text[])
-          FOR UPDATE`,
-        [sourceId, [...LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES]],
+           FROM minion_jobs`,
       );
-      const candidateIds = rows.map((row) => row.id);
-      const candidateInboxPathIds = new Set<number>();
-      if (hasMinionInbox && candidateIds.length > 0) {
-        const candidateInbox = await tx.executeRaw<{
+      const scannedInbox = hasMinionInbox
+        ? await tx.executeRaw<{
           job_id: number;
           payload: unknown;
         }>(
           `SELECT job_id, payload
-             FROM minion_inbox
-            WHERE job_id = ANY($1::int[])
-               OR payload->>'child_id' = ANY($2::text[])`,
-          [candidateIds, candidateIds.map(String)],
-        );
-        for (const inbox of candidateInbox) {
+             FROM minion_inbox`,
+        )
+        : [];
+      const collectInboxPathJobIds = (
+        inboxRows: Array<{ job_id: number; payload: unknown }>,
+      ): Set<number> => {
+        const ids = new Set<number>();
+        for (const inbox of inboxRows) {
           const payload = parseSharedJson(inbox.payload);
           if (!structuredValueContainsClientPath(payload, sharedRoots)) continue;
-          if (candidateIds.includes(inbox.job_id)) {
-            candidateInboxPathIds.add(inbox.job_id);
-          }
+          ids.add(inbox.job_id);
           if (payload && typeof payload === 'object') {
             const childId = (payload as Record<string, unknown>).child_id;
-            if (typeof childId === 'number' && candidateIds.includes(childId)) {
-              candidateInboxPathIds.add(childId);
+            if (typeof childId === 'number' && Number.isInteger(childId)) {
+              ids.add(childId);
+            } else if (
+              typeof childId === 'string' &&
+              /^[1-9][0-9]*$/.test(childId)
+            ) {
+              ids.add(Number(childId));
             }
           }
         }
-      }
-      const targetRows = rows.filter((row) => {
+        return ids;
+      };
+      const scannedInboxPathIds = collectInboxPathJobIds(scannedInbox);
+      const shouldTargetRow = (
+        row: ClientBindingJobRow,
+        inboxPathIds: Set<number>,
+      ): boolean => {
         const data = parseJobData(row.data);
         const matchesSource =
           data.sourceId === sourceId || data.source_id === sourceId;
-        const matchesClientBinding =
-          data[CLIENT_BINDING_MARKER_KEY] === sourceId;
         const hasExplicitSource =
           typeof data.sourceId === 'string' || typeof data.source_id === 'string';
         const isLegacyGlobalFilesystemJob =
           !hasExplicitSource && LEGACY_GLOBAL_FILESYSTEM_JOB_NAMES.has(row.name);
-        const hasClientRepoPath =
-          typeof data.repoPath === 'string' &&
-          (
-            pathBelongsToRoot(data.repoPath, sharedRoots) ||
-            isClientPathShapedText(data.repoPath)
-          );
         const hasStructuredPath = [
           data,
           row.result,
@@ -567,24 +574,13 @@ export async function prepareClientSourceBinding(
         ].some((value) =>
           structuredValueContainsClientPath(parseSharedJson(value), sharedRoots));
         return (
-          hasClientRepoPath ||
+          hasStructuredPath ||
+          inboxPathIds.has(row.id) ||
           (
-            isLegacyGlobalFilesystemJob &&
-            retireLegacyGlobalState &&
-            (hasStructuredPath || candidateInboxPathIds.has(row.id))
-          ) ||
-          (
-            (matchesSource || matchesClientBinding) &&
-            (
-              hasStructuredPath ||
-              candidateInboxPathIds.has(row.id) ||
-              (
-                matchesSource &&
-                retiringLegacyBinding &&
-                CLIENT_BOUND_FILESYSTEM_JOB_NAMES.has(row.name) &&
-                nonterminal.has(row.status)
-              )
-            )
+            matchesSource &&
+            retiringLegacyBinding &&
+            CLIENT_BOUND_FILESYSTEM_JOB_NAMES.has(row.name) &&
+            nonterminal.has(row.status)
           ) ||
           (
             isLegacyGlobalFilesystemJob &&
@@ -594,7 +590,37 @@ export async function prepareClientSourceBinding(
             nonterminal.has(row.status)
           )
         );
-      });
+      };
+      const candidateIds = scannedRows
+        .filter((row) => shouldTargetRow(row, scannedInboxPathIds))
+        .map((row) => row.id)
+        .sort((a, b) => a - b);
+      const lockedRows = candidateIds.length > 0
+        ? await tx.executeRaw<ClientBindingJobRow>(
+          `SELECT id, name, status, data, parent_job_id,
+                  result, progress, error_text, stacktrace
+             FROM minion_jobs
+            WHERE id = ANY($1::int[])
+            FOR UPDATE`,
+          [candidateIds],
+        )
+        : [];
+      const lockedInbox = hasMinionInbox && candidateIds.length > 0
+        ? await tx.executeRaw<{
+          job_id: number;
+          payload: unknown;
+        }>(
+          `SELECT job_id, payload
+             FROM minion_inbox
+            WHERE job_id = ANY($1::int[])
+               OR payload->>'child_id' = ANY($2::text[])
+            FOR UPDATE`,
+          [candidateIds, candidateIds.map(String)],
+        )
+        : [];
+      const lockedInboxPathIds = collectInboxPathJobIds(lockedInbox);
+      const targetRows = lockedRows.filter((row) =>
+        shouldTargetRow(row, lockedInboxPathIds));
       const targetIds = targetRows.map((row) => row.id).sort((a, b) => a - b);
       const cancelIds = targetRows
         .filter((row) => nonterminal.has(row.status))
@@ -660,7 +686,7 @@ export async function prepareClientSourceBinding(
         );
         const errorText = cancelIdSet.has(row.id)
           ? 'cancelled: client-local source binding retired queued checkout path'
-          : pathShapedError || textContainsRoot(row.error_text, rowRoots)
+          : pathShapedError || textContainsClientRoot(row.error_text, rowRoots)
             ? 'client-local source binding retired checkout path from historical job state'
             : row.error_text;
 
@@ -764,17 +790,94 @@ export async function prepareClientSourceBinding(
       cancelledJobIds.push(...cancelIds);
     }
 
-    const ingestRows = await tx.executeRaw<{ id: number; source_ref: string }>(
-      `SELECT id, source_ref FROM ingest_log WHERE source_id = $1 FOR UPDATE`,
-      [sourceId],
+    type ClientBindingIngestRow = {
+      id: number;
+      source_id: string;
+      source_type: string;
+      source_ref: string;
+      pages_updated: unknown;
+      summary: string;
+    };
+    // Attribution is not an ownership boundary: a historically
+    // misattributed row can still carry this client's checkout root. Discover
+    // recursively without locking the whole log, then lock only target rows.
+    const scannedIngestRows = await tx.executeRaw<ClientBindingIngestRow>(
+      `SELECT id, source_id, source_type, source_ref, pages_updated, summary
+         FROM ingest_log`,
     );
+    const ingestCandidateIds = scannedIngestRows
+      .filter((row) =>
+        structuredValueContainsClientPath(
+          {
+            source_type: row.source_type,
+            source_ref: row.source_ref,
+            pages_updated: parseSharedJson(row.pages_updated),
+            summary: row.summary,
+          },
+          sharedRoots,
+        ))
+      .map((row) => row.id)
+      .sort((a, b) => a - b);
+    const ingestRows = ingestCandidateIds.length > 0
+      ? await tx.executeRaw<ClientBindingIngestRow>(
+        `SELECT id, source_id, source_type, source_ref, pages_updated, summary
+           FROM ingest_log
+          WHERE id = ANY($1::int[])
+          FOR UPDATE`,
+        [ingestCandidateIds],
+      )
+      : [];
     const sanitizedIngestIds: number[] = [];
     for (const row of ingestRows) {
-      const sanitized = sanitizeClientPathSourceRef(sourceId, row.source_ref);
-      if (sanitized === null || sanitized === row.source_ref) continue;
+      if (!structuredValueContainsClientPath(
+        {
+          source_type: row.source_type,
+          source_ref: row.source_ref,
+          pages_updated: parseSharedJson(row.pages_updated),
+          summary: row.summary,
+        },
+        sharedRoots,
+      )) {
+        continue;
+      }
+      const sourceRef = sanitizeClientPathSourceRef(
+        row.source_id,
+        row.source_ref,
+        sharedRoots,
+      ) ?? row.source_ref;
+      const sourceType = redactKnownRoots(
+        row.source_type,
+        sharedRoots,
+      ) as string;
+      const pagesUpdated = redactKnownRoots(
+        parseSharedJson(row.pages_updated),
+        sharedRoots,
+        true,
+      );
+      const summary = redactKnownRoots(row.summary, sharedRoots) as string;
+      if (
+        sourceRef === row.source_ref &&
+        sourceType === row.source_type &&
+        JSON.stringify(pagesUpdated) ===
+          JSON.stringify(parseSharedJson(row.pages_updated)) &&
+        summary === row.summary
+      ) {
+        continue;
+      }
       await tx.executeRaw(
-        `UPDATE ingest_log SET source_ref = $1 WHERE id = $2`,
-        [sanitized, row.id],
+        `UPDATE ingest_log
+            SET source_type = $1,
+                source_ref = $2,
+                pages_updated = $3::text::jsonb,
+                summary = $4
+          WHERE id = $5`,
+        [
+          sourceType,
+          sourceRef,
+          JSON.stringify(pagesUpdated),
+          summary,
+          row.id,
+        ],
       );
       sanitizedIngestIds.push(row.id);
     }

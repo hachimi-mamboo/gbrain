@@ -69,6 +69,7 @@ import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defa
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
+import { assertClientBoundStructuredWrite } from './client-local-write.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -5492,6 +5493,11 @@ export class PostgresEngine implements BrainEngine {
     // v0.31.2 (codex P1 #3): source_id threaded so multi-source brains can
     // scope ingest_log queries. Default 'default' matches the column DEFAULT.
     const sourceId = entry.source_id ?? 'default';
+    await assertClientBoundStructuredWrite(
+      this,
+      entry,
+      'ingest log fields',
+    );
     await sql`
       INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
       VALUES (${sourceId}, ${entry.source_type}, ${entry.source_ref}, ${sql.json(entry.pages_updated)}, ${entry.summary})

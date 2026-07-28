@@ -2849,12 +2849,34 @@ const log_ingest: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'log_ingest' };
+    const sourceId = ctx.sourceId ?? 'default';
+    const boundSourceId = process.env.GBRAIN_SOURCE;
+    const { resolveClientSourcePath } = await import('./source-resolver.ts');
+    if (
+      boundSourceId &&
+      process.env.GBRAIN_SOURCE_PATH &&
+      resolveClientSourcePath(boundSourceId)
+    ) {
+      const { prepareClientSourceBindingForStructuredWrite } =
+        await import('./sources-ops.ts');
+      await prepareClientSourceBindingForStructuredWrite(
+        ctx.engine,
+        boundSourceId,
+        {
+          source_type: p.source_type,
+          source_ref: p.source_ref,
+          pages_updated: p.pages_updated,
+          summary: p.summary,
+        },
+        'ingest log fields',
+      );
+    }
     await ctx.engine.logIngest({
       // Thread ctx.sourceId (same pattern as get_chunks/get_page above): on a
       // multi-source brain the ingest event must be attributed to the caller's
       // source, not the shared 'default' bucket. Absent sourceId still falls to
       // the engine's 'default' (single-source brains unchanged).
-      ...(ctx.sourceId ? { source_id: ctx.sourceId } : {}),
+      source_id: sourceId,
       source_type: p.source_type as string,
       source_ref: p.source_ref as string,
       pages_updated: p.pages_updated as string[],

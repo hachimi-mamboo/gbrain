@@ -44,29 +44,65 @@ describe('MinionQueue: CRUD', () => {
     await expect(queue.add('', {})).rejects.toThrow('Job name cannot be empty');
   });
 
-  test('explicit client binding rejects path payloads while generic path sources stay compatible', async () => {
+  test('explicit client binding recursively rejects path payloads while stable locators and generic sources stay compatible', async () => {
     await withEnv({
       GBRAIN_SOURCE: 'default',
       GBRAIN_SOURCE_PATH: '/clients/a/wiki',
     }, async () => {
-      for (const [name, sourceKey] of [
-        ['sync', 'sourceId'],
-        ['autopilot-cycle', 'source_id'],
-        ['autopilot-global-maintenance', 'sourceId'],
+      for (const [name, data] of [
+        ['autopilot-cycle', { source_id: 'default', nested: { repoPath: '/clients/a/wiki' } }],
+        ['autopilot-cycle', { source_id: 'default', nested: { repoPath: 'relative/repo' } }],
+        ['autopilot-global-maintenance', { sourceId: 'default', cwd: '/clients/a/wiki' }],
+        ['sync', { sourceId: 'default', nested: [{ '/clients/a/wiki': 'checkout' }] }],
+        ['sync', { sourceId: 'default', locator: 'https://example.com/repo.git?checkout=/clients/a/wiki' }],
+        ['sync', { sourceId: 'default', repoPath: '/clients/a/wiki' }],
       ] as const) {
         await expect(
-          queue.add(name, {
-            [sourceKey]: 'default',
-            repoPath: '/clients/a/wiki',
-          }),
-        ).rejects.toThrow('must not persist data.repoPath');
+          queue.add(name, data),
+        ).rejects.toThrow('must not persist client-local paths in queued work');
       }
       await expect(
         queue.add('sync', { sourceId: 'other', repoPath: '/different/path' }),
-      ).rejects.toThrow('must not persist data.repoPath');
+      ).rejects.toThrow('must not persist client-local paths in queued work');
       await expect(
         queue.add('autopilot-cycle', { repoPath: '/different/path' }),
-      ).rejects.toThrow('must not persist data.repoPath');
+      ).rejects.toThrow('must not persist client-local paths in queued work');
+      await expect(queue.add(
+        'sync',
+        { sourceId: 'default', commit: 'abc123' },
+        {
+          quiet_hours: {
+            start: 22,
+            end: 7,
+            tz: '/clients/a/wiki',
+          },
+        },
+      )).rejects.toThrow('must not persist client-local paths in queued work');
+      await expect(queue.add(
+        'sync',
+        { sourceId: 'default', commit: 'abc123' },
+        { idempotency_key: '/clients/a/wiki' },
+      )).rejects.toThrow('must not persist client-local paths in queued work');
+      await expect(queue.add(
+        'sync',
+        { sourceId: 'default', commit: 'abc123' },
+        { stagger_key: String.raw`C:\clients\a\wiki` },
+      )).rejects.toThrow('must not persist client-local paths in queued work');
+
+      for (const locator of [
+        'https://example.com/C:/repo.git',
+        'https://example.com/path:/repo.git',
+        'ssh://git@example.com/C:/repo.git',
+        'git@example.com:C:/repo.git',
+        'git://example.com/C:/repo.git',
+      ]) {
+        const stable = await queue.add('sync', {
+          sourceId: 'default',
+          remote: locator,
+          commit: 'abc123',
+        });
+        expect(stable.data.remote).toBe(locator);
+      }
     });
 
     const generic = await queue.add('sync', {
@@ -125,6 +161,169 @@ describe('MinionQueue: CRUD', () => {
     const j1 = await queue.add('sync', { full: true });
     const j2 = await queue.add('sync', { full: true });
     expect(j1.id).not.toBe(j2.id);
+  });
+});
+
+describe('MinionQueue: client binding structured write guard', () => {
+  test('completeJob rejects a late nested client path result before persistence', async () => {
+    await withEnv({
+      GBRAIN_SOURCE: 'default',
+      GBRAIN_SOURCE_PATH: '/clients/a/wiki',
+    }, async () => {
+      const added = await queue.add('late-result', {
+        sourceId: 'default',
+        commit: 'abc123',
+      });
+      const claimed = await queue.claim(
+        'late-result-lock',
+        30_000,
+        'default',
+        ['late-result'],
+      );
+      expect(claimed?.id).toBe(added.id);
+
+      await expect(queue.completeJob(
+        added.id,
+        'late-result-lock',
+        { nested: [{ cwd: '/clients/a/wiki' }] },
+      )).rejects.toThrow('must not persist client-local paths in queued result');
+
+      expect(await queue.getJob(added.id)).toMatchObject({
+        status: 'active',
+        result: null,
+      });
+    });
+  });
+
+  test('late structured writes reject paths while terminal error paths use a fixed safe substitute', async () => {
+    await withEnv({
+      GBRAIN_SOURCE: 'default',
+      GBRAIN_SOURCE_PATH: '/clients/a/wiki',
+    }, async () => {
+      const claimJob = async (name: string, token: string) => {
+        const added = await queue.add(name, {
+          sourceId: 'default',
+          commit: 'abc123',
+        });
+        expect((await queue.claim(token, 30_000, 'default', [name]))?.id)
+          .toBe(added.id);
+        return added;
+      };
+
+      const progressJob = await claimJob('late-progress', 'progress-lock');
+      await expect(queue.updateProgress(
+        progressJob.id,
+        'progress-lock',
+        { nested: [{ '/clients/a/wiki': 'progress' }] },
+      )).rejects.toThrow('must not persist client-local paths in queued progress');
+      await expect(queue.appendLog(
+        progressJob.id,
+        'progress-lock',
+        { message: [{ cwd: '/clients/a/wiki' }] },
+      )).rejects.toThrow('must not persist client-local paths in queued worker log');
+
+      const failedJob = await claimJob('late-failure', 'failure-lock');
+      expect(await queue.failJob(
+        failedJob.id,
+        'failure-lock',
+        'failed in /clients/a/wiki',
+        'dead',
+      )).toMatchObject({
+        status: 'dead',
+        error_text: 'client-local source binding omitted path-bearing queued error',
+      });
+
+      const leaseJob = await claimJob('late-lease', 'lease-lock');
+      expect(await queue.releaseLeaseFullJob(
+        leaseJob.id,
+        'lease-lock',
+        'lease full at /clients/a/wiki',
+        100,
+      )).toMatchObject({
+        status: 'delayed',
+        error_text: 'client-local source binding omitted path-bearing queued error',
+      });
+
+      const parent = await queue.add('late-parent', {
+        sourceId: 'default',
+        commit: 'abc123',
+      });
+      await queue.add(
+        'late-child',
+        { sourceId: 'default', commit: 'abc123' },
+        { parent_job_id: parent.id },
+      );
+      expect(await queue.failParent(
+        parent.id,
+        999,
+        'child failed at /clients/a/wiki',
+      )).toMatchObject({
+        status: 'failed',
+        error_text: 'child job 999 failed: client-local source binding omitted path-bearing queued parent error',
+      });
+
+      const inboxJob = await queue.add('late-inbox', {
+        sourceId: 'default',
+        commit: 'abc123',
+      });
+      await expect(queue.sendMessage(
+        inboxJob.id,
+        { directive: [{ cwd: '/clients/a/wiki' }] },
+        'admin',
+      )).rejects.toThrow('must not persist client-local paths in queued inbox payload');
+
+      const rows = await engine.executeRaw<{
+        id: number;
+        status: string;
+        progress: unknown;
+        error_text: string | null;
+        stacktrace: unknown;
+      }>(
+        `SELECT id, status, progress, error_text, stacktrace
+           FROM minion_jobs
+          WHERE id = ANY($1::int[])
+          ORDER BY id`,
+        [[progressJob.id, failedJob.id, leaseJob.id, parent.id]],
+      );
+      expect(rows).toEqual([
+        {
+          id: progressJob.id,
+          status: 'active',
+          progress: null,
+          error_text: null,
+          stacktrace: [],
+        },
+        {
+          id: failedJob.id,
+          status: 'dead',
+          progress: null,
+          error_text: 'client-local source binding omitted path-bearing queued error',
+          stacktrace: [
+            'client-local source binding omitted path-bearing queued error',
+          ],
+        },
+        {
+          id: leaseJob.id,
+          status: 'delayed',
+          progress: null,
+          error_text: 'client-local source binding omitted path-bearing queued error',
+          stacktrace: [
+            'client-local source binding omitted path-bearing queued error',
+          ],
+        },
+        {
+          id: parent.id,
+          status: 'failed',
+          progress: null,
+          error_text: 'child job 999 failed: client-local source binding omitted path-bearing queued parent error',
+          stacktrace: [],
+        },
+      ]);
+      expect(await engine.executeRaw(
+        `SELECT id FROM minion_inbox WHERE job_id = $1`,
+        [inboxJob.id],
+      )).toEqual([]);
+    });
   });
 });
 

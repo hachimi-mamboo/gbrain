@@ -315,13 +315,7 @@ async function runPgliteSubagentsInline(
         await queue.updateTokens(job.id, lockToken, tokens);
       },
       log: async (message) => {
-        const value = typeof message === 'string' ? message : JSON.stringify(message);
-        await engine.executeRaw(
-          `UPDATE minion_jobs SET stacktrace = COALESCE(stacktrace, '[]'::jsonb) || to_jsonb($1::text),
-            updated_at = now()
-           WHERE id = $2 AND status = 'active' AND lock_token = $3`,
-          [value, job.id, lockToken],
-        );
+        await queue.appendLog(job.id, lockToken, message);
       },
       isActive: async () => {
         const rows = await engine.executeRaw<{ id: number }>(

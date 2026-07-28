@@ -98,8 +98,10 @@ and per-client config export.
 > keys are counted but never named, and byte sizes round up to 1KB so size-probe
 > attacks can't binary-search secret content. Operators on a personal laptop who
 > want raw payloads back can pass `gbrain serve --http --log-full-params` (loud
-> stderr warning fires at startup). Multi-tenant deployments should leave it on
-> the redacted default.
+> stderr warning fires at startup). When `GBRAIN_SOURCE` +
+> `GBRAIN_SOURCE_PATH` activates a client-local source binding, that flag is
+> ignored and both the shared audit row and SSE feed stay summarized.
+> Multi-tenant deployments should leave it on the redacted default.
 
 ### 2. Register OAuth clients
 

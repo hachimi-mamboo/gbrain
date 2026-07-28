@@ -201,6 +201,11 @@ describe('prepareClientSourceBinding', () => {
 
     for (const sourceRef of [
       'https://git.example.invalid/private/wiki.git',
+      'https://example.com/C:/repo.git',
+      'https://example.com/path:/repo.git',
+      'ssh://git@example.com/C:/repo.git',
+      'git@example.com:C:/repo.git',
+      'git://example.com/C:/repo.git',
       'source:wiki @ abc123',
       'git@example.invalid:private/wiki.git',
       'wiki/main',
@@ -208,6 +213,22 @@ describe('prepareClientSourceBinding', () => {
     ]) {
       expect(sanitizeClientPathSourceRef('wiki', sourceRef)).toBeNull();
     }
+
+    expect(sanitizeClientPathSourceRef(
+      'wiki',
+      'https://example.com/repo.git?checkout=/clients/a/wiki @ abc123',
+      ['/clients/a/wiki'],
+    )).toBe('source:wiki @ abc123');
+    expect(sanitizeClientPathSourceRef(
+      'wiki',
+      'ssh://git@example.com/C:/clients/a/wiki @ abc123',
+      [String.raw`C:\clients\a\wiki`],
+    )).toBe('source:wiki @ abc123');
+    expect(sanitizeClientPathSourceRef(
+      'wiki',
+      'https://example.com/repo.git?checkout=//server/share/wiki @ abc123',
+      [String.raw`\\server\share\wiki`],
+    )).toBe('source:wiki @ abc123');
   });
 
   test('retires the checkout path inherited through the real v20 legacy upgrade', async () => {
@@ -367,6 +388,218 @@ describe('prepareClientSourceBinding', () => {
     });
   });
 
+  test('removes a stable-shaped remote_url when it contains an exact current or legacy client root', async () => {
+    await withEnv2(async () => {
+      for (const [sourceId, useCurrentRoot] of [
+        ['remote-current-root', true],
+        ['remote-legacy-root', false],
+      ] as const) {
+        const oldPath = join(GBRAIN_HOME, `${sourceId}-old`);
+        const clientPath = join(GBRAIN_HOME, `${sourceId}-client`);
+        const leakedRoot = useCurrentRoot ? clientPath : oldPath;
+        const remoteUrl = `https://example.com/repo.git?checkout=${leakedRoot}`;
+        mkdirSync(oldPath, { recursive: true });
+        mkdirSync(clientPath, { recursive: true });
+        await engine.executeRaw(
+          `INSERT INTO sources (id, name, local_path, last_commit, config)
+           VALUES ($1, $1, $2, 'stable-commit', $3::jsonb)`,
+          [
+            sourceId,
+            oldPath,
+            JSON.stringify({
+              remote_url: remoteUrl,
+              tracked_branch: 'main',
+            }),
+          ],
+        );
+
+        await withEnv(
+          { GBRAIN_SOURCE: sourceId, GBRAIN_SOURCE_PATH: clientPath },
+          () => prepareClientSourceBinding(engine, sourceId),
+        );
+
+        expect(await engine.executeRaw(
+          `SELECT local_path, last_commit, config FROM sources WHERE id = $1`,
+          [sourceId],
+        )).toEqual([{
+          local_path: null,
+          last_commit: 'stable-commit',
+          config: { tracked_branch: 'main' },
+        }]);
+      }
+    });
+  });
+
+  test('recursively sanitizes every controlled ingest-log field and preserves stable remote provenance', async () => {
+    await withEnv2(async () => {
+      const oldPath = join(GBRAIN_HOME, 'ingest-client-a');
+      const clientPath = join(GBRAIN_HOME, 'ingest-client-b');
+      mkdirSync(oldPath, { recursive: true });
+      mkdirSync(clientPath, { recursive: true });
+      await engine.executeRaw(
+        `UPDATE sources
+            SET local_path = $1,
+                last_commit = 'stable-ingest-commit'
+          WHERE id = 'default'`,
+        [oldPath],
+      );
+      await engine.setConfig('sync.repo_path', oldPath);
+      await engine.executeRaw(
+        `INSERT INTO ingest_log (
+           source_id, source_type, source_ref, pages_updated, summary
+         )
+         VALUES
+           (
+             'default',
+             $1,
+             $2,
+             $3::jsonb,
+             $4
+           ),
+           (
+             'default',
+             'git_sync',
+             'ssh://git@example.com/C:/repo.git',
+             '["wiki/stable"]'::jsonb,
+             'mirrored from https://example.com/path:/repo.git'
+           )`,
+        [
+          `directory:${oldPath}`,
+          `https://example.com/repo.git?checkout=${oldPath} @ abc123`,
+          JSON.stringify([
+            'wiki/safe',
+            { nested: [{ cwd: clientPath }] },
+            { [oldPath]: 'legacy-key' },
+          ]),
+          `imported from ${oldPath}`,
+        ],
+      );
+
+      const first = await withEnv(
+        { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'default'),
+      );
+      expect(first.sanitized_ingest_log_count).toBe(1);
+
+      const rows = await engine.executeRaw<{
+        source_type: string;
+        source_ref: string;
+        pages_updated: unknown;
+        summary: string;
+      }>(
+        `SELECT source_type, source_ref, pages_updated, summary
+           FROM ingest_log
+          WHERE source_id = 'default'
+          ORDER BY id`,
+      );
+      expect(rows).toEqual([
+        {
+          source_type: 'directory:[client-local-path]',
+          source_ref: 'source:default @ abc123',
+          pages_updated: [
+            'wiki/safe',
+            { nested: [{ cwd: '[client-local-path]' }] },
+            { '[client-local-path]': 'legacy-key' },
+          ],
+          summary: 'imported from [client-local-path]',
+        },
+        {
+          source_type: 'git_sync',
+          source_ref: 'ssh://git@example.com/C:/repo.git',
+          pages_updated: ['wiki/stable'],
+          summary: 'mirrored from https://example.com/path:/repo.git',
+        },
+      ]);
+
+      const second = await withEnv(
+        { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+        () => prepareClientSourceBinding(engine, 'default'),
+      );
+      expect(second.sanitized_ingest_log_count).toBe(0);
+      expect(JSON.stringify(rows)).not.toContain(oldPath);
+      expect(JSON.stringify(rows)).not.toContain(clientPath);
+    });
+  });
+
+  test('public log_ingest runs cleanup first and direct engine writes reject every controlled path field', async () => {
+    await withEnv2(async () => {
+      const oldPath = join(GBRAIN_HOME, 'log-client-a');
+      const clientPath = join(GBRAIN_HOME, 'log-client-b');
+      mkdirSync(oldPath, { recursive: true });
+      mkdirSync(clientPath, { recursive: true });
+      await engine.executeRaw(
+        `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+        [oldPath],
+      );
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name) VALUES ('other', 'Other')`,
+      );
+      await engine.setConfig('sync.repo_path', oldPath);
+
+      const logIngest = operations.find((op) => op.name === 'log_ingest')!;
+      await withEnv(
+        { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+        async () => {
+          await expect(logIngest.handler(
+            {
+              engine,
+              sourceId: 'other',
+              remote: false,
+              dryRun: false,
+            } as never,
+            {
+              source_type: 'directory',
+              source_ref: 'source:default @ abc123',
+              pages_updated: ['wiki/page'],
+              summary: `imported from ${oldPath}`,
+            },
+          )).rejects.toThrow('must not persist client-local paths in ingest log fields');
+
+          expect(await engine.executeRaw(
+            `SELECT local_path FROM sources WHERE id = 'default'`,
+          )).toEqual([{ local_path: null }]);
+          expect(await engine.getConfig('sync.repo_path')).toBeNull();
+
+          const safe = {
+            source_id: 'other',
+            source_type: 'git_sync',
+            source_ref: 'ssh://git@example.com/C:/repo.git',
+            pages_updated: ['wiki/page'],
+            summary: 'mirrored from https://example.com/path:/repo.git',
+          };
+          const unsafeEntries = [
+            { ...safe, source_type: `directory:${clientPath}` },
+            { ...safe, source_ref: clientPath },
+            {
+              ...safe,
+              pages_updated: [{ nested: [{ cwd: clientPath }] }],
+            },
+            { ...safe, summary: `imported from ${clientPath}` },
+          ];
+          for (const entry of unsafeEntries) {
+            await expect(engine.logIngest(entry as never)).rejects.toThrow(
+              'must not persist client-local paths in ingest log fields',
+            );
+          }
+
+          await engine.logIngest(safe);
+        },
+      );
+
+      expect(await engine.executeRaw<{
+        source_id: string;
+        source_ref: string;
+        summary: string;
+      }>(
+        `SELECT source_id, source_ref, summary FROM ingest_log ORDER BY id`,
+      )).toEqual([{
+        source_id: 'other',
+        source_ref: 'ssh://git@example.com/C:/repo.git',
+        summary: 'mirrored from https://example.com/path:/repo.git',
+      }]);
+    });
+  });
+
   test('clears only client-local path state and invalidates matching queued jobs', async () => {
     await withEnv({ GBRAIN_HOME, PATH: REAL_PATH }, async () => {
       const stableRemote = 'https://git.example.invalid/private/wiki.git';
@@ -488,6 +721,12 @@ describe('prepareClientSourceBinding', () => {
         sourceId: 'other',
         repoPath: '/srv/shared-other',
       }, 'unrelated /srv/shared-other');
+      const arbitraryNestedId = await insertJob('arbitrary-nested', 'waiting', {
+        nested: [{ cwd: oldPath }],
+      });
+      const inboxOnlyId = await insertJob('arbitrary-inbox', 'waiting', {
+        commit: 'inbox-only-stable',
+      });
       await engine.executeRaw(
         `UPDATE minion_jobs
             SET parent_job_id = $1,
@@ -550,6 +789,14 @@ describe('prepareClientSourceBinding', () => {
           }),
         ],
       );
+      await engine.executeRaw(
+        `INSERT INTO minion_inbox (job_id, sender, payload)
+         VALUES ($1, 'admin', $2::jsonb)`,
+        [
+          inboxOnlyId,
+          JSON.stringify({ directive: [{ cwd: oldPath }] }),
+        ],
+      );
       const stableOnlyBefore = await engine.executeRaw<{
         data: Record<string, unknown>;
         result: unknown;
@@ -583,6 +830,7 @@ describe('prepareClientSourceBinding', () => {
         cleared_legacy_repo_path: true,
         sanitized_ingest_log_count: 2,
         sanitized_job_ids: [
+          parentId,
           waitingId,
           stableOnlyStaleId,
           delayedId,
@@ -592,8 +840,11 @@ describe('prepareClientSourceBinding', () => {
           racingGlobalId,
           legacyActiveId,
           unrelatedId,
+          arbitraryNestedId,
+          inboxOnlyId,
         ],
         cancelled_job_ids: [
+          parentId,
           waitingId,
           stableOnlyStaleId,
           delayedId,
@@ -601,6 +852,8 @@ describe('prepareClientSourceBinding', () => {
           racingGlobalId,
           legacyActiveId,
           unrelatedId,
+          arbitraryNestedId,
+          inboxOnlyId,
         ],
       });
 
@@ -712,6 +965,8 @@ describe('prepareClientSourceBinding', () => {
           legacyActiveId,
           safeDbJobId,
           unrelatedId,
+          arbitraryNestedId,
+          inboxOnlyId,
         ]],
       );
       const byId = new Map(jobs.map((job) => [job.id, job]));
@@ -781,7 +1036,7 @@ describe('prepareClientSourceBinding', () => {
         data: { sourceId: 'binding' },
         error_text: 'cancelled: client-local source binding retired queued checkout path',
       });
-      expect(byId.get(parentId)?.status).toBe('waiting');
+      expect(byId.get(parentId)?.status).toBe('cancelled');
       expect(byId.get(safeDbJobId)).toMatchObject({
         status: 'waiting',
         data: {
@@ -790,6 +1045,20 @@ describe('prepareClientSourceBinding', () => {
         },
       });
       expect(byId.get(unrelatedId)?.status).toBe('completed');
+      expect(byId.get(arbitraryNestedId)).toMatchObject({
+        status: 'cancelled',
+        data: {
+          clientBindingSourceId: 'binding',
+          nested: [{ cwd: '[client-local-path]' }],
+        },
+      });
+      expect(byId.get(inboxOnlyId)).toMatchObject({
+        status: 'cancelled',
+        data: {
+          clientBindingSourceId: 'binding',
+          commit: 'inbox-only-stable',
+        },
+      });
       expect(byId.get(unrelatedId)?.data).toEqual({
         clientBindingSourceId: 'binding',
         sourceId: 'other',
@@ -808,13 +1077,20 @@ describe('prepareClientSourceBinding', () => {
         `SELECT job_id, payload FROM minion_inbox
           WHERE job_id = ANY($1::int[])
           ORDER BY id`,
-        [[parentId, completedId]],
+        [[parentId, completedId, inboxOnlyId]],
       );
+      // The parent itself was cancelled because its inbox carried a local
+      // path, so no additional child_done message is appended to that
+      // terminal row.
       expect(inbox.some((row) =>
         row.job_id === parentId &&
         row.payload.child_id === waitingId &&
         row.payload.outcome === 'cancelled'
-      )).toBe(true);
+      )).toBe(false);
+      expect(inbox).toContainEqual({
+        job_id: inboxOnlyId,
+        payload: { directive: [{ cwd: '[client-local-path]' }] },
+      });
       expect(JSON.stringify(inbox)).toContain('[client-local-path]');
       const claimed = await new MinionQueue(engine).claim(
         'client-b-worker',
@@ -1010,6 +1286,93 @@ describe('prepareClientSourceBinding', () => {
       expect(stable).toEqual([{
         status: 'active',
         data: { phases: ['embed'] },
+      }]);
+    });
+  });
+
+  test('rolls back structured cleanup when the remote_url CAS loses', async () => {
+    await withEnv2(async () => {
+      const oldPath = join(GBRAIN_HOME, 'cas-client-a');
+      const clientPath = join(GBRAIN_HOME, 'cas-client-b');
+      const localRemote = `file://${oldPath}`;
+      mkdirSync(oldPath, { recursive: true });
+      mkdirSync(clientPath, { recursive: true });
+      await engine.executeRaw(
+        `UPDATE sources
+            SET local_path = $1,
+                config = $2::jsonb
+          WHERE id = 'default'`,
+        [oldPath, JSON.stringify({ remote_url: localRemote })],
+      );
+      await engine.executeRaw(
+        `INSERT INTO ingest_log (
+           source_id, source_type, source_ref, pages_updated, summary
+         ) VALUES (
+           'default', 'directory', $1, $2::jsonb, $3
+         )`,
+        [
+          oldPath,
+          JSON.stringify([{ cwd: oldPath }]),
+          `imported from ${oldPath}`,
+        ],
+      );
+      await engine.executeRaw(
+        `INSERT INTO minion_jobs (name, status, data)
+         VALUES ('arbitrary-cas', 'waiting', $1::jsonb)`,
+        [JSON.stringify({ nested: [{ repoPath: oldPath }] })],
+      );
+
+      const originalTransaction = engine.transaction.bind(engine);
+      (engine as unknown as {
+        transaction: typeof engine.transaction;
+      }).transaction = (async <T>(
+        fn: Parameters<typeof engine.transaction<T>>[0],
+      ): Promise<T> => originalTransaction(async (tx) => {
+        const guardedTx = Object.create(tx) as typeof tx;
+        guardedTx.executeRaw = async <R = Record<string, unknown>>(
+          sql: string,
+          params?: unknown[],
+        ): Promise<R[]> => {
+          if (
+            sql.includes(`config->>'remote_url' = $2`) &&
+            sql.includes('RETURNING id')
+          ) {
+            return [];
+          }
+          return tx.executeRaw<R>(sql, params);
+        };
+        return fn(guardedTx);
+      })) as typeof engine.transaction;
+
+      try {
+        await expect(withEnv(
+          { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientPath },
+          () => prepareClientSourceBinding(engine, 'default'),
+        )).rejects.toThrow('config changed while preparing');
+      } finally {
+        (engine as unknown as {
+          transaction: typeof engine.transaction;
+        }).transaction = originalTransaction;
+      }
+
+      expect(await engine.executeRaw(
+        `SELECT local_path, config FROM sources WHERE id = 'default'`,
+      )).toEqual([{
+        local_path: oldPath,
+        config: { remote_url: localRemote },
+      }]);
+      expect(await engine.executeRaw(
+        `SELECT source_ref, pages_updated, summary FROM ingest_log`,
+      )).toEqual([{
+        source_ref: oldPath,
+        pages_updated: [{ cwd: oldPath }],
+        summary: `imported from ${oldPath}`,
+      }]);
+      expect(await engine.executeRaw(
+        `SELECT status, data FROM minion_jobs`,
+      )).toEqual([{
+        status: 'waiting',
+        data: { nested: [{ repoPath: oldPath }] },
       }]);
     });
   });
