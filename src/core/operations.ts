@@ -901,10 +901,22 @@ const put_page: Operation = {
     // closed here; writePageThrough is intentionally best-effort and runs
     // after the DB write.
     const sourceId = ctx.sourceId ?? 'default';
-    const { resolveClientSourcePath } = await import('./source-resolver.ts');
-    if (resolveClientSourcePath(sourceId)) {
+    const { resolveClientBrainRepoPath, resolveClientSourcePath } = await import('./source-resolver.ts');
+    const sharedBrainRepoPath = resolveClientBrainRepoPath();
+    const clientSourcePath = resolveClientSourcePath(sourceId);
+    if (sharedBrainRepoPath) {
+      const { toRepoRelativeSourcePath } = await import('./brain-repo-layout.ts');
+      // Validate the source-qualified physical mapping before the DB write.
+      // Hidden/reserved logical roots (notably `.sources`) are not bijective
+      // with the shared projection layout and must fail closed.
+      toRepoRelativeSourcePath(`${slug}.md`, sourceId);
+    }
+    if (clientSourcePath) {
       const { prepareClientSourceBinding } = await import('./sources-ops.ts');
       await prepareClientSourceBinding(ctx.engine, sourceId);
+    } else if (sharedBrainRepoPath) {
+      const { prepareClientBrainRepoBinding } = await import('./sources-ops.ts');
+      await prepareClientBrainRepoBinding(ctx.engine, sourceId);
     }
 
     // Empty-overwrite guard: empty/whitespace-only content over an existing
@@ -4134,15 +4146,15 @@ const sources_status: Operation = {
 const sources_prepare_client: Operation = {
   name: 'sources_prepare_client',
   description:
-    'Local-only client-binding entry seam. Requires matching GBRAIN_SOURCE and ' +
-    'absolute GBRAIN_SOURCE_PATH, validates any stable source remote identity, then ' +
+    'Local-only client-binding entry seam. Uses either matching GBRAIN_SOURCE plus ' +
+    'absolute GBRAIN_SOURCE_PATH or the independent absolute GBRAIN_BRAIN_REPO_PATH, then ' +
     'idempotently retires historical client paths from shared source/config/' +
     'ingest/job state without changing source identity, commit, or bookmarks.',
   params: {
     id: {
       type: 'string',
       required: true,
-      description: 'Existing source id bound by GBRAIN_SOURCE.',
+      description: 'Existing logical source id entering a client-local checkout binding.',
     },
   },
   mutating: true,
@@ -4152,8 +4164,11 @@ const sources_prepare_client: Operation = {
     if (ctx.dryRun) {
       return { dry_run: true, action: 'sources_prepare_client', source_id: p.id };
     }
-    const { prepareClientSourceBinding } = await import('./sources-ops.ts');
-    return prepareClientSourceBinding(ctx.engine, p.id as string);
+    const { resolveClientBrainRepoPath } = await import('./source-resolver.ts');
+    const { prepareClientBrainRepoBinding, prepareClientSourceBinding } = await import('./sources-ops.ts');
+    return resolveClientBrainRepoPath()
+      ? prepareClientBrainRepoBinding(ctx.engine, p.id as string)
+      : prepareClientSourceBinding(ctx.engine, p.id as string);
   },
   cliHints: { name: 'sources_prepare_client', hidden: true },
 };

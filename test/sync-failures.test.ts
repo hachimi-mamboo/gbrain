@@ -173,7 +173,9 @@ describe('Bug 9 — sync.ts CLI flag wiring', () => {
     // v0.42.42.0 (#2139, D13C): the pre-ack is now scoped PER SOURCE — `--all`
     // acks every source, single-source acks only its own.
     const source = await Bun.file(new URL('../src/commands/sync.ts', import.meta.url)).text();
-    expect(source).toMatch(/if \(skipFailed\) \{[\s\S]*?syncAll \? acknowledgeFailures\(\) : acknowledgeFailures\(sourceId\)/);
+    expect(source.match(/if \(skipFailed && !dryRun\)/g)?.length).toBe(2);
+    expect(source).toContain('const acked = acknowledgeFailures();');
+    expect(source).toContain('const acked = acknowledgeFailures(sourceId);');
   });
 
   test('acknowledgeSyncFailures clears stale failures end-to-end', async () => {

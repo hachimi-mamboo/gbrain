@@ -5,7 +5,8 @@
  *  1. Impact assessment (counts pages/chunks/embeddings/files for a source)
  *  2. Confirmation gate (`--confirm-destructive` required when data exists;
  *     `--yes` alone rejected)
- *  3. Soft-delete with 72h TTL (column-based as of v0.26.5; JSONB shape was
+ *  3. Soft-delete with an ordinary 72h TTL or persistent whole-brain Git
+ *     projection tombstone (column-based as of v0.26.5; JSONB shape was
  *     migrated in v33)
  *
  * Run against PGLite — the contract logic is identical on Postgres but
@@ -27,6 +28,7 @@ import {
   SOFT_DELETE_TTL_HOURS,
   type DestructiveImpact,
 } from '../src/core/destructive-guard.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 // Tier 3 opt-out — these tests need the cold-init schema path so the v33
 // migration columns exist on the brain under test.
@@ -166,20 +168,59 @@ describe('soft-delete + restore lifecycle (column-based v0.26.5)', () => {
     const id = 'sd-flips';
     await seedSource(engine, id, { withPages: 2 });
     const before = Date.now();
-    const result = await softDeleteSource(engine, id);
+    const result = await withEnv(
+      { GBRAIN_BRAIN_REPO_PATH: undefined, GBRAIN_SOURCE_PATH: undefined },
+      async () => softDeleteSource(engine, id),
+    );
     const after = Date.now();
     expect(result).not.toBeNull();
     expect(result!.id).toBe(id);
     expect(result!.pageCount).toBe(2);
     const ttlMs = SOFT_DELETE_TTL_HOURS * 60 * 60 * 1000;
-    expect(result!.expiresAt.getTime()).toBeGreaterThanOrEqual(before + ttlMs - 1000);
-    expect(result!.expiresAt.getTime()).toBeLessThanOrEqual(after + ttlMs + 1000);
+    expect(result!.expiresAt).not.toBeNull();
+    expect(result!.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + ttlMs - 1000);
+    expect(result!.expiresAt!.getTime()).toBeLessThanOrEqual(after + ttlMs + 1000);
     const rows = await engine.executeRaw<{ archived: boolean; archived_at: string }>(
       `SELECT archived, archived_at FROM sources WHERE id = $1`,
       [id],
     );
     expect(rows[0].archived).toBe(true);
     expect(rows[0].archived_at).not.toBeNull();
+  });
+
+  test('shared projection archive disables automatic expiry across unbound maintenance processes', async () => {
+    const id = 'sd-shared-no-expiry';
+    await seedSource(engine, id, { withPages: 1 });
+
+    const archived = await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: '/tmp/gbrain-shared-archive-fixture',
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => softDeleteSource(engine, id),
+    );
+    expect(archived?.expiresAt).toBeNull();
+
+    const stored = await engine.executeRaw<{
+      archived: boolean;
+      archive_expires_at: string | null;
+    }>(
+      `SELECT archived, archive_expires_at FROM sources WHERE id = $1`,
+      [id],
+    );
+    expect(stored).toEqual([{
+      archived: true,
+      archive_expires_at: null,
+    }]);
+
+    // The env binding is gone here, modeling an independent maintenance
+    // worker. NULL expiry keeps the archived tombstone out of automatic purge.
+    expect(await purgeExpiredSources(engine)).not.toContain(id);
+    const remaining = await engine.executeRaw<{ id: string }>(
+      `SELECT id FROM sources WHERE id = $1`,
+      [id],
+    );
+    expect(remaining).toEqual([{ id }]);
   });
 
   test('softDeleteSource is idempotent-as-null on already-archived', async () => {
@@ -278,6 +319,43 @@ describe('soft-delete + restore lifecycle (column-based v0.26.5)', () => {
     expect(remainingPages[0].n).toBe(0);
   });
 
+  test('purgeExpiredSources retains expired rows while a shared Git projection is bound', async () => {
+    const id = 'pe-shared-projection';
+    await seedSource(engine, id, { withPages: 1 });
+    await softDeleteSource(engine, id);
+    await engine.executeRaw(
+      `UPDATE sources SET archive_expires_at = now() - INTERVAL '1 hour' WHERE id = $1`,
+      [id],
+    );
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: '/tmp/gbrain-shared-projection-fixture',
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        expect(await purgeExpiredSources(engine)).toEqual([]);
+      },
+    );
+
+    const rows = await engine.executeRaw<{
+      archived: boolean;
+      archive_expires_at: string | null;
+      pages: number;
+    }>(
+      `SELECT s.archived,
+              s.archive_expires_at,
+              (SELECT COUNT(*)::int FROM pages p WHERE p.source_id = s.id) AS pages
+       FROM sources s WHERE s.id = $1`,
+      [id],
+    );
+    expect(rows).toEqual([{
+      archived: true,
+      archive_expires_at: null,
+      pages: 1,
+    }]);
+  });
+
   test('purgeExpiredSources is no-op when nothing is past TTL', async () => {
     // After all earlier tests, there may still be archived rows whose
     // archive_expires_at is in the future. Force-update any leftover-past
@@ -321,5 +399,18 @@ describe('formatters (display helpers)', () => {
     expect(out).toContain('archived');
     expect(out).toContain('restore src-a');
     expect(out).toContain('72');
+  });
+
+  test('formatSoftDelete explains a shared projection archive has no automatic expiry', () => {
+    const out = formatSoftDelete({
+      id: 'src-projected',
+      name: 'src-projected',
+      deletedAt: new Date(),
+      expiresAt: null,
+      pageCount: 100,
+    });
+    expect(out).toContain('no automatic expiry');
+    expect(out).toContain('Git projection first');
+    expect(out).toContain('restore src-projected');
   });
 });

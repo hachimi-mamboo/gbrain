@@ -1,6 +1,6 @@
 import { readdirSync, lstatSync, existsSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join, relative } from 'path';
+import { join, relative, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
 import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
@@ -24,6 +24,8 @@ import {
   resolveImportTargetDir,
   resumeFilter,
 } from '../core/import-checkpoint.ts';
+import { toRepoRelativeSourcePath } from '../core/brain-repo-layout.ts';
+import { resolveClientBrainRepoPath } from '../core/source-resolver.ts';
 
 function defaultWorkers(): number {
   const cpuCount = cpus().length;
@@ -43,6 +45,20 @@ export interface RunImportResult {
   errors: number;
   chunksCreated: number;
   failures: Array<{ path: string; error: string }>;
+}
+
+/**
+ * Convert `path.relative()` output into the canonical form persisted as
+ * `pages.source_path`. Only the host's native separator is translated. On
+ * POSIX a literal backslash is a filename character and remains visible so
+ * shared-projection validation can reject it instead of silently colliding
+ * with a directory.
+ */
+export function normalizeImportRelativePath(
+  relativePath: string,
+  nativeSeparator: string = sep,
+): string {
+  return nativeSeparator === '\\' ? relativePath.replaceAll('\\', '/') : relativePath;
 }
 
 export async function runImport(
@@ -69,6 +85,9 @@ export async function runImport(
   } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
+  const sharedProjectionSourceId = resolveClientBrainRepoPath()
+    ? (opts.sourceId ?? 'default')
+    : null;
   const fresh = args.includes('--fresh');
   const jsonOutput = args.includes('--json');
 
@@ -282,12 +301,20 @@ export async function runImport(
     // monorepo subdir, slugRoot is the git root so slugs stay git-root-
     // relative (matching the incremental path's git-diff paths). The
     // checkpoint (`completed`) stays dir-relative — resumeFilter's contract.
-    const importRelPath = opts.slugRoot ? relative(opts.slugRoot, filePath) : relativePath;
+    const importRelPath = normalizeImportRelativePath(
+      opts.slugRoot ? relative(opts.slugRoot, filePath) : relativePath,
+    );
     // v0.31.2 (D5): per-file slow-path log. Fires only when a single
     // file takes >5s. The user's hang surfaces as one file taking
     // forever — without this, the agent can't see which file.
     const _fileT0 = Date.now();
     try {
+      if (sharedProjectionSourceId) {
+        // Full import owns source_path persistence. In shared projection mode
+        // reject literal backslashes, hidden roots, traversal, and other
+        // noncanonical logical paths before any page row is written.
+        toRepoRelativeSourcePath(importRelPath, sharedProjectionSourceId);
+      }
       // v0.27.1 (F2): dispatch image extensions to importImageFile when
       // multimodal is enabled. The walker (collectMarkdownFiles) only picks
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is

@@ -316,6 +316,30 @@ describe('put_page write-through — multi-source filing', () => {
     expect(result.write_through?.path).toBe(path.join(brainDir, '.sources/team-x/shared/page.md'));
     expect(fs.existsSync(result.write_through!.path!)).toBe(true);
   });
+
+  test('shared projection rejects reserved/non-canonical slugs before the DB write', async () => {
+    const sharedRepo = path.join(tmpRoot, 'shared-brain-repo');
+    fs.mkdirSync(path.join(sharedRepo, '.sources', 'project-p'), { recursive: true });
+    execFileSync('git', ['init', '-q', sharedRepo]);
+    const sentinel = path.join(sharedRepo, '.sources', 'project-p', 'sentinel.md');
+    fs.writeFileSync(sentinel, 'unchanged\n');
+
+    for (const slug of ['.sources/project-p/escape', 'notes//collision']) {
+      await expect(withEnv({
+        GBRAIN_BRAIN_REPO_PATH: sharedRepo,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      }, () => putPage.handler(makeCtx(), {
+        slug,
+        content: '---\ntitle: Rejected\n---\n\nmust not persist',
+      }))).rejects.toThrow(/reserved hidden segment|canonical POSIX path/);
+
+      expect(await engine.getPage(slug, { sourceId: 'default' })).toBeNull();
+      expect(fs.readFileSync(sentinel, 'utf8')).toBe('unchanged\n');
+    }
+    expect(fs.existsSync(path.join(sharedRepo, '.sources', 'project-p', 'escape.md'))).toBe(false);
+    expect(fs.existsSync(path.join(sharedRepo, 'notes', 'collision.md'))).toBe(false);
+  });
 });
 
 describe('put_page write-through — failure isolation', () => {

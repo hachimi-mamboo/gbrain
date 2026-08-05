@@ -24,7 +24,7 @@ import {
   computeSyncDelta,
   buildDetachedWorkingTreeManifest,
 } from '../core/sync-delta.ts';
-import { fetchRemote } from '../core/git-remote.ts';
+import { fetchRemote, pullRepo } from '../core/git-remote.ts';
 import {
   parseUsdLimit,
   formatUsdLimit,
@@ -67,10 +67,25 @@ import {
 } from '../core/console-prefix.ts';
 import { loadStorageConfig } from '../core/storage-config.ts';
 import {
+  assertClientBrainRepoCheckout,
+  assertClientBrainRepoRoot,
   assertClientSourceCheckout,
   getDefaultSourcePath,
+  resolveClientBrainRepoPath,
   resolveClientSourcePath,
 } from '../core/source-resolver.ts';
+import {
+  BRAIN_REPO_SOURCE_MARKER,
+  discoverProjectedSourceIds,
+  ensureSourceProjectionMarker,
+  resolveSourceProjectionRoot,
+  toLogicalSourcePath,
+  toRepoRelativeSourcePath,
+} from '../core/brain-repo-layout.ts';
+import {
+  commitManagedPathsAndPush,
+  isDurabilityHardened,
+} from '../core/brain-repo-durability.ts';
 // v0.41.32.0: stamp the durable newest-COMMIT timestamp at sync time so the
 // remote staleness path reads a column instead of shelling out to git.
 // lagFromContentMs is the remote/column comparator (buildSyncStatusReport
@@ -378,6 +393,9 @@ export function estimateInlineNewTokens(
     config: Record<string, unknown>;
     last_commit: string | null;
     chunker_version: string | null;
+    projection_source_id?: string;
+    /** Repo-level snapshot fixed by the shared sync lock; never persisted. */
+    projection_git_target?: { commit: string; detached: boolean };
   }>,
   currentChunkerVersion: string,
 ): InlineEstimate {
@@ -401,6 +419,7 @@ export function estimateInlineNewTokens(
     if (cfg.syncEnabled === false) continue;
     const strategy = cfg.strategy ?? 'markdown';
     const localPath = src.local_path;
+    const projectionSourceId = src.projection_source_id ?? null;
 
     // Rung 2: chunker drift forces a full re-chunk → full re-embed. CEILING.
     if (src.chunker_version !== currentChunkerVersion) {
@@ -414,7 +433,24 @@ export function estimateInlineNewTokens(
       continue;
     }
 
-    const resolved = resolveEstimateTarget(localPath);
+    let deltaRoot = localPath;
+    if (projectionSourceId) {
+      try {
+        deltaRoot = discoverGitRoot(localPath);
+      } catch {
+        ceiling(localPath, strategy, 'git_unavailable');
+        continue;
+      }
+    }
+
+    // Shared projection sync already pulled once under the repo-level DB lock.
+    // Reuse that exact local snapshot for every logical source: fetching
+    // origin here would both repeat network work and could price a commit that
+    // this run never checked out.
+    const pinnedProjectionTarget = src.projection_git_target;
+    const resolved = pinnedProjectionTarget
+      ? { target: pinnedProjectionTarget.commit, detached: pinnedProjectionTarget.detached }
+      : resolveEstimateTarget(deltaRoot);
     if (!resolved) {
       // HEAD unresolvable (not a git repo / gone) — can't compute a delta. CEILING.
       ceiling(localPath, strategy, 'git_unavailable');
@@ -425,7 +461,7 @@ export function estimateInlineNewTokens(
     // Mirrors the executor's `up_to_date` predicate — a dirty-but-committed-current
     // tree imports nothing, so it must price $0 (the heart of the false-fire fix).
     const detachedManifest = resolved.detached
-      ? buildDetachedWorkingTreeManifest(localPath)
+      ? buildDetachedWorkingTreeManifest(deltaRoot)
       : null;
     const detachedHasChanges = detachedManifest !== null &&
       (detachedManifest.added.length > 0 ||
@@ -438,7 +474,7 @@ export function estimateInlineNewTokens(
     }
 
     // Rung 5/6: the delta itself — SAME helper the executor diffs with.
-    const delta = computeSyncDelta(localPath, src.last_commit, resolved.target, {
+    const delta = computeSyncDelta(deltaRoot, src.last_commit, resolved.target, {
       detachedManifest,
     });
     if (delta.status === 'unavailable') {
@@ -446,12 +482,17 @@ export function estimateInlineNewTokens(
       continue;
     }
     const syncOpts = { strategy };
+    const belongsToSource = (path: string): boolean => {
+      if (!projectionSourceId) return isSyncable(path, syncOpts);
+      const logicalPath = toLogicalSourcePath(path, projectionSourceId);
+      return logicalPath !== null && isSyncable(logicalPath, syncOpts);
+    };
     const changedPaths = unique([
-      ...delta.manifest.added.filter(p => isSyncable(p, syncOpts)),
-      ...delta.manifest.modified.filter(p => isSyncable(p, syncOpts)),
-      ...delta.manifest.renamed.filter(r => isSyncable(r.to, syncOpts)).map(r => r.to),
+      ...delta.manifest.added.filter(belongsToSource),
+      ...delta.manifest.modified.filter(belongsToSource),
+      ...delta.manifest.renamed.filter(r => belongsToSource(r.to)).map(r => r.to),
     ]);
-    tokens += estimateDeltaTokens(localPath, changedPaths);
+    tokens += estimateDeltaTokens(deltaRoot, changedPaths);
     changedSources++;
     hadDelta = true;
   }
@@ -536,6 +577,8 @@ type CostGateSource = {
   config: Record<string, unknown>;
   last_commit: string | null;
   chunker_version: string | null;
+  projection_source_id?: string;
+  projection_git_target?: { commit: string; detached: boolean };
 };
 
 interface CostGateContext {
@@ -745,6 +788,14 @@ export interface SyncOpts {
    * pre-v0.17 global-config path unchanged.
    */
   sourceId?: string;
+  /**
+   * Internal path-identity mode for `GBRAIN_BRAIN_REPO_PATH`.
+   *
+   * Git diff/checkpoint paths are physical repo paths, while imports and
+   * `pages.source_path` stay source-relative. Existing monorepo
+   * `srcSubpath` behavior remains git-root-relative when this is unset.
+   */
+  brainRepoProjection?: boolean;
   /** Multi-repo: sync strategy override (markdown, code, auto). */
   strategy?: 'markdown' | 'code' | 'auto';
   /**
@@ -1420,6 +1471,17 @@ See also:
     process.exit(1);
   }
 
+  if (resolveClientBrainRepoPath()) {
+    const { prepareClientBrainRepoBinding } = await import('../core/sources-ops.ts');
+    await prepareClientBrainRepoBinding(engine, sourceIdArg);
+    console.error(
+      `Error: source "${sourceIdArg}" uses a client-local shared brain repo. ` +
+      `A queued sync cannot inherit GBRAIN_BRAIN_REPO_PATH, and GBrain will not persist that local path.`,
+    );
+    console.error('Run inline in this client instead: gbrain sync --all');
+    process.exit(2);
+  }
+
   if (resolveClientSourcePath(sourceIdArg)) {
     const { prepareClientSourceBinding } = await import('../core/sources-ops.ts');
     await prepareClientSourceBinding(engine, sourceIdArg);
@@ -1528,9 +1590,11 @@ async function formatLockBusyMessage(engine: BrainEngine, lockKey: string): Prom
   }
 
   const ageHuman = formatAgeHuman(snap.age_ms);
-  const breakHint = lockKey.startsWith('gbrain-sync:')
-    ? `gbrain sync --break-lock --source ${lockKey.slice('gbrain-sync:'.length)}`
-    : `gbrain sync --break-lock`;
+  const breakHint = lockKey === SHARED_BRAIN_REPO_SYNC_LOCK_ID
+    ? 'gbrain sync --all --break-lock'
+    : lockKey.startsWith('gbrain-sync:')
+      ? `gbrain sync --break-lock --source ${lockKey.slice('gbrain-sync:'.length)}`
+      : `gbrain sync --break-lock`;
   const ttlNote = snap.ttl_expired ? ' [TTL expired]' : '';
   return (
     `Another sync is in progress (lock ${lockKey} held by pid ${snap.holder_pid} on ${snap.holder_host}, ` +
@@ -1808,6 +1872,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   const clientSourcePath = opts.sourceId
     ? resolveClientSourcePath(opts.sourceId)
     : null;
+  const clientBrainRepoRoot = opts.brainRepoProjection
+    ? resolveClientBrainRepoPath()
+    : null;
+  const clientBrainRepoSourcePath = clientBrainRepoRoot && opts.sourceId
+    ? resolveSourceProjectionRoot(clientBrainRepoRoot, opts.sourceId)
+    : null;
   if (clientSourcePath) {
     if (opts.repoPath && resolvePath(opts.repoPath) !== clientSourcePath) {
       throw new Error(
@@ -1818,11 +1888,27 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     const { prepareClientSourceBinding } = await import('../core/sources-ops.ts');
     await prepareClientSourceBinding(engine, opts.sourceId!);
   }
+  if (
+    clientBrainRepoSourcePath &&
+    opts.repoPath &&
+    resolvePath(opts.repoPath) !== resolvePath(clientBrainRepoSourcePath)
+  ) {
+    throw new Error(
+      `--repo ${opts.repoPath} conflicts with the ${opts.sourceId} projection in ` +
+      `GBRAIN_BRAIN_REPO_PATH=${clientBrainRepoRoot}.`,
+    );
+  }
+  if (clientBrainRepoSourcePath && !opts.dryRun) {
+    const { prepareClientBrainRepoBinding } = await import('../core/sources-ops.ts');
+    await prepareClientBrainRepoBinding(engine, opts.sourceId!);
+  }
   const repoPath =
     opts.repoPath ||
     clientSourcePath ||
+    clientBrainRepoSourcePath ||
     await readSyncAnchor(engine, opts.sourceId, 'repo_path');
-  const persistRepoPath = !opts.repoPath && clientSourcePath === null;
+  const persistRepoPath =
+    !opts.repoPath && clientSourcePath === null && clientBrainRepoSourcePath === null;
   if (!repoPath) {
     const hint = opts.sourceId
       ? `Source "${opts.sourceId}" has no local_path. Run: gbrain sources add ${opts.sourceId} --path <path>`
@@ -1861,7 +1947,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // clone is auto-managed. validateRepoState classifies the on-disk state;
   // we recover from missing/no-git/not-a-dir by re-cloning, refuse on
   // url-drift or corruption with structured hints.
-  if (opts.sourceId) {
+  if (opts.sourceId && !opts.brainRepoProjection) {
     serr(`[gbrain phase] sync.validate_repo_state`);
     const { validateRepoState } = await import('../core/git-remote.ts');
     const { recloneIfMissing, isOwnedClone, unownedHint } = await import(
@@ -1978,6 +2064,17 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // Relative path from git root to sync scope ('' when scope == root).
   const syncScopeRelPath = syncScopeRoot === gitContextRoot ? '' : relative(gitContextRoot, syncScopeRoot);
   const scoped = syncScopeRelPath !== '';
+  if (opts.brainRepoProjection && !opts.sourceId) {
+    throw new Error('Shared brain-repo projection sync requires a sourceId.');
+  }
+  const projectionSourceId = opts.brainRepoProjection ? opts.sourceId! : null;
+  // Git owns physical repo-relative paths. The database owns source-relative
+  // paths plus source_id. Keep the translation here so every incremental
+  // add/modify/delete/rename follows the same identity rule.
+  const logicalPathForRepoPath = (path: string): string | null =>
+    projectionSourceId ? toLogicalSourcePath(path, projectionSourceId) : path;
+  const repoPathForLogicalPath = (path: string): string =>
+    projectionSourceId ? toRepoRelativeSourcePath(path, projectionSourceId) : path;
   // Anchor written back to sync state (sources.local_path / sync.repo_path):
   // the SCOPE path, so a follow-up bare `gbrain sync` auto-discovers the same
   // scope. Unchanged (the caller's repoPath spelling) when no --src-subpath.
@@ -2344,12 +2441,21 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // subpath scope is active, only paths under it participate. Back-compat:
   // syncScopeRelPath is '' when scope == root, so inScope is always true and
   // the filters below reduce to the pre-#774 behavior exactly.
-  const inScope = (p: string): boolean =>
-    !scoped || p === syncScopeRelPath || p.startsWith(syncScopeRelPath + '/');
+  const inScope = (p: string): boolean => {
+    if (projectionSourceId) return logicalPathForRepoPath(p) !== null;
+    return !scoped || p === syncScopeRelPath || p.startsWith(syncScopeRelPath + '/');
+  };
   // --exclude patterns match the SCOPE-relative path (what the user of a
   // scoped source thinks in), same form runImport matches on full sync.
   const scopeRel = (p: string): string =>
-    scoped && p.startsWith(syncScopeRelPath + '/') ? p.slice(syncScopeRelPath.length + 1) : p;
+    projectionSourceId
+      ? logicalPathForRepoPath(p) ?? p
+      : scoped && p.startsWith(syncScopeRelPath + '/')
+        ? p.slice(syncScopeRelPath.length + 1)
+        : p;
+  const identityPath = (p: string): string =>
+    projectionSourceId ? scopeRel(p) : p;
+  const classificationPath = identityPath;
   const excluded = (p: string): boolean =>
     opts.exclude !== undefined && opts.exclude.length > 0 && matchesAnyGlob(scopeRel(p), opts.exclude);
 
@@ -2363,17 +2469,38 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // #774: a rename whose destination LEFT the scope is the same class — the
   // old page's backing file is gone from this source's slice of the repo.
   const renamedToUnsyncable = manifest.renamed
-    .filter(r => inScope(r.from) && isSyncable(r.from, syncOpts) &&
-      !(inScope(r.to) && isSyncable(r.to, syncOpts)))
-    .map(r => r.from);
+    .filter(r => inScope(r.from) && isSyncable(classificationPath(r.from), syncOpts) &&
+      !(inScope(r.to) && isSyncable(classificationPath(r.to), syncOpts)))
+    .map(r => identityPath(r.from));
+  // A Git rename across projection boundaries is a move between logical
+  // sources. Git emits one R record, not a delete plus add, so the destination
+  // source must explicitly treat a rename entering its scope as an add. The
+  // source it left is handled by renamedToUnsyncable above.
+  const renamedIntoScope = manifest.renamed
+    .filter(r => !inScope(r.from) && inScope(r.to) && !excluded(r.to) &&
+      isSyncable(classificationPath(r.to), syncOpts))
+    .map(r => identityPath(r.to));
   const filtered: SyncManifest = {
-    added: manifest.added.filter(p => inScope(p) && !excluded(p) && isSyncable(p, syncOpts)),
-    modified: manifest.modified.filter(p => inScope(p) && !excluded(p) && isSyncable(p, syncOpts)),
+    added: unique([
+      ...manifest.added
+        .filter(p => inScope(p) && !excluded(p) && isSyncable(classificationPath(p), syncOpts))
+        .map(identityPath),
+      ...renamedIntoScope,
+    ]),
+    modified: manifest.modified
+      .filter(p => inScope(p) && !excluded(p) && isSyncable(classificationPath(p), syncOpts))
+      .map(identityPath),
     deleted: unique([
-      ...manifest.deleted.filter(p => inScope(p) && isSyncable(p, syncOpts)),
+      ...manifest.deleted
+        .filter(p => inScope(p) && isSyncable(classificationPath(p), syncOpts))
+        .map(identityPath),
       ...renamedToUnsyncable,
     ]),
-    renamed: manifest.renamed.filter(r => inScope(r.to) && !excluded(r.to) && isSyncable(r.to, syncOpts)),
+    renamed: manifest.renamed
+      .filter(r =>
+        inScope(r.from) && inScope(r.to) && !excluded(r.to) &&
+        isSyncable(classificationPath(r.to), syncOpts))
+      .map(r => ({ from: identityPath(r.from), to: identityPath(r.to) })),
   };
 
   // NAV-4: warn when --exclude filtered out every candidate change — almost
@@ -2381,7 +2508,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // "up to date" in the output.
   if (opts.exclude && opts.exclude.length > 0) {
     const excludeCandidates = [...manifest.added, ...manifest.modified]
-      .filter(p => inScope(p) && isSyncable(p, syncOpts));
+      .filter(p => inScope(p) && isSyncable(classificationPath(p), syncOpts));
     if (excludeCandidates.length > 0 && excludeCandidates.every(excluded)) {
       console.warn(
         `[gbrain sync] No files matched after applying ${opts.exclude.length} --exclude pattern(s). ` +
@@ -2413,30 +2540,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // delete the page. That's the same pre-fix behavior — removing the
   // page requires `gbrain pages purge-deleted` or a direct MCP delete.
   // Filed as v0.42+ follow-up for a `gbrain pages remove <slug>` surface.
-  const unsyncableModified = manifest.modified.filter(p => inScope(p) && !isSyncable(p, syncOpts));
-  // v0.18.0+ multi-source: scope getPage + deletePage to opts.sourceId so
-  // unsyncable cleanup in source A doesn't accidentally sweep same-slug
-  // pages in sources B/C/D.
-  const pageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  for (const path of unsyncableModified) {
-    // v0.41.13 #1433: never delete on metafile classification.
-    // #2404 hardening: same for 'pruned-dir' — a page under a pruned
-    // directory can only exist via a deliberate put_page (sync never
-    // imports those paths), so "the file was modified" is not evidence
-    // the page is stale. Deleting here silently destroyed put-created
-    // pages every time their materialized file landed in a commit.
-    const reason = unsyncableReason(path, syncOpts);
-    if (reason === 'metafile' || reason === 'pruned-dir') continue;
-    const slug = await resolveSlugByPathOrSourcePath(engine, path, opts.sourceId);
-    try {
-      const existing = await engine.getPage(slug, pageOpts);
-      if (existing) {
-        await engine.deletePage(slug, pageOpts);
-        slog(`  Deleted un-syncable page: ${slug}`);
-      }
-    } catch { /* ignore */ }
-  }
-
+  const unsyncableModified = manifest.modified
+    .filter(p => inScope(p) && !isSyncable(classificationPath(p), syncOpts))
+    .map(identityPath);
   const totalChanges = filtered.added.length + filtered.modified.length +
     filtered.deleted.length + filtered.renamed.length;
 
@@ -2460,6 +2566,30 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       embedded: 0,
       pagesAffected: [],
     };
+  }
+
+  // v0.18.0+ multi-source: scope getPage + deletePage to opts.sourceId so
+  // unsyncable cleanup in source A doesn't accidentally sweep same-slug
+  // pages in sources B/C/D. This intentionally runs AFTER the dry-run return:
+  // a preview may classify and report a path, but must never mutate the DB.
+  const pageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  for (const path of unsyncableModified) {
+    // v0.41.13 #1433: never delete on metafile classification.
+    // #2404 hardening: same for 'pruned-dir' — a page under a pruned
+    // directory can only exist via a deliberate put_page (sync never
+    // imports those paths), so "the file was modified" is not evidence
+    // the page is stale. Deleting here silently destroyed put-created
+    // pages every time their materialized file landed in a commit.
+    const reason = unsyncableReason(path, syncOpts);
+    if (reason === 'metafile' || reason === 'pruned-dir') continue;
+    const slug = await resolveSlugByPathOrSourcePath(engine, path, opts.sourceId);
+    try {
+      const existing = await engine.getPage(slug, pageOpts);
+      if (existing) {
+        await engine.deletePage(slug, pageOpts);
+        slog(`  Deleted un-syncable page: ${slug}`);
+      }
+    } catch { /* ignore */ }
   }
 
   if (totalChanges === 0) {
@@ -2888,13 +3018,23 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // Paths from git diff are relative to gitContextRoot; join from there.
       // NAV-1 TOCTOU: refuse a destination that realpath-resolves outside the
       // repo (committed symlink pointing out).
-      const filePath = join(gitContextRoot, to);
+      const filePath = join(gitContextRoot, repoPathForLogicalPath(to));
       if (existsSync(filePath) && isPathSafe(filePath, gitContextRoot)) {
         try {
           const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
           if (result.status === 'imported') chunksCreated += result.chunks;
           else if (result.status === 'skipped' && (result as { error?: string }).error) {
             failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
+          }
+          // An unchanged-content rename short-circuits inside importFile after
+          // updateSlug, so its source_path would otherwise keep the old name.
+          // Keep path identity source-relative in both ordinary source syncs
+          // and shared brain-repo projection syncs.
+          if (opts.sourceId && !(result.status === 'skipped' && (result as { error?: string }).error)) {
+            await engine.executeRaw(
+              `UPDATE pages SET source_path = $1 WHERE source_id = $2 AND slug = $3`,
+              [to, opts.sourceId, newSlug],
+            );
           }
         } catch (e: unknown) {
           failedFiles.push({ path: to, error: e instanceof Error ? e.message : String(e) });
@@ -3041,7 +3181,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
 
     async function importOnePath(eng: BrainEngine, path: string): Promise<void> {
-      const filePath = join(syncRepoPath, path);
+      const filePath = join(syncRepoPath, repoPathForLogicalPath(path));
       if (!existsSync(filePath)) {
         // v0.42.x (#1794, Codex #3): the diff is against the PINNED target, but
         // importFile reads the live working tree. A file added in lastCommit..pin
@@ -3462,10 +3602,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!opts.noExtract && totalChanges <= 100 && pagesAffected.length > 0) {
     try {
       const { extractLinksForSlugs, extractTimelineForSlugs, stampExtracted } = await import('./extract.ts');
-      // #774: pages' source_path is git-root-relative, so extract resolves
-      // files from gitContextRoot (== repoPath realpath when unscoped).
-      const linksCreated = await extractLinksForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
-      const timelineCreated = await extractTimelineForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
+      // Ordinary scoped sources keep git-root-relative source_path values, so
+      // extraction resolves from gitContextRoot. Shared brain-repo projection
+      // deliberately stores source-relative paths; resolve those from this
+      // source's physical projection root or a same-path default file could be
+      // read under the wrong logical source.
+      const extractionRoot = opts.brainRepoProjection ? syncScopeRoot : gitContextRoot;
+      const linksCreated = await extractLinksForSlugs(engine, extractionRoot, pagesAffected, extractOpts);
+      const timelineCreated = await extractTimelineForSlugs(engine, extractionRoot, pagesAffected, extractOpts);
       if (linksCreated > 0 || timelineCreated > 0) {
         slog(`  Extracted: ${linksCreated} links, ${timelineCreated} timeline entries`);
       }
@@ -3593,7 +3737,10 @@ async function performFullSync(
   // Scoped sync → slugs/source_path are git-root-relative (matches the
   // incremental path's git-diff paths). Unscoped → undefined (dir-relative,
   // the pre-#774 behavior, byte-for-byte).
-  const slugRoot = syncScopeRoot !== gitContextRoot ? gitContextRoot : undefined;
+  const slugRoot =
+    !opts.brainRepoProjection && syncScopeRoot !== gitContextRoot
+      ? gitContextRoot
+      : undefined;
   // Dry-run: walk the scope, count syncable files, return without writing.
   // Fixes the silent-write-on-dry-run bug where performFullSync called
   // runImport unconditionally regardless of opts.dryRun.
@@ -3816,7 +3963,10 @@ async function performFullSync(
         deletableSlugs = [];
         for (const slug of plan.staleSlugs) {
           const sp = pathBySlug.get(slug);
-          if (sp && !everCommitted.has(sp.replace(/\\/g, '/'))) dbOnlySlugs.push(slug);
+          const committedPath = sp && opts.brainRepoProjection
+            ? toRepoRelativeSourcePath(sp, sid)
+            : sp;
+          if (committedPath && !everCommitted.has(committedPath.replace(/\\/g, '/'))) dbOnlySlugs.push(slug);
           else deletableSlugs.push(slug);
         }
       }
@@ -3827,7 +3977,11 @@ async function performFullSync(
           for (const slug of dbOnlySlugs) {
             const r = await writePageThrough(engine, slug, {
               sourceId: sid,
-              operationRoot: gitContextRoot,
+              // In shared projection mode the source walk root is only the
+              // logical file subtree. Let write-through resolve the configured
+              // brain-repo root so it writes under .sources/<id> but detects
+              // hardening and commits at the one physical Git checkout.
+              ...(opts.brainRepoProjection ? {} : { operationRoot: gitContextRoot }),
             });
             if (r.written) reExported++;
           }
@@ -4112,6 +4266,143 @@ function manageGitignoreAtGitRoot(path: string, engineKind?: 'pglite' | 'postgre
   manageGitignore(root, engineKind);
 }
 
+/** One physical checkout gets one cross-process sync lock. */
+export const SHARED_BRAIN_REPO_SYNC_LOCK_ID = 'gbrain-sync:brain-repo';
+
+async function withSharedBrainRepoSyncLock<T>(
+  engine: BrainEngine,
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await withRefreshingLock(engine, SHARED_BRAIN_REPO_SYNC_LOCK_ID, fn);
+  } catch (error) {
+    if (error instanceof LockUnavailableError) {
+      throw new SyncLockBusyError(
+        await formatLockBusyMessage(engine, SHARED_BRAIN_REPO_SYNC_LOCK_ID),
+        SHARED_BRAIN_REPO_SYNC_LOCK_ID,
+      );
+    }
+    throw error;
+  }
+}
+
+/** Pull the shared checkout once while the repo-level lock is held. */
+function pullSharedBrainRepoSnapshot(
+  sharedBrainRepoPath: string,
+  opts: { noPull: boolean; dryRun: boolean },
+): void {
+  if (opts.noPull || opts.dryRun) return;
+  const sharedGitRoot = realpathSync(discoverGitRoot(sharedBrainRepoPath));
+  if (isDetachedHead(sharedGitRoot)) {
+    throw new Error(
+      `Shared brain repo ${sharedBrainRepoPath} is on detached HEAD. ` +
+      'Check out a branch, or pass --no-pull to deliberately proceed without a remote update.',
+    );
+  }
+  if (git(sharedGitRoot, ['status', '--porcelain']).length > 0) {
+    throw new Error(
+      `Shared brain repo ${sharedBrainRepoPath} has uncommitted changes. ` +
+      'Commit or stash them before sync. --no-pull only bypasses the remote update; ' +
+      'incremental sync still follows committed Git history.',
+    );
+  }
+  if (!hasOriginRemote(sharedGitRoot)) return;
+  try {
+    pullRepo(sharedGitRoot);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Shared brain-repo pull failed before source discovery: ${message}`);
+  }
+}
+
+/**
+ * Materialize empty-source identities after pull and before child syncs.
+ * Hardened repos commit the format upgrade immediately. Unhardened repos keep
+ * the marker visible and print the exact operator action required to make it
+ * durable; --no-pull remains the explicit local-snapshot escape hatch.
+ */
+function ensureSharedProjectionMarkers(
+  sharedBrainRepoPath: string,
+  sourceIds: string[],
+): void {
+  const created: string[] = [];
+  const markers: string[] = [];
+  for (const sourceId of sourceIds) {
+    if (sourceId === 'default') continue;
+    const markerPath = join(
+      resolveSourceProjectionRoot(sharedBrainRepoPath, sourceId),
+      BRAIN_REPO_SOURCE_MARKER,
+    );
+    const existed = existsSync(markerPath);
+    const marker = ensureSourceProjectionMarker(sharedBrainRepoPath, sourceId);
+    if (marker) {
+      markers.push(marker);
+      if (!existed) created.push(marker);
+    }
+  }
+
+  if (isDurabilityHardened(sharedBrainRepoPath)) {
+    const branch = git(sharedBrainRepoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const undurableMarkers = markers.filter((marker) => {
+      const rel = relative(sharedBrainRepoPath, marker);
+      try {
+        git(sharedBrainRepoPath, ['cat-file', '-e', `HEAD:${rel}`], [], 10_000, {
+          silenceStderr: true,
+        });
+        git(sharedBrainRepoPath, ['cat-file', '-e', `origin/${branch}:${rel}`], [], 10_000, {
+          silenceStderr: true,
+        });
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    if (undurableMarkers.length === 0) return;
+    if (!commitManagedPathsAndPush(
+      sharedBrainRepoPath,
+      undurableMarkers,
+      'chore(gbrain): record projection source identities',
+    )) {
+      throw new Error(
+        'Created shared projection markers but could not commit them in the hardened brain repo. ' +
+        'Run `gbrain sources harden --all` and retry.',
+      );
+    }
+    return;
+  }
+
+  if (created.length === 0) return;
+  serr(
+    `[gbrain] Created ${created.length} projection source marker(s). ` +
+    'Run `gbrain sources harden --all` to commit and push them before relying on fresh-clone recovery.',
+  );
+}
+
+type SharedBrainRepoSetupStage =
+  | 'shared_brain_repo_preflight'
+  | 'shared_brain_repo_lock'
+  | 'shared_brain_repo_pull'
+  | 'shared_brain_repo_layout'
+  | 'shared_brain_repo_cost_gate'
+  | 'shared_brain_repo_admission';
+
+async function emitSharedBrainRepoSetupError(
+  stage: SharedBrainRepoSetupStage,
+  error: unknown,
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  console.log(JSON.stringify({
+    schema_version: 1,
+    sources: [],
+    parallel: 0,
+    ok_count: 0,
+    error_count: 1,
+    error: { stage, message },
+  }));
+  const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+  setCliExitVerdict(1);
+}
+
 export async function runSync(engine: BrainEngine, args: string[]) {
   // v0.40 Federated Sync v2: `gbrain sync trigger` subcommand
   // Routes to runSyncTrigger which queues a 'sync' minion job with
@@ -4182,6 +4473,13 @@ Options:
                        2 = cost-prompt-not-confirmed.
   --yes                Accept any interactive prompts (CI / non-TTY).
 
+Environment:
+  GBRAIN_BRAIN_REPO_PATH
+                       Absolute client-local checkout that projects all
+                       sources in one repo. Use with --all; default lives at
+                       the root and other sources under .sources/<id>/.
+                       One physical checkout is always synced serially.
+
 See also:
   gbrain embed --stale    Re-embed all stale chunks (post --no-embed).
   gbrain doctor           Diagnose dim mismatches and other sync issues.
@@ -4204,6 +4502,7 @@ See also:
   const syncAll = args.includes('--all');
   const jsonOut = args.includes('--json');
   const yesFlag = args.includes('--yes');
+  const sharedBrainRepoPath = resolveClientBrainRepoPath();
   if (syncAll && process.env.GBRAIN_SOURCE_PATH) {
     console.error(
       '--all cannot be combined with GBRAIN_SOURCE_PATH because a client-local ' +
@@ -4217,6 +4516,49 @@ See also:
       'Run one source explicitly with --source <id> --repo <path>.',
     );
     process.exit(1);
+  }
+  if (sharedBrainRepoPath) {
+    if (!syncAll) {
+      throw new Error(
+        'GBRAIN_BRAIN_REPO_PATH is a whole-brain projection and requires `gbrain sync --all`.',
+      );
+    }
+    if (repoPath) {
+      throw new Error('GBRAIN_BRAIN_REPO_PATH cannot be combined with --repo.');
+    }
+    if (watch) {
+      throw new Error(
+        'GBRAIN_BRAIN_REPO_PATH does not support --watch; run an explicit `gbrain sync --all` cycle.',
+      );
+    }
+    if (args.includes('--timeout')) {
+      throw new Error(
+        'GBRAIN_BRAIN_REPO_PATH does not support --timeout because one pull covers the whole checkout.',
+      );
+    }
+    if (args.includes('--src-subpath')) {
+      throw new Error(
+        'GBRAIN_BRAIN_REPO_PATH cannot be combined with --src-subpath; source identity already comes from the projection layout.',
+      );
+    }
+    if (args.includes('--source')) {
+      throw new Error(
+        'GBRAIN_BRAIN_REPO_PATH syncs the complete projection; do not combine --source with --all.',
+      );
+    }
+    // Establish only the physical checkout identity here. Projection markers
+    // are validated after the one repo-level pull, while its lock is held, so
+    // a stale malformed marker cannot block an upstream repair from arriving.
+    // Neither preflight mutates DB state.
+    try {
+      assertClientBrainRepoRoot(sharedBrainRepoPath);
+    } catch (error) {
+      if (jsonOut) {
+        await emitSharedBrainRepoSetupError('shared_brain_repo_preflight', error);
+        return;
+      }
+      throw error;
+    }
   }
   // v0.41.6.0 D3: lock-recovery flags. --break-lock (safe) verifies the
   // holder is local-host + (TTL-expired OR PID-dead+60s-old) before
@@ -4254,6 +4596,31 @@ See also:
   // source in one call; runBreakLock now widens to iterate sources when
   // --all is set and accept maxAgeSeconds for age-gated breaks.
   if (breakLock || forceBreakLock) {
+    if (syncAll && sharedBrainRepoPath) {
+      let worstExit = await runBreakLock(
+        engine,
+        SHARED_BRAIN_REPO_SYNC_LOCK_ID,
+        'brain-repo',
+        {
+          force: forceBreakLock,
+          json: jsonOut,
+          maxAgeSeconds,
+        },
+      );
+      // A killed shared run can leave both the outer checkout lock and the
+      // per-source DB lock held by the child active at the time. Clear/audit
+      // both layers in one supported recovery command.
+      const { listSources } = await import('../core/sources-ops.ts');
+      for (const source of await listSources(engine)) {
+        const exit = await runBreakLock(engine, syncLockId(source.id), source.id, {
+          force: forceBreakLock,
+          json: jsonOut,
+          maxAgeSeconds,
+        });
+        if (exit > worstExit) worstExit = exit;
+      }
+      process.exit(worstExit);
+    }
     if (syncAll) {
       const { listSources } = await import('../core/sources-ops.ts');
       const sources = await listSources(engine);
@@ -4408,28 +4775,14 @@ See also:
   // and can pass --source to override if needed.
   const explicitSource = args.find((a, i) => args[i - 1] === '--source') || null;
   const { resolveSourceWithTier, formatSoleNonDefaultNudge } = await import('../core/source-resolver.ts');
-  const resolved = await resolveSourceWithTier(engine, explicitSource);
-  const sourceId: string = resolved.source_id;
-  if (resolved.tier === 'sole_non_default') {
+  // Aggregate sync does not have a single source identity. In particular, a
+  // fresh shared restore must discover sources from Git even if the caller's
+  // ambient GBRAIN_SOURCE names one that is not registered in the new DB yet.
+  const resolved = syncAll ? null : await resolveSourceWithTier(engine, explicitSource);
+  const sourceId: string = resolved?.source_id ?? 'default';
+  if (resolved?.tier === 'sole_non_default') {
     const nudge = formatSoleNonDefaultNudge(sourceId);
     if (nudge) process.stderr.write(nudge + '\n');
-  }
-
-  // --skip-failed: acknowledge pre-existing unacked failures BEFORE the sync
-  // runs, not only ones the current run produces. Without this, the common
-  // recovery flow — fix the YAML, re-run sync, then run --skip-failed to clear
-  // the log — fails to clear anything (no NEW failures → the inner ack path in
-  // performSync is never reached, and "Already up to date." leaves the log).
-  //
-  // v0.42.42.0 (#2139, D13C): scoped PER SOURCE. `--all` clears every source's
-  // open failures; single-source clears only its own (don't ack source B's
-  // failures when syncing source A). Safe under parallel — the ledger
-  // serializes writes via `withLedgerLock` and keys rows by `source_id`
-  // (#1939), which is why the old D15 "no --skip-failed under parallel"
-  // refusal is lifted below.
-  if (skipFailed) {
-    const acked = syncAll ? acknowledgeFailures() : acknowledgeFailures(sourceId);
-    if (acked.count > 0) console.log(`Acknowledged ${acked.count} pre-existing failure(s).`);
   }
 
   // v0.19.0 — `sync --all` iterates all registered sources with a
@@ -4442,16 +4795,96 @@ See also:
   // source (no checkout) has nothing for `sync` to pull. Sources with
   // syncEnabled=false in config.jsonb are skipped too.
   if (syncAll) {
+    let sharedSetupStage: SharedBrainRepoSetupStage = 'shared_brain_repo_pull';
+    let sharedFanoutStarted = false;
+    const runAll = async (): Promise<void> => {
+      let sharedProjectionTarget: { commit: string; detached: boolean } | undefined;
+      if (sharedBrainRepoPath) {
+        sharedSetupStage = 'shared_brain_repo_pull';
+        pullSharedBrainRepoSnapshot(sharedBrainRepoPath, { noPull, dryRun });
+        sharedSetupStage = 'shared_brain_repo_layout';
+        // Pull first, then validate the snapshot that will actually be
+        // discovered and synced. This remains read-only and precedes every DB
+        // cleanup, source registration, failure acknowledgement, and marker.
+        assertClientBrainRepoCheckout(sharedBrainRepoPath);
+        sharedProjectionTarget = {
+          commit: git(sharedBrainRepoPath, ['rev-parse', 'HEAD']),
+          detached: isDetachedHead(sharedBrainRepoPath),
+        };
+      }
+
+      // Acknowledge only after the shared snapshot is known-good. Pull or
+      // layout failures therefore cannot mutate the failure ledger.
+      if (skipFailed && !dryRun) {
+        const acked = acknowledgeFailures();
+        if (acked.count > 0) console.log(`Acknowledged ${acked.count} pre-existing failure(s).`);
+      }
+
     // v0.41.31: SELECT carries last_commit + chunker_version so the inline
     // cost preview's "unchanged source → 0" short-circuit can mirror sync's
     // own "do work?" gate (sync.ts:1057+1075) + doctor's sync_freshness.
     // Both columns predate v0.41 (writeSyncAnchor / writeChunkerVersion); no
     // schema migration needed.
-    const sources = await engine.executeRaw<{ id: string; name: string; local_path: string | null; config: Record<string, unknown>; last_commit: string | null; chunker_version: string | null }>(
-      `SELECT id, name, local_path, config, last_commit, chunker_version FROM sources WHERE local_path IS NOT NULL`,
-    );
+    type SyncAllSource = {
+      id: string;
+      name: string;
+      local_path: string | null;
+      config: Record<string, unknown>;
+      last_commit: string | null;
+      chunker_version: string | null;
+      archived?: boolean;
+      projection_source_id?: string;
+      projection_git_target?: { commit: string; detached: boolean };
+    };
+    let sources: SyncAllSource[];
+    let pendingSharedSourceIds: string[] = [];
+    let pendingSharedMissingIds: string[] = [];
+    if (sharedBrainRepoPath) {
+      // The pulled checkout plus already-known DB identities form the recovery
+      // manifest. The union matters when a source's final page was deleted:
+      // Git cannot retain an empty directory until the managed marker is
+      // committed, but the current DB still knows which source must process
+      // that deletion.
+      const discoveredIds = discoverProjectedSourceIds(sharedBrainRepoPath);
+      let allRows = await engine.executeRaw<SyncAllSource>(
+        `SELECT id, name, local_path, config, last_commit, chunker_version, archived FROM sources`,
+      );
+      const existingIds = new Set(allRows.map(row => row.id));
+      const archivedIds = new Set(
+        allRows.filter(row => row.archived === true).map(row => row.id),
+      );
+      const projectedIds = discoveredIds.filter(id => !archivedIds.has(id));
+      const rows = allRows.filter(row => row.archived !== true);
+      const rowsById = new Map(rows.map(row => [row.id, row]));
+      const sourceIds = unique([...projectedIds, ...rows.map(row => row.id)])
+        .sort((a, b) => a === 'default' ? -1 : b === 'default' ? 1 : a.localeCompare(b));
+      pendingSharedSourceIds = sourceIds;
+      pendingSharedMissingIds = projectedIds.filter(id => !existingIds.has(id));
+      sources = sourceIds.map((id) => {
+        const row = rowsById.get(id) ?? {
+          id,
+          name: id,
+          local_path: null,
+          config: {},
+          last_commit: null,
+          chunker_version: null,
+        };
+        const projectionRoot = resolveSourceProjectionRoot(sharedBrainRepoPath, id);
+        return {
+          ...row,
+          local_path: projectionRoot,
+          projection_source_id: id,
+          projection_git_target: sharedProjectionTarget,
+        };
+      });
+    } else {
+      sources = await engine.executeRaw<SyncAllSource>(
+        `SELECT id, name, local_path, config, last_commit, chunker_version
+           FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+      );
+    }
     if (!sources || sources.length === 0) {
-      console.log('No sources with local_path configured. Use `gbrain sources add <id> --path <path>` first.');
+      console.log('No syncable sources found. Configure local_path or GBRAIN_BRAIN_REPO_PATH first.');
       return;
     }
 
@@ -4469,12 +4902,36 @@ See also:
     // entirely when --no-embed is set.
     let autoDeferEmbeds = false;
     if (!noEmbed) {
+      if (sharedBrainRepoPath) sharedSetupStage = 'shared_brain_repo_cost_gate';
       const mode = willEmbedSynchronously({ v2Enabled, serialFlag, noEmbed });
       const gate = await runInlineCostGate(engine, {
         sources, mode, dryRun, jsonOut, yesFlag, full, label: 'sync --all',
       });
       if (gate.action === 'stop') return;
       autoDeferEmbeds = gate.autoDeferEmbeds;
+    }
+
+    // Admission has now succeeded. Only here may a shared restore register
+    // newly-discovered identities or materialize/commit projection markers;
+    // answering "no" to the cost gate leaves DB and Git content untouched.
+    if (sharedBrainRepoPath && !dryRun) {
+      sharedSetupStage = 'shared_brain_repo_admission';
+      // Projection directories can make a hard-deleted source reappear on the
+      // next fresh discovery. Persist archived rows as non-expiring tombstones
+      // when adopting shared mode, including archives created before this
+      // seam existed. This path-free DB metadata also protects maintenance
+      // workers that do not inherit the client-local checkout environment.
+      await engine.executeRaw(
+        `UPDATE sources
+            SET archive_expires_at = NULL
+          WHERE archived = TRUE
+            AND archive_expires_at IS NOT NULL`,
+      );
+      if (pendingSharedMissingIds.length > 0) {
+        const { addSource } = await import('../core/sources-ops.ts');
+        for (const id of pendingSharedMissingIds) await addSource(engine, { id });
+      }
+      ensureSharedProjectionMarkers(sharedBrainRepoPath, pendingSharedSourceIds);
     }
 
     // v0.40.5.0 Federated Sync v2 (master) + v0.40.6.0 layering (this branch):
@@ -4565,11 +5022,12 @@ See also:
       timer?.unref?.();
       const repoOpts: SyncOpts = {
         repoPath: src.local_path!,
-        dryRun, full, noPull,
+        dryRun, full, noPull: sharedBrainRepoPath ? true : noPull,
         noEmbed: effectiveNoEmbed,
         noExtract,
         skipFailed, retryFailed, noSchemaPack,
         sourceId: src.id,
+        brainRepoProjection: sharedBrainRepoPath !== null,
         strategy: cfg.strategy,
         concurrency,
         signal: composeAbortSignals(allInterrupt.signal, controller?.signal),
@@ -4631,8 +5089,13 @@ See also:
       return result;
     };
 
-    const parallelEligible =
-      v2Enabled && !serialFlag && engine.kind !== 'pglite' && activeSources.length > 1;
+    const parallelEligible = canParallelizeSyncAll({
+      v2Enabled,
+      serial: serialFlag,
+      engineKind: engine.kind,
+      sourceCount: activeSources.length,
+      sharedCheckout: sharedBrainRepoPath !== null,
+    });
 
     // v0.42.42.0 (#2139, D13C): the v0.40.6.0 (D15) refusal of --skip-failed /
     // --retry-failed under parallel sync is LIFTED. It existed because the
@@ -4650,6 +5113,7 @@ See also:
       : 1;
 
     process.on('SIGINT', onAllSigint);
+    if (sharedBrainRepoPath) sharedFanoutStarted = true;
     try {
     if (parallelEligible) {
       const { pMapAllSettled } = await import('../core/parallel.ts');
@@ -4773,8 +5237,36 @@ See also:
     const pullFailedCount = perSourceResults.filter(
       (r) => r.status === 'ok' && r.result?.status === 'partial' && r.result.reason === 'pull_failed',
     ).length;
-    if (errCount > 0 || pullFailedCount > 0) process.exit(1);
-    return;
+      if (errCount > 0 || pullFailedCount > 0) {
+        if (sharedBrainRepoPath) {
+          const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+          setCliExitVerdict(1);
+        } else {
+          process.exit(1);
+        }
+      }
+    };
+
+    if (!sharedBrainRepoPath) return runAll();
+    try {
+      return await withSharedBrainRepoSyncLock(engine, runAll);
+    } catch (error) {
+      if (jsonOut && !sharedFanoutStarted) {
+        await emitSharedBrainRepoSetupError(
+          error instanceof SyncLockBusyError
+            ? 'shared_brain_repo_lock'
+            : sharedSetupStage,
+          error,
+        );
+        return;
+      }
+      throw error;
+    }
+  }
+
+  if (skipFailed && !dryRun) {
+    const acked = acknowledgeFailures(sourceId);
+    if (acked.count > 0) console.log(`Acknowledged ${acked.count} pre-existing failure(s).`);
   }
 
   // v0.41.13.0 (T6) — single-source --timeout: same per-source AbortController
@@ -4792,8 +5284,18 @@ See also:
   // lock released by its own finally) instead of a hard cut.
   const singleSourceInterrupt = new AbortController();
   const onSingleSourceSigint = () => { try { singleSourceInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
+  const singleSourceRepoPath = sharedBrainRepoPath
+    ? resolveSourceProjectionRoot(sharedBrainRepoPath, sourceId)
+    : repoPath;
+  if (sharedBrainRepoPath && !dryRun) {
+    ensureSourceProjectionMarker(sharedBrainRepoPath, sourceId);
+  }
   const opts: SyncOpts = {
-    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, sourceId,
+    repoPath: singleSourceRepoPath,
+    dryRun, full,
+    noPull: sharedBrainRepoPath ? true : noPull,
+    noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, sourceId,
+    brainRepoProjection: sharedBrainRepoPath !== null,
     strategy: strategyArg, concurrency,
     srcSubpath,
     exclude: excludePatterns.length > 0 ? excludePatterns : undefined,
@@ -4821,13 +5323,14 @@ See also:
       }
       const gateSources = [{
         local_path:
-          repoPath ??
+          singleSourceRepoPath ??
           clientPath ??
           gateRows[0].local_path ??
           null,
         config: gateRows[0].config ?? {},
         last_commit: gateRows[0].last_commit,
         chunker_version: gateRows[0].chunker_version,
+        ...(sharedBrainRepoPath ? { projection_source_id: sourceId } : {}),
       }];
       const gate = await runInlineCostGate(engine, {
         sources: gateSources, mode: 'inline', dryRun: false, jsonOut, yesFlag, full, label: 'sync',
@@ -5000,6 +5503,28 @@ export function resolveParallelism(input: {
     ? Math.min(input.workers, DEFAULT_PARALLEL_SOURCES)
     : DEFAULT_PARALLEL_SOURCES;
   return Math.max(1, Math.min(input.sourceCount, ceiling));
+}
+
+/**
+ * Whether `sync --all` may fan logical sources out concurrently.
+ *
+ * Per-source DB locks make separate source checkouts safe to parallelize, but
+ * a shared brain repo is one physical Git working tree. Concurrent pull/diff
+ * operations against that checkout are unsafe even when the sources write
+ * disjoint projection directories, so shared projection is always serial.
+ */
+export function canParallelizeSyncAll(input: {
+  v2Enabled: boolean;
+  serial: boolean;
+  engineKind: 'pglite' | 'postgres';
+  sourceCount: number;
+  sharedCheckout: boolean;
+}): boolean {
+  return input.v2Enabled &&
+    !input.serial &&
+    input.engineKind !== 'pglite' &&
+    input.sourceCount > 1 &&
+    !input.sharedCheckout;
 }
 
 /**

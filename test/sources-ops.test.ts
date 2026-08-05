@@ -134,7 +134,13 @@ beforeEach(async () => {
 // it leak.
 async function withEnv2<T>(fn: () => Promise<T>): Promise<T> {
   return withEnv(
-    { GBRAIN_HOME, PATH: fakePath() },
+    {
+      GBRAIN_HOME,
+      PATH: fakePath(),
+      GBRAIN_BRAIN_REPO_PATH: undefined,
+      GBRAIN_SOURCE: undefined,
+      GBRAIN_SOURCE_PATH: undefined,
+    },
     fn,
   );
 }
@@ -1640,6 +1646,44 @@ describe('listSources', () => {
 // ---------------------------------------------------------------------------
 
 describe('removeSource — clone-cleanup', () => {
+  test('fails closed under a shared brain-repo binding so projection state cannot resurrect the source', async () => {
+    await withEnv2(async () => {
+      await addSource(engine, {
+        id: 'projected',
+        localPath: '/tmp/projected-source-fixture',
+        force: true,
+      });
+
+      await withEnv(
+        { GBRAIN_BRAIN_REPO_PATH: join(GBRAIN_HOME, 'brain-repo') },
+        async () => {
+          try {
+            await removeSource(engine, {
+              id: 'projected',
+              confirmDestructive: true,
+            });
+            throw new Error('expected throw');
+          } catch (e) {
+            expect(e).toBeInstanceOf(SourceOpError);
+            expect((e as SourceOpError).code).toBe('unmanaged_path');
+            expect((e as SourceOpError).message).toContain(
+              'gbrain sources archive projected',
+            );
+            expect((e as SourceOpError).message).toContain(
+              'commit and push',
+            );
+          }
+        },
+      );
+
+      const rows = await engine.executeRaw<{ id: string }>(
+        `SELECT id FROM sources WHERE id = $1`,
+        ['projected'],
+      );
+      expect(rows).toEqual([{ id: 'projected' }]);
+    });
+  });
+
   test('counts soft-deleted pages for destructive removal while list/status show active pages', async () => {
     await withEnv2(async () => {
       await addSource(engine, { id: 'soft-only', localPath: '/tmp/soft-only-fixture' });

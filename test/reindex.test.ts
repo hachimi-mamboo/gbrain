@@ -7,9 +7,14 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runReindex } from '../src/commands/reindex.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 
@@ -26,6 +31,7 @@ afterAll(async () => {
 beforeEach(async () => {
   await (engine as any).db.exec('DELETE FROM content_chunks');
   await (engine as any).db.exec('DELETE FROM pages');
+  await (engine as any).db.exec("DELETE FROM sources WHERE id <> 'default'");
 });
 
 async function seedLegacyPage(slug: string, body: string, sourcePath: string | null = null) {
@@ -146,5 +152,49 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
     const result = await runReindex(engine, ['--markdown', '--no-embed']);
     expect(result.pending).toBe(1);
     expect(result.reindexed).toBe(1);
+  });
+
+  test('shared brain-repo reindex reads the source-qualified same-slug file', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-reindex-shared-'));
+    execFileSync('git', ['init', '-q', repo]);
+    mkdirSync(join(repo, 'same'), { recursive: true });
+    mkdirSync(join(repo, '.sources', 'project-p', 'same'), { recursive: true });
+    writeFileSync(
+      join(repo, 'same', 'topic.md'),
+      '---\ntitle: Default topic\n---\n\ndefault-file-body\n',
+    );
+    writeFileSync(
+      join(repo, '.sources', 'project-p', 'same', 'topic.md'),
+      '---\ntitle: Project topic\n---\n\nproject-file-body\n',
+    );
+    writeFileSync(
+      join(repo, '.sources', 'project-p', '.gbrain-source'),
+      'project-p\n',
+    );
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('project-p', 'Project P')`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages
+        (slug, type, title, compiled_truth, page_kind, chunker_version, source_path, source_id)
+       VALUES
+        ('same/topic', 'note', 'Default old', 'default-db-old', 'markdown', 1, 'same/topic.md', 'default'),
+        ('same/topic', 'note', 'Project old', 'project-db-old', 'markdown', 1, 'same/topic.md', 'project-p')`,
+    );
+
+    try {
+      const result = await withEnv({
+        GBRAIN_BRAIN_REPO_PATH: repo,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      }, () => runReindex(engine, ['--markdown', '--no-embed']));
+      expect(result.failed).toBe(0);
+      expect((await engine.getPage('same/topic', { sourceId: 'default' }))?.compiled_truth)
+        .toContain('default-file-body');
+      expect((await engine.getPage('same/topic', { sourceId: 'project-p' }))?.compiled_truth)
+        .toContain('project-file-body');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

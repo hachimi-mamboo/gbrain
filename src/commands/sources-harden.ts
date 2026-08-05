@@ -22,12 +22,22 @@ import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import {
+  assertClientBrainRepoCheckout,
+  assertClientBrainRepoRoot,
   assertClientSourceCheckout,
+  resolveClientBrainRepoPath,
   resolveClientSourcePath,
 } from '../core/source-resolver.ts';
-import { prepareClientSourceBinding } from '../core/sources-ops.ts';
+import {
+  prepareClientBrainRepoBinding,
+  prepareClientSourceBinding,
+} from '../core/sources-ops.ts';
+import { ensureSourceProjectionMarker } from '../core/brain-repo-layout.ts';
 
 interface SourceRow { id: string; local_path: string | null; config: unknown; }
+
+/** One checkout means one durability hook/helper/cron identity on this host. */
+const SHARED_BRAIN_REPO_DURABILITY_ID = 'brain-repo';
 
 function flagVal(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -65,6 +75,8 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
   const verify = !args.includes('--no-verify');
   const branch = flagVal(args, '--branch');
   const patFile = flagVal(args, '--pat-file');
+  const sharedBrainRepoPath = resolveClientBrainRepoPath();
+  if (sharedBrainRepoPath) assertClientBrainRepoRoot(sharedBrainRepoPath);
 
   if (all && process.env.GBRAIN_SOURCE_PATH) {
     throw new Error(
@@ -76,14 +88,20 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
   const pat = acceptPat({ patFile });
   for (const w of pat?.warnings ?? []) console.error(`[gbrain] ${w}`);
 
-  const rows = await loadSourceRows(engine, id, all);
+  const rows = sharedBrainRepoPath && all
+    ? await engine.executeRaw<SourceRow>(
+      `SELECT id, local_path, config FROM sources WHERE archived IS NOT TRUE ORDER BY id`,
+    )
+    : await loadSourceRows(engine, id, all);
   if (rows.length === 0) {
     console.error(all ? 'No sources with a local_path to harden.' : `Source "${id}" not found.`);
     process.exit(1);
   }
 
   // --all guard (codex): one PAT must not silently span multiple hosts/accounts.
-  if (all && pat) {
+  // A shared brain repo is one checkout with one origin; logical sources'
+  // remote_url values describe those sources, not the projection repo's remote.
+  if (all && pat && !sharedBrainRepoPath) {
     const hosts = new Set(rows.map(r => configHost(r.config)).filter(Boolean));
     if (hosts.size > 1) {
       console.error(`[gbrain] Refusing --all with one PAT across multiple hosts (${[...hosts].join(', ')}). Harden each source with its own --pat-file.`);
@@ -92,23 +110,55 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
   }
 
   const reports: DurabilityReport[] = [];
-  for (const row of rows) {
-    const clientPath = all ? null : resolveClientSourcePath(row.id);
-    if (clientPath) {
-      await prepareClientSourceBinding(engine, row.id);
-    }
-    const repoPath = clientPath ?? row.local_path;
-    if (!repoPath || !existsSync(join(repoPath, '.git'))) {
-      console.error(`[${row.id}] skipped — no local git repo at ${repoPath ?? '(none)'}`);
-      continue;
-    }
+  if (sharedBrainRepoPath) {
+    const bindingRows = await engine.executeRaw<{ id: string }>(
+      `SELECT id FROM sources WHERE archived IS NOT TRUE ORDER BY id`,
+    );
+    const managedPaths: string[] = [];
     const report = await hardenBrainRepo({
-      repoPath, sourceId: row.id, branch,
-      pat: pat?.token, installCron, verify, dryRun,
+      repoPath: sharedBrainRepoPath,
+      sourceId: SHARED_BRAIN_REPO_DURABILITY_ID,
+      branch,
+      pat: pat?.token,
+      installCron,
+      verify,
+      dryRun,
+      managedPaths,
+      afterPullBeforeMutation: async () => {
+        // The pull inside hardenBrainRepo gets the first chance to repair a
+        // stale local projection. Validate that updated snapshot before any
+        // host scaffolding, DB path retirement, or marker creation.
+        assertClientBrainRepoCheckout(sharedBrainRepoPath);
+        if (dryRun) return;
+        for (const source of bindingRows) {
+          await prepareClientBrainRepoBinding(engine, source.id);
+          const marker = ensureSourceProjectionMarker(sharedBrainRepoPath, source.id);
+          if (marker) managedPaths.push(marker);
+        }
+      },
       logger: json ? undefined : (l) => console.error(`  ${l}`),
     });
     reports.push(report);
     if (!json) renderReport(report);
+  } else {
+    for (const row of rows) {
+      const clientPath = all ? null : resolveClientSourcePath(row.id);
+      if (clientPath) {
+        await prepareClientSourceBinding(engine, row.id);
+      }
+      const repoPath = clientPath ?? row.local_path;
+      if (!repoPath || !existsSync(join(repoPath, '.git'))) {
+        console.error(`[${row.id}] skipped — no local git repo at ${repoPath ?? '(none)'}`);
+        continue;
+      }
+      const report = await hardenBrainRepo({
+        repoPath, sourceId: row.id, branch,
+        pat: pat?.token, installCron, verify, dryRun,
+        logger: json ? undefined : (l) => console.error(`  ${l}`),
+      });
+      reports.push(report);
+      if (!json) renderReport(report);
+    }
   }
 
   if (json) console.log(JSON.stringify({ reports }, null, 2));
@@ -139,6 +189,8 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
   const branchFlag = flagVal(args, '--branch');
 
   let repoPath: string;
+  let sharedBindingIds: string[] = [];
+  let sharedBrainRepoPath: string | null = null;
   if (path) {
     repoPath = path;
   } else {
@@ -152,11 +204,18 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
       console.error(`Source "${id}" not found.`);
       process.exit(1);
     }
-    const clientPath = resolveClientSourcePath(id);
-    if (clientPath) {
+    sharedBrainRepoPath = resolveClientBrainRepoPath();
+    const clientPath = sharedBrainRepoPath ? null : resolveClientSourcePath(id);
+    if (sharedBrainRepoPath) {
+      assertClientBrainRepoRoot(sharedBrainRepoPath);
+      const bindingRows = await engine.executeRaw<{ id: string }>(
+        `SELECT id FROM sources WHERE archived IS NOT TRUE ORDER BY id`,
+      );
+      sharedBindingIds = bindingRows.map(source => source.id);
+    } else if (clientPath) {
       await prepareClientSourceBinding(engine, id);
     }
-    const resolvedPath = clientPath ?? rows[0].local_path;
+    const resolvedPath = sharedBrainRepoPath ?? clientPath ?? rows[0].local_path;
     if (!resolvedPath) {
       console.error(`Source "${id}" not found or has no local_path.`);
       process.exit(1);
@@ -170,6 +229,12 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
   }
   const branch = branchFlag || detectDefaultBranch(repoPath);
   const outcome = divergenceSafePull(repoPath, branch);
+  if (outcome.status !== 'conflict_aborted' && sharedBrainRepoPath) {
+    assertClientBrainRepoCheckout(sharedBrainRepoPath);
+    for (const sourceId of sharedBindingIds) {
+      await prepareClientBrainRepoBinding(engine!, sourceId);
+    }
+  }
   switch (outcome.status) {
     case 'up_to_date': console.log(`up to date (${branch})`); break;
     case 'advanced': console.log(`advanced ${outcome.from.slice(0, 7)}→${outcome.to.slice(0, 7)} (${branch})`); break;
@@ -193,12 +258,15 @@ export async function runUnharden(engine: BrainEngine, args: string[]): Promise<
     console.error(`Source "${id}" not found.`);
     process.exit(1);
   }
-  const clientPath = resolveClientSourcePath(rows[0].id);
+  const sharedBrainRepoPath = resolveClientBrainRepoPath();
+  const clientPath = sharedBrainRepoPath ? null : resolveClientSourcePath(rows[0].id);
   if (clientPath) assertClientSourceCheckout(rows[0].id, clientPath, rows[0].config);
-  const repoPath = clientPath ?? rows[0].local_path ?? '';
+  const repoPath = sharedBrainRepoPath ?? clientPath ?? rows[0].local_path ?? '';
   const steps = await unhardenBrainRepo({
     repoPath,
-    sourceId: rows[0].id,
+    sourceId: sharedBrainRepoPath
+      ? SHARED_BRAIN_REPO_DURABILITY_ID
+      : rows[0].id,
     logger: (l) => console.error(l),
   });
   for (const s of steps) {

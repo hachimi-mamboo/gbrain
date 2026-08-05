@@ -42,6 +42,7 @@ import {
 } from '../core/destructive-guard.ts';
 import {
   addSource as opsAddSource,
+  assertSourceHardRemoveAllowed,
   prepareClientSourceBinding,
   recloneIfMissing,
   SourceOpError,
@@ -379,6 +380,11 @@ async function runRemove(engine: BrainEngine, args: string[]): Promise<void> {
     process.exit(3);
   }
 
+  // A DB-only delete would be reversed by the next shared projection sync.
+  // Keep the CLI and the sources_remove operation on the same fail-closed
+  // ownership rule; archive remains available while this binding is active.
+  assertSourceHardRemoveAllowed(id);
+
   const src = await fetchSource(engine, id);
   if (!src) {
     console.error(`Source "${id}" not found.`);
@@ -582,6 +588,10 @@ async function runPurge(engine: BrainEngine, args: string[]): Promise<void> {
   const id = args[0];
   const confirmDestructive = args.includes('--confirm-destructive');
 
+  // Both the targeted and expired-row forms permanently delete source rows.
+  // Keep them under the same projection-ownership gate as `sources remove`.
+  assertSourceHardRemoveAllowed(id);
+
   if (id) {
     // Purge a specific source (must be archived)
     const impact = await assessDestructiveImpact(engine, id);
@@ -630,8 +640,10 @@ async function runListArchived(engine: BrainEngine, args: string[]): Promise<voi
   console.log('ARCHIVED SOURCES (soft-deleted)');
   console.log('───────────────────────────────');
   for (const a of archived) {
-    const hours = Math.max(0, Math.round((a.expiresAt.getTime() - Date.now()) / (1000 * 60 * 60)));
-    console.log(`  ${a.id.padEnd(20)}  ${String(a.pageCount).padStart(6)} pages  expires in ${hours}h  (restore: gbrain sources restore ${a.id})`);
+    const expiry = a.expiresAt
+      ? `expires in ${Math.max(0, Math.round((a.expiresAt.getTime() - Date.now()) / (1000 * 60 * 60)))}h`
+      : 'no automatic expiry';
+    console.log(`  ${a.id.padEnd(20)}  ${String(a.pageCount).padStart(6)} pages  ${expiry}  (restore: gbrain sources restore ${a.id})`);
   }
 }
 

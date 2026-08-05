@@ -36,8 +36,9 @@ CREATE TABLE IF NOT EXISTS sources (
   -- actually trigger re-chunking on upgrade.
   chunker_version TEXT,
   -- v0.26.5: soft-delete + recovery window. `archive` flips archived=true and
-  -- sets archive_expires_at = now() + 72h. The autopilot purge phase
-  -- hard-deletes rows where archive_expires_at <= now(). Promoted from a
+  -- normally sets archive_expires_at = now() + 72h. Shared Git projection
+  -- archives use NULL to disable automatic purge. The autopilot purge phase
+  -- hard-deletes rows where a non-NULL archive_expires_at <= now(). Promoted from a
   -- JSONB key to real columns to avoid reserved-key footguns and to make the
   -- search visibility filter (`NOT s.archived`) a column lookup.
   archived            BOOLEAN NOT NULL DEFAULT false,

@@ -14,8 +14,10 @@
  */
 
 import { readFileSync, lstatSync, type Stats } from 'fs';
+import { execFileSync } from 'node:child_process';
 import { join, dirname, isAbsolute, resolve } from 'path';
 import type { BrainEngine } from './engine.ts';
+import { discoverProjectedSourceIds } from './brain-repo-layout.ts';
 import { SOURCE_ID_RE, isValidSourceId } from './source-id.ts';
 import { isTrustedDotfile, realpathOrResolve } from './path-confine.ts';
 import { validateRepoRawRemoteState } from './git-remote.ts';
@@ -281,6 +283,83 @@ export function resolveClientSourcePath(
     throw new Error('GBRAIN_SOURCE_PATH must be an absolute path.');
   }
   return resolve(localPath);
+}
+
+/**
+ * Resolve one process-local checkout that projects every source in a brain.
+ *
+ * Unlike `GBRAIN_SOURCE_PATH`, this binding is intentionally not paired with
+ * `GBRAIN_SOURCE`: callers must preserve source identity in the checkout's
+ * physical layout (`default` at the root, other sources under
+ * `.sources/<source_id>/`). The path is client-local and must never be stored
+ * in the shared database.
+ *
+ * This is a separate resolver rather than an extension of
+ * `resolveClientSourcePath` so the established single-source binding keeps its
+ * exact matching semantics and future sync/restore callers have one explicit
+ * shared-repo seam to adopt.
+ */
+export function resolveClientBrainRepoPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const localPath = env.GBRAIN_BRAIN_REPO_PATH;
+  if (!localPath) return null;
+  if (env.GBRAIN_SOURCE_PATH) {
+    throw new Error(
+      'GBRAIN_BRAIN_REPO_PATH cannot be combined with GBRAIN_SOURCE_PATH. ' +
+      'Choose either the shared multi-source checkout or one source checkout.',
+    );
+  }
+  if (!isAbsolute(localPath)) {
+    throw new Error('GBRAIN_BRAIN_REPO_PATH must be an absolute path.');
+  }
+  return resolve(localPath);
+}
+
+/**
+ * Validate only the physical shared-checkout identity.
+ *
+ * Keep this separate from projection-layout validation so pull-capable callers
+ * can establish the exact Git root, update it, and only then validate the
+ * pulled markers. A stale local marker must not prevent its upstream fix from
+ * being fetched.
+ */
+export function assertClientBrainRepoRoot(localPath: string): void {
+  const resolvedPath = realpathOrResolve(localPath);
+  let stats: Stats;
+  try {
+    stats = lstatSync(resolvedPath);
+  } catch {
+    throw new Error(`Shared brain-repo checkout does not exist: ${localPath}`);
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(`Shared brain-repo checkout is not a directory: ${localPath}`);
+  }
+  let gitRoot: string;
+  try {
+    gitRoot = execFileSync('git', ['-C', resolvedPath, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+      env: process.env,
+    }).trim();
+  } catch {
+    throw new Error(`Shared brain-repo checkout is not inside a Git repository: ${localPath}`);
+  }
+  if (realpathOrResolve(gitRoot) !== resolvedPath) {
+    throw new Error(
+      `GBRAIN_BRAIN_REPO_PATH must name the Git checkout root, not a subdirectory: ${localPath}`,
+    );
+  }
+}
+
+/** Validate the shared checkout and its current projection layout read-only. */
+export function assertClientBrainRepoCheckout(localPath: string): void {
+  assertClientBrainRepoRoot(localPath);
+  const resolvedPath = realpathOrResolve(localPath);
+  // The same public preflight protects every write, sync, pull, and harden
+  // entry. Existing markers are validated but no marker or DB row is created.
+  discoverProjectedSourceIds(resolvedPath);
 }
 
 /**

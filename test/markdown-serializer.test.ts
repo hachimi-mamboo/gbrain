@@ -176,20 +176,17 @@ describe('resolvePageFilePath — single source of truth for v0.32.8 filing layo
     expect(path).toBe(join('/brain', '.sources', 'gstack', 'wiki/people/alice.md'));
   });
 
-  test('source_id is the literal string "default" — anything else routes to .sources/', () => {
-    // The discriminator is exactly the string 'default'. Casing matters.
+  test('source_id is validated by the shared projection-layout owner', () => {
+    // brain-repo-layout.ts is now the sole physical-path owner. Keep validation
+    // here so every current and future writer fails before resolving an unsafe
+    // or unrestorable projection path.
     const lower = resolvePageFilePath('/brain', 's', 'default');
-    const upper = resolvePageFilePath('/brain', 's', 'Default');
     expect(lower).toBe(join('/brain', 's.md'));
-    expect(upper).toBe(join('/brain', '.sources', 'Default', 's.md'));
+    expect(() => resolvePageFilePath('/brain', 's', 'Default')).toThrow(/Invalid source_id/);
   });
 
-  test('empty string source_id is treated as non-default', () => {
-    // Regression: '' is not 'default' so it lands in .sources/<empty>/. This is
-    // a bug surface — `validateSourceId` is the caller's responsibility to
-    // reject. Pin the current behavior so a refactor doesn't quietly change it.
-    const path = resolvePageFilePath('/brain', 's', '');
-    expect(path).toBe(join('/brain', '.sources', '', 's.md'));
+  test('empty source_id is rejected before path resolution', () => {
+    expect(() => resolvePageFilePath('/brain', 's', '')).toThrow(/Invalid source_id/);
   });
 
   test('nested slug paths join cleanly without traversal artifacts', () => {
@@ -210,12 +207,7 @@ describe('resolvePageFilePath — single source of truth for v0.32.8 filing layo
     expect(rel).toBe(join('./relative/brain', 's.md'));
   });
 
-  test('source_id with spaces or special chars passes through (caller validates)', () => {
-    // Pin that the helper does NOT mutate source_id — validation is the
-    // caller's job per the helper's documented contract. If this ever
-    // changes (helper starts validating internally) a real implementation
-    // change is needed and this test surfaces it.
-    const path = resolvePageFilePath('/brain', 's', 'has spaces');
-    expect(path).toBe(join('/brain', '.sources', 'has spaces', 's.md'));
+  test('source_id with spaces or special chars is rejected before path resolution', () => {
+    expect(() => resolvePageFilePath('/brain', 's', 'has spaces')).toThrow(/Invalid source_id/);
   });
 });
