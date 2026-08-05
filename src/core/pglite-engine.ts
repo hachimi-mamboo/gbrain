@@ -1271,6 +1271,18 @@ export class PGLiteEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
     const sourceId = opts?.sourceId ?? 'default';
+    if (page.source_kind || page.source_uri || page.ingested_via) {
+      await assertClientBoundStructuredWrite(
+        this,
+        {
+          source_kind: page.source_kind,
+          source_uri: page.source_uri,
+          ingested_via: page.ingested_via,
+        },
+        'page provenance fields',
+        sourceId,
+      );
+    }
 
     // v0.18.0 Step 5+: source_id is now in the INSERT column list so multi-
     // source callers land on the intended (source_id, slug) row. Omitting it
@@ -5775,6 +5787,7 @@ export class PGLiteEngine implements BrainEngine {
       this,
       entry,
       'ingest log fields',
+      sourceId,
     );
     await this.db.query(
       `INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)

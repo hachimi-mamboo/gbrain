@@ -23,4 +23,6 @@ timeout = 60_000
 # were appending rows into the operator's real ~/.gbrain/sync-failures.jsonl,
 # which `gbrain doctor` reads and warns on. See
 # test/helpers/sync-failures-preload.ts.
-preload = ["./test/helpers/legacy-embedding-preload.ts", "./test/helpers/audit-dir-preload.ts", "./test/helpers/sync-failures-preload.ts"]
+# Client bindings are cleared first so no subsequently loaded preload or test
+# module can observe a developer's live checkout paths by accident.
+preload = ["./test/helpers/client-binding-preload.ts", "./test/helpers/legacy-embedding-preload.ts", "./test/helpers/audit-dir-preload.ts", "./test/helpers/sync-failures-preload.ts"]

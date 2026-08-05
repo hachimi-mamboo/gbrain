@@ -1989,7 +1989,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // "hung with no output" into actionable diagnostic data.
   serr(`[gbrain phase] sync.resolve_repo`);
   // Resolve repo path
-  const clientSourcePath = opts.sourceId
+  // An explicit operation root is authoritative for single-source sync.
+  // GBRAIN_SOURCE_PATH is only the fallback when the caller did not name one.
+  // Shared brain-repo projections keep their stricter conflict check below.
+  const clientSourcePath = !opts.repoPath && opts.sourceId
     ? resolveClientSourcePath(opts.sourceId)
     : null;
   const clientBrainRepoRoot = opts.brainRepoProjection
@@ -1999,12 +2002,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     ? resolveSourceProjectionRoot(clientBrainRepoRoot, opts.sourceId)
     : null;
   if (clientSourcePath) {
-    if (opts.repoPath && resolvePath(opts.repoPath) !== clientSourcePath) {
-      throw new Error(
-        `--repo ${opts.repoPath} conflicts with GBRAIN_SOURCE_PATH=${clientSourcePath} ` +
-        `for source "${opts.sourceId}".`,
-      );
-    }
     const { prepareClientSourceBinding } = await import('../core/sources-ops.ts');
     await prepareClientSourceBinding(engine, opts.sourceId!);
   }

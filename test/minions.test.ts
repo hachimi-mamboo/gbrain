@@ -46,6 +46,7 @@ describe('MinionQueue: CRUD', () => {
 
   test('explicit client binding recursively rejects path payloads while stable locators and generic sources stay compatible', async () => {
     await withEnv({
+      GBRAIN_BRAIN_REPO_PATH: undefined,
       GBRAIN_SOURCE: 'default',
       GBRAIN_SOURCE_PATH: '/clients/a/wiki',
     }, async () => {
@@ -165,8 +166,88 @@ describe('MinionQueue: CRUD', () => {
 });
 
 describe('MinionQueue: client binding structured write guard', () => {
+  test('shared brain-repo binding rejects a checkout path in queued work', async () => {
+    await withEnv({
+      GBRAIN_BRAIN_REPO_PATH: '/clients/a/team-brain',
+      GBRAIN_SOURCE: undefined,
+      GBRAIN_SOURCE_PATH: undefined,
+    }, async () => {
+      await expect(queue.add('sync', {
+        sourceId: 'project-p',
+        nested: [{ cwd: '/clients/a/team-brain/.sources/project-p' }],
+      })).rejects.toThrow('must not persist client-local paths in queued work');
+    });
+
+    expect(await queue.getJobs()).toEqual([]);
+  });
+
+  test('shared brain-repo binding guards late queue writes and sanitizes terminal errors', async () => {
+    const brainRepoPath = '/clients/a/team-brain';
+    await withEnv({
+      GBRAIN_BRAIN_REPO_PATH: brainRepoPath,
+      GBRAIN_SOURCE: undefined,
+      GBRAIN_SOURCE_PATH: undefined,
+    }, async () => {
+      const claimJob = async (name: string, token: string) => {
+        const added = await queue.add(name, {
+          sourceId: 'project-p',
+          commit: 'abc123',
+        });
+        expect((await queue.claim(token, 30_000, 'default', [name]))?.id)
+          .toBe(added.id);
+        return added;
+      };
+
+      const resultJob = await claimJob('shared-late-result', 'result-lock');
+      await expect(queue.completeJob(
+        resultJob.id,
+        'result-lock',
+        { output: [{ path: `${brainRepoPath}/.sources/project-p/result.md` }] },
+      )).rejects.toThrow('must not persist client-local paths in queued result');
+
+      const activeJob = await claimJob('shared-late-fields', 'fields-lock');
+      await expect(queue.updateProgress(
+        activeJob.id,
+        'fields-lock',
+        { cwd: `${brainRepoPath}/.sources/project-p` },
+      )).rejects.toThrow('must not persist client-local paths in queued progress');
+      await expect(queue.appendLog(
+        activeJob.id,
+        'fields-lock',
+        `reading ${brainRepoPath}/.sources/project-p`,
+      )).rejects.toThrow('must not persist client-local paths in queued worker log');
+      expect(await queue.failJob(
+        activeJob.id,
+        'fields-lock',
+        `failed in ${brainRepoPath}/.sources/project-p`,
+        'dead',
+      )).toMatchObject({
+        status: 'dead',
+        error_text: 'client-local source binding omitted path-bearing queued error',
+        stacktrace: [
+          'client-local source binding omitted path-bearing queued error',
+        ],
+      });
+
+      const inboxJob = await queue.add('shared-late-inbox', {
+        sourceId: 'project-p',
+        commit: 'abc123',
+      });
+      await expect(queue.sendMessage(
+        inboxJob.id,
+        { directive: [{ cwd: `${brainRepoPath}/.sources/project-p` }] },
+        'admin',
+      )).rejects.toThrow('must not persist client-local paths in queued inbox payload');
+      expect(await engine.executeRaw(
+        `SELECT id FROM minion_inbox WHERE job_id = $1`,
+        [inboxJob.id],
+      )).toEqual([]);
+    });
+  });
+
   test('completeJob rejects a late nested client path result before persistence', async () => {
     await withEnv({
+      GBRAIN_BRAIN_REPO_PATH: undefined,
       GBRAIN_SOURCE: 'default',
       GBRAIN_SOURCE_PATH: '/clients/a/wiki',
     }, async () => {
@@ -197,6 +278,7 @@ describe('MinionQueue: client binding structured write guard', () => {
 
   test('late structured writes reject paths while terminal error paths use a fixed safe substitute', async () => {
     await withEnv({
+      GBRAIN_BRAIN_REPO_PATH: undefined,
       GBRAIN_SOURCE: 'default',
       GBRAIN_SOURCE_PATH: '/clients/a/wiki',
     }, async () => {

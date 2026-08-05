@@ -36,8 +36,10 @@ import {
   resolveClientSourcePath,
 } from './source-resolver.ts';
 import {
+  BRAIN_REPO_SOURCES_DIR,
   ensureSourceProjectionMarker,
   resolveProjectedSourcePath,
+  resolveSourceProjectionRoot,
 } from './brain-repo-layout.ts';
 import {
   prepareClientBrainRepoBinding,
@@ -123,7 +125,11 @@ export async function writePageThrough(
     //      `local_path`, nesting this page there would pollute that sibling's
     //      git repo (the reported bug). Skip instead.
     let filePath: string;
-    let writeRoot: string;
+    // Git durability owns the checkout; path confinement owns one source's
+    // projection inside that checkout. They differ only in shared-repo mode.
+    let durabilityRoot: string;
+    let confinementRoot: string;
+    let forbiddenProjectionRoot: string | null = null;
     let projectionMarkerPath: string | null = null;
     const operationRoot = opts.operationRoot ? resolve(opts.operationRoot) : null;
     const boundClientPath = resolveClientSourcePath(sourceId);
@@ -154,21 +160,27 @@ export async function writePageThrough(
         return { written: false, skipped: 'repo_not_found' };
       }
       filePath = join(sourceLocalPath, `${slug}.md`);
-      writeRoot = sourceLocalPath;
+      durabilityRoot = sourceLocalPath;
+      confinementRoot = sourceLocalPath;
     } else if (sharedBrainRepoPath) {
       if (!existsSync(sharedBrainRepoPath) || !statSync(sharedBrainRepoPath).isDirectory()) {
         return { written: false, skipped: 'repo_not_found' };
       }
       filePath = resolveProjectedSourcePath(sharedBrainRepoPath, `${slug}.md`, sourceId);
       projectionMarkerPath = ensureSourceProjectionMarker(sharedBrainRepoPath, sourceId);
-      writeRoot = sharedBrainRepoPath;
+      durabilityRoot = sharedBrainRepoPath;
+      confinementRoot = resolveSourceProjectionRoot(sharedBrainRepoPath, sourceId);
+      if (sourceId === 'default') {
+        forbiddenProjectionRoot = join(sharedBrainRepoPath, BRAIN_REPO_SOURCES_DIR);
+      }
     } else if (srcRows[0]?.local_path) {
       const registeredSourcePath = srcRows[0].local_path;
       if (!existsSync(registeredSourcePath) || !statSync(registeredSourcePath).isDirectory()) {
         return { written: false, skipped: 'repo_not_found' };
       }
       filePath = join(registeredSourcePath, `${slug}.md`);
-      writeRoot = registeredSourcePath;
+      durabilityRoot = registeredSourcePath;
+      confinementRoot = registeredSourcePath;
     } else {
       const repoPath = await engine.getConfig('sync.repo_path');
       if (!repoPath) {
@@ -187,7 +199,8 @@ export async function writePageThrough(
         return { written: false, skipped: 'source_repo_belongs_to_other_source' };
       }
       filePath = resolvePageFilePath(repoPath, slug, sourceId);
-      writeRoot = repoPath;
+      durabilityRoot = repoPath;
+      confinementRoot = repoPath;
     }
 
     // Defense-in-depth (#1647-slug / codex #6): confirm the computed file path
@@ -195,7 +208,13 @@ export async function writePageThrough(
     // already rejects `..`/backslash/control/%2e in the slug at write time, so
     // this guards a pre-existing hostile row or a symlinked intermediate dir
     // under the source tree from escaping to an arbitrary filesystem location.
-    if (!isWriteTargetContained(filePath, writeRoot)) {
+    // The shared default source owns the repo root except for reserved
+    // `.sources/`; reject a root symlink that resolves into that sibling area.
+    if (
+      !isWriteTargetContained(filePath, confinementRoot) ||
+      (forbiddenProjectionRoot !== null &&
+        isWriteTargetContained(filePath, forbiddenProjectionRoot))
+    ) {
       return { written: false, skipped: 'path_escapes_source_root' };
     }
 
@@ -264,9 +283,9 @@ export async function writePageThrough(
     // failure never fails the write (the DB row + file are the durable sinks).
     let committed = false;
     try {
-      if (isDurabilityHardened(writeRoot)) {
+      if (isDurabilityHardened(durabilityRoot)) {
         committed = commitWriteThroughFile(
-          writeRoot,
+          durabilityRoot,
           filePath,
           slug,
           projectionMarkerPath ? [projectionMarkerPath] : [],
