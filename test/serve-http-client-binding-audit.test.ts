@@ -13,10 +13,34 @@ describe('serve --http client-local audit privacy', () => {
     GBRAIN_SOURCE_PATH: '/clients/a/wiki',
   };
 
+  const sharedBrainRepoBinding = {
+    GBRAIN_BRAIN_REPO_PATH: '/clients/a/team-brain',
+  };
+
   test('forces summarized params despite --log-full-params', () => {
     expect(allowFullMcpAuditParams(true, activeBinding)).toBe(false);
     expect(allowFullMcpAuditParams(false, activeBinding)).toBe(false);
     expect(allowFullMcpAuditParams(true, {})).toBe(true);
+  });
+
+  test('shared brain-repo binding forces summarized params and redacts its checkout path', () => {
+    expect(allowFullMcpAuditParams(true, sharedBrainRepoBinding)).toBe(false);
+    expect(sanitizeClientLocalMcpAuditFields({
+      tokenName: 'client-1',
+      agentName: 'agent-1',
+      operation: 'query',
+      params: { nested: [{ cwd: '/clients/a/team-brain/.sources/project-p' }] },
+      errorMessage: 'failed in /clients/a/team-brain',
+    }, sharedBrainRepoBinding)).toEqual({
+      tokenName: 'client-1',
+      agentName: 'agent-1',
+      operation: 'query',
+      params: {
+        redacted: true,
+        kind: 'client_local_path',
+      },
+      errorMessage: 'client-local path omitted from MCP audit error',
+    });
   });
 
   test('redacts path-bearing errors and unknown operation names but preserves stable locators', () => {

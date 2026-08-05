@@ -25,8 +25,12 @@ import {
   logBatchRetry as auditLogBatchRetry,
   logBatchExhausted as auditLogBatchExhausted,
 } from '../audit/batch-retry-audit.ts';
-import { resolveClientSourcePath } from '../source-resolver.ts';
+import {
+  resolveClientBrainRepoPath,
+  resolveClientSourcePath,
+} from '../source-resolver.ts';
 import { ClientLocalStructuredPathError } from '../client-local-path.ts';
+import { assertClientBoundStructuredWrite } from '../client-local-write.ts';
 
 /** Options for opting into protected-job-name submission. Passed as a separate
  *  4th arg to `MinionQueue.add()` (NOT folded into `opts`) so user-spread
@@ -57,6 +61,14 @@ export class MinionQueue {
     value: unknown,
     fieldLabel: string,
   ): Promise<void> {
+    if (resolveClientBrainRepoPath()) {
+      await assertClientBoundStructuredWrite(
+        this.engine,
+        value,
+        fieldLabel,
+      );
+      return;
+    }
     const sourceId = process.env.GBRAIN_SOURCE;
     if (!sourceId || !process.env.GBRAIN_SOURCE_PATH) return;
     if (!resolveClientSourcePath(sourceId)) return;
@@ -125,26 +137,14 @@ export class MinionQueue {
         `(pass {allowProtectedSubmit: true} as the 4th arg to MinionQueue.add)`,
       );
     }
-    const boundSourceId = process.env.GBRAIN_SOURCE;
-    const boundClientPath = process.env.GBRAIN_SOURCE_PATH;
-    const activeClientPath =
-      boundSourceId && boundClientPath
-        ? resolveClientSourcePath(boundSourceId)
-        : null;
-    if (activeClientPath) {
-      const { prepareClientSourceBindingForStructuredWrite } =
-        await import('../sources-ops.ts');
-      await prepareClientSourceBindingForStructuredWrite(
-        this.engine,
-        boundSourceId!,
-        {
-          name: jobName,
-          data: data ?? {},
-          options: opts ?? {},
-        },
-        'queued work. Queue stable source identity/commit only, or run the filesystem operation inline',
-      );
-    }
+    await this.guardClientBoundStructuredWrite(
+      {
+        name: jobName,
+        data: data ?? {},
+        options: opts ?? {},
+      },
+      'queued work. Queue stable source identity/commit only, or run the filesystem operation inline',
+    );
     // v0.38 (S1.7 + D6) — capability-based gate replaces the v0.31.12 Anthropic
     // pin. The subagent loop now routes through `gateway.toolLoop()` so any
     // provider with native tool calling works. Only refuse-at-submit when

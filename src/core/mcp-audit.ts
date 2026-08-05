@@ -2,11 +2,16 @@ import {
   isClientPathShapedText,
   structuredValueContainsClientPath,
 } from './client-local-path.ts';
-import { resolveClientSourcePath } from './source-resolver.ts';
+import {
+  resolveClientBrainRepoPath,
+  resolveClientSourcePath,
+} from './source-resolver.ts';
 
 function activeClientBindingPath(
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
+  const brainRepoPath = resolveClientBrainRepoPath(env);
+  if (brainRepoPath) return brainRepoPath;
   const sourceId = env.GBRAIN_SOURCE;
   if (!sourceId || !env.GBRAIN_SOURCE_PATH) return null;
   return resolveClientSourcePath(sourceId, env);

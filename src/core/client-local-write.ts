@@ -4,7 +4,10 @@ import {
   ClientLocalStructuredPathError,
   structuredValueContainsClientPath,
 } from './client-local-path.ts';
-import { resolveClientSourcePath } from './source-resolver.ts';
+import {
+  resolveClientBrainRepoPath,
+  resolveClientSourcePath,
+} from './source-resolver.ts';
 
 function normalizedPath(value: string): string {
   return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\')
@@ -36,11 +39,16 @@ export async function assertClientBoundStructuredWrite(
   engine: BrainEngine,
   value: unknown,
   fieldLabel: string,
+  sourceIdArg?: string,
 ): Promise<void> {
-  const sourceId = process.env.GBRAIN_SOURCE;
-  if (!sourceId || !process.env.GBRAIN_SOURCE_PATH) return;
-  const clientPath = resolveClientSourcePath(sourceId);
+  const sharedBrainRepoPath = resolveClientBrainRepoPath();
+  const boundSourceId = process.env.GBRAIN_SOURCE;
+  const sourceClientPath = boundSourceId && process.env.GBRAIN_SOURCE_PATH
+    ? resolveClientSourcePath(boundSourceId)
+    : null;
+  const clientPath = sharedBrainRepoPath ?? sourceClientPath;
   if (!clientPath) return;
+  const sourceId = sourceIdArg ?? boundSourceId ?? 'default';
 
   const sourceRows = await engine.executeRaw<{ local_path: string | null }>(
     `SELECT local_path FROM sources WHERE id = $1`,

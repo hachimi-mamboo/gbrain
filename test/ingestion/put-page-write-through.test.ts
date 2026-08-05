@@ -115,7 +115,11 @@ describe('put_page write-through — happy path', () => {
     );
 
     const result = await withEnv(
-      { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientDir },
+      {
+        GBRAIN_BRAIN_REPO_PATH: undefined,
+        GBRAIN_SOURCE: 'default',
+        GBRAIN_SOURCE_PATH: clientDir,
+      },
       async () => (await putPage.handler(makeCtx(), {
         slug: 'inbox/client-bound',
         content: '---\ntitle: Client bound\n---\n\nclient-local body',
@@ -178,7 +182,11 @@ describe('put_page write-through — happy path', () => {
     );
 
     await expect(withEnv(
-      { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: clientDir },
+      {
+        GBRAIN_BRAIN_REPO_PATH: undefined,
+        GBRAIN_SOURCE: 'default',
+        GBRAIN_SOURCE_PATH: clientDir,
+      },
       async () => putPage.handler(makeCtx(), {
         slug: 'inbox/wrong-remote',
         content: '---\ntitle: Wrong remote\n---\n\nmust not project here',

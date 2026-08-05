@@ -2863,8 +2863,13 @@ const log_ingest: Operation = {
     if (ctx.dryRun) return { dry_run: true, action: 'log_ingest' };
     const sourceId = ctx.sourceId ?? 'default';
     const boundSourceId = process.env.GBRAIN_SOURCE;
-    const { resolveClientSourcePath } = await import('./source-resolver.ts');
-    if (
+    const { resolveClientBrainRepoPath, resolveClientSourcePath } =
+      await import('./source-resolver.ts');
+    const sharedBrainRepoPath = resolveClientBrainRepoPath();
+    if (sharedBrainRepoPath) {
+      const { prepareClientBrainRepoBinding } = await import('./sources-ops.ts');
+      await prepareClientBrainRepoBinding(ctx.engine, sourceId);
+    } else if (
       boundSourceId &&
       process.env.GBRAIN_SOURCE_PATH &&
       resolveClientSourcePath(boundSourceId)

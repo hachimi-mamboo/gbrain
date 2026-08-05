@@ -107,6 +107,80 @@ describe('writePageThrough', () => {
     );
   });
 
+  test('shared brain-repo write refuses a symlink escape into a sibling source projection', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES
+        ('project-p', 'Project P', '{}'::jsonb),
+        ('project-q', 'Project Q', '{}'::jsonb)`,
+    );
+    const projectPDir = path.join(brainDir, '.sources', 'project-p');
+    const projectQDir = path.join(brainDir, '.sources', 'project-q');
+    fs.mkdirSync(projectPDir, { recursive: true });
+    fs.mkdirSync(projectQDir, { recursive: true });
+    fs.symlinkSync(
+      projectQDir,
+      path.join(projectPDir, 'alias'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    await seedPage('alias/leak', 'project-p');
+    await engine.setConfig('sync.repo_path', '');
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: brainDir,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        const result = await writePageThrough(engine, 'alias/leak', {
+          sourceId: 'project-p',
+        });
+
+        expect(result).toEqual({
+          written: false,
+          skipped: 'path_escapes_source_root',
+        });
+        expect(fs.existsSync(path.join(projectQDir, 'leak.md'))).toBe(false);
+      },
+    );
+  });
+
+  test('shared default-source write refuses a symlink into a reserved source projection', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('project-q', 'Project Q', '{}'::jsonb)`,
+    );
+    const projectQDir = path.join(brainDir, '.sources', 'project-q');
+    fs.mkdirSync(projectQDir, { recursive: true });
+    fs.symlinkSync(
+      projectQDir,
+      path.join(brainDir, 'alias'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    await seedPage('alias/leak', 'default');
+    await engine.setConfig('sync.repo_path', '');
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: brainDir,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        const result = await writePageThrough(engine, 'alias/leak', {
+          sourceId: 'default',
+        });
+
+        expect(result).toEqual({
+          written: false,
+          skipped: 'path_escapes_source_root',
+        });
+        expect(fs.existsSync(path.join(projectQDir, 'leak.md'))).toBe(false);
+      },
+    );
+  });
+
   test('writes the file rendered from the saved row; no .tmp leftover', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const slug = 'wiki/ideas/2026-01-01-lsd-foo-abc123';

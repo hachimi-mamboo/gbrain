@@ -710,6 +710,97 @@ describe('prepareClientSourceBinding', () => {
     });
   });
 
+  test('direct ingest log rejects the shared brain-repo checkout path without a source-path binding', async () => {
+    await withEnv2(async () => {
+      const brainRepoPath = join(GBRAIN_HOME, 'shared-brain');
+      await withEnv(
+        { GBRAIN_BRAIN_REPO_PATH: brainRepoPath },
+        async () => {
+          await expect(engine.logIngest({
+            source_id: 'default',
+            source_type: 'git_sync',
+            source_ref: 'source:default @ abc123',
+            pages_updated: ['wiki/page'],
+            summary: `imported from ${brainRepoPath}`,
+          })).rejects.toThrow(
+            'must not persist client-local paths in ingest log fields',
+          );
+        },
+      );
+
+      expect(await engine.executeRaw(
+        `SELECT id FROM ingest_log ORDER BY id`,
+      )).toEqual([]);
+    });
+  });
+
+  test('direct page write rejects a shared brain-repo checkout path in source_uri', async () => {
+    await withEnv2(async () => {
+      const brainRepoPath = join(GBRAIN_HOME, 'shared-brain');
+      await withEnv(
+        { GBRAIN_BRAIN_REPO_PATH: brainRepoPath },
+        async () => {
+          await expect(engine.putPage('wiki/private-path', {
+            type: 'note',
+            title: 'Private path',
+            compiled_truth: 'safe body',
+            timeline: '',
+            frontmatter: {},
+            source_kind: 'put_page',
+            source_uri: join(brainRepoPath, '.sources/project-p/wiki/private-path.md'),
+            ingested_via: 'put_page',
+          }, { sourceId: 'default' })).rejects.toThrow(
+            'must not persist client-local paths in page provenance fields',
+          );
+        },
+      );
+
+      expect(await engine.getPage('wiki/private-path', { sourceId: 'default' }))
+        .toBeNull();
+    });
+  });
+
+  test('public log_ingest prepares historical paths under a shared brain-repo binding', async () => {
+    await withEnv2(async () => {
+      const oldPath = join(GBRAIN_HOME, 'old-default-checkout');
+      const brainRepoPath = join(GBRAIN_HOME, 'shared-brain');
+      mkdirSync(oldPath, { recursive: true });
+      mkdirSync(brainRepoPath, { recursive: true });
+      execFileSync('git', ['init', '--initial-branch=main', brainRepoPath]);
+      await engine.executeRaw(
+        `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+        [oldPath],
+      );
+      await engine.setConfig('sync.repo_path', oldPath);
+
+      const logIngest = operations.find((op) => op.name === 'log_ingest')!;
+      await withEnv({
+        GBRAIN_BRAIN_REPO_PATH: brainRepoPath,
+        PATH: REAL_PATH,
+      }, async () => {
+        await expect(logIngest.handler(
+          {
+            engine,
+            sourceId: 'default',
+            remote: false,
+            dryRun: false,
+          } as never,
+          {
+            source_type: 'git_sync',
+            source_ref: 'source:default @ abc123',
+            pages_updated: ['wiki/page'],
+            summary: 'safe shared projection import',
+          },
+        )).resolves.toEqual({ status: 'ok' });
+      });
+
+      expect(await engine.executeRaw(
+        `SELECT local_path FROM sources WHERE id = 'default'`,
+      )).toEqual([{ local_path: null }]);
+      expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    });
+  });
+
   test('clears only client-local path state and invalidates matching queued jobs', async () => {
     await withEnv({ GBRAIN_HOME, PATH: REAL_PATH }, async () => {
       const stableRemote = 'https://git.example.invalid/private/wiki.git';
