@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS sources (
   last_commit   TEXT,
   last_sync_at  TIMESTAMPTZ,
   config        JSONB NOT NULL DEFAULT '{}'::jsonb,
-  -- v0.26.5: soft-delete + recovery window (mirrors src/schema.sql).
+  -- v0.26.5: soft-delete + recovery window (mirrors src/schema.sql); NULL
+  -- archive_expires_at disables automatic purge for shared Git projections.
   archived            BOOLEAN NOT NULL DEFAULT false,
   archived_at         TIMESTAMPTZ,
   archive_expires_at  TIMESTAMPTZ,

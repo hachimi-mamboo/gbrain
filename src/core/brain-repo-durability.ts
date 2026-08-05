@@ -76,6 +76,14 @@ export interface HardenOpts {
   verify?: boolean;         // default true
   dryRun?: boolean;
   intervalSec?: number;     // cron cadence; default 1800
+  /** Additional GBrain-owned files to commit with durability scaffolding. */
+  managedPaths?: string[];
+  /**
+   * Shared-checkout hook: runs after the pull phase and before any credential,
+   * hook, helper, cron, or commit mutation. Pull-capable command adapters use
+   * it to validate the updated projection and retire client-local DB paths.
+   */
+  afterPullBeforeMutation?: () => void | Promise<void>;
   logger?: (line: string) => void;
 }
 
@@ -234,8 +242,8 @@ fi
 # write-through case). Stage + commit first; brain_push below already handles
 # a remote that advanced (push -> rejected -> pull --rebase -> push).
 git add -- "$@"
-if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
-git commit -m "$_msg"
+if git diff --cached --quiet -- "$@"; then echo "nothing to commit"; exit 0; fi
+git commit -m "$_msg" -- "$@"
 
 if brain_push "$_branch"; then exit 0; fi
 echo "PUSH FAILED — commit is local-only, NEEDS ATTENTION (see ${'$'}{GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log)" >&2
@@ -419,13 +427,77 @@ export function isDurabilityHardened(repoPath: string): boolean {
  * (index.lock contention, nothing changed, detached states) — the DB row and
  * the on-disk file remain the durable sinks either way.
  */
-export function commitWriteThroughFile(repoPath: string, absPath: string, slug: string): boolean {
+export function commitWriteThroughFile(
+  repoPath: string,
+  absPath: string,
+  slug: string,
+  managedCompanionPaths: string[] = [],
+): boolean {
   try {
-    const rel = relative(repoPath, absPath);
-    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return false;
+    const relPaths = [absPath, ...managedCompanionPaths].map((path) => relative(repoPath, path));
+    if (relPaths.some((path) => !path || path.startsWith('..') || isAbsolute(path))) return false;
     const gitOpts = { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } } as const;
-    execFileSync('git', ['-C', repoPath, 'add', '--', rel], gitOpts);
-    execFileSync('git', ['-C', repoPath, 'commit', '-m', `gbrain: write-through ${slug}`, '--', rel], gitOpts);
+    execFileSync('git', ['-C', repoPath, 'add', '--', ...relPaths], gitOpts);
+    execFileSync(
+      'git',
+      ['-C', repoPath, 'commit', '-m', `gbrain: write-through ${slug}`, '--', ...relPaths],
+      gitOpts,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Commit a small, explicit set of GBrain-owned projection-format files and
+ * synchronously push the resulting HEAD. Unlike write-through's best-effort
+ * background hook, this is safe inside a shared-sync snapshot: the managed
+ * post-commit hook is disabled for the commit and no async rebase can race the
+ * subsequent import.
+ */
+export function commitManagedPathsAndPush(
+  repoPath: string,
+  absPaths: string[],
+  message: string,
+): boolean {
+  try {
+    if (absPaths.length === 0) return true;
+    const relPaths = absPaths.map((path) => relative(repoPath, path));
+    if (relPaths.some((path) => !path || path.startsWith('..') || isAbsolute(path))) return false;
+    const branch = currentBranch(repoPath);
+    if (!branch || branch === 'HEAD') return false;
+    const localGitEnv = { ...process.env, ...GIT_ENV };
+    execFileSync('git', ['-C', repoPath, 'add', '--', ...relPaths], {
+      stdio: 'ignore', timeout: 30_000, env: localGitEnv,
+    });
+    let hasStagedChanges = true;
+    try {
+      execFileSync('git', ['-C', repoPath, 'diff', '--cached', '--quiet', '--', ...relPaths], {
+        stdio: 'ignore', timeout: 10_000, env: localGitEnv,
+      });
+      hasStagedChanges = false;
+    } catch {
+      hasStagedChanges = true;
+    }
+    if (hasStagedChanges) {
+      execFileSync('git', [
+        '-C', repoPath,
+        '-c', 'core.hooksPath=/dev/null',
+        'commit', '-m', message, '--', ...relPaths,
+      ], {
+        stdio: 'ignore', timeout: 30_000, env: localGitEnv,
+      });
+    }
+    execFileSync('git', [
+      '-C', repoPath,
+      '-c', 'http.followRedirects=false',
+      'push', 'origin', `HEAD:${branch}`,
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 120_000,
+      env: { ...process.env, ...GIT_ENV_AUTH },
+    });
     return true;
   } catch {
     return false;
@@ -818,12 +890,31 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   };
 
   // Refuse on detached HEAD — pushing to a wrong ref is worse than not pushing.
+  let checkoutReadyForMutation = true;
   if (currentBranch(repoPath) === 'HEAD') {
     push('pull', { status: 'needs_attention', detail: 'detached HEAD — checkout a branch before hardening' });
+    checkoutReadyForMutation = false;
+  } else if (dryRun) {
+    // Preview is strictly read-only. In particular, divergenceSafePull can
+    // fetch/rebase and advance HEAD when origin is ahead, so it must not run.
+    push('pull', { status: 'skipped', detail: 'would inspect and pull origin (dry-run)' });
   } else {
     // 1. pull current state
-    try { push('pull', pullDetail(divergenceSafePull(repoPath, branch))); }
-    catch (e) { push('pull', { status: 'needs_attention', detail: `fetch/pull failed: ${(e as Error).message.slice(0, 140)}` }); }
+    try {
+      const outcome = divergenceSafePull(repoPath, branch);
+      push('pull', pullDetail(outcome));
+      if (outcome.status === 'conflict_aborted') checkoutReadyForMutation = false;
+    } catch (e) {
+      checkoutReadyForMutation = false;
+      push('pull', { status: 'needs_attention', detail: `fetch/pull failed: ${(e as Error).message.slice(0, 140)}` });
+    }
+  }
+
+  if (opts.afterPullBeforeMutation) {
+    if (!checkoutReadyForMutation) {
+      throw new Error('brain-repo pull did not establish a safe checkout; refusing post-pull mutation');
+    }
+    await opts.afterPullBeforeMutation();
   }
 
   // 2. credential
@@ -850,7 +941,7 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
       push('verify', { status: 'ok', detail: 'push-probe ok — push auth confirmed' });
       // Commit the durability scaffolding (helper + rules) — real content, the
       // genuine end-to-end proof (no synthetic heartbeat). No-op when unchanged.
-      const committed = commitScaffolding(repoPath, branch, redact);
+      const committed = commitScaffolding(repoPath, branch, redact, opts.managedPaths ?? []);
       if (committed) push('commit', committed);
       clean = headMatchesOrigin(repoPath, branch);
     }
@@ -866,18 +957,59 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   return { source_id: sourceId, repo_path: repoPath, branch, steps, missing, fixed, needs_attention, clean_against_origin: clean };
 }
 
-function commitScaffolding(repoPath: string, branch: string, redact: (s: string) => string): { status: StepStatus; detail: string } | null {
+function commitScaffolding(
+  repoPath: string,
+  branch: string,
+  redact: (s: string) => string,
+  managedPaths: string[],
+): { status: StepStatus; detail: string } | null {
   // Stage only the durability artifacts we manage — never a blind add.
   const paths: string[] = [HELPER_REL];
   const resolver = findResolverFile(repoPath);
   if (resolver) paths.push(relative(repoPath, resolver));
+  for (const managedPath of managedPaths) {
+    const rel = relative(repoPath, managedPath);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+      return {
+        status: 'needs_attention',
+        detail: `managed durability path escapes repo: ${managedPath}`,
+      };
+    }
+    paths.push(rel);
+  }
   try {
     execFileSync('git', ['-C', repoPath, 'add', '--', ...paths], { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } });
-    const staged = execFileSync('git', ['-C', repoPath, 'diff', '--cached', '--name-only'], {
+    const staged = execFileSync('git', [
+      '-C', repoPath, 'diff', '--cached', '--name-only', '--', ...paths,
+    ], {
       stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
     }).toString().trim();
-    if (!staged) return { status: 'ok', detail: 'scaffolding already committed' };
-    execFileSync('git', ['-C', repoPath, 'commit', '-m', 'chore(gbrain): install brain durability scaffolding'], {
+    if (!staged) {
+      // A previous managed commit may have succeeded locally while its push
+      // failed. A retry must close that durability gap even though there is no
+      // new scaffolding diff to commit.
+      const alreadyDurable = headMatchesOrigin(repoPath, branch);
+      execFileSync('git', [
+        '-C', repoPath,
+        '-c', 'http.followRedirects=false',
+        'push', 'origin', `HEAD:${branch}`,
+      ], {
+        stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
+        env: { ...process.env, ...GIT_ENV_AUTH },
+      });
+      return alreadyDurable
+        ? { status: 'ok', detail: 'scaffolding already committed and pushed' }
+        : { status: 'fixed', detail: 'pushed previously committed durability changes' };
+    }
+    // This function performs its own synchronous push below. Disable the
+    // managed post-commit hook for this one commit so its background push
+    // cannot race the authoritative push on the same remote ref.
+    execFileSync('git', [
+      '-C', repoPath,
+      '-c', 'core.hooksPath=/dev/null',
+      'commit', '-m', 'chore(gbrain): install brain durability scaffolding',
+      '--', ...paths,
+    ], {
       stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
     });
     execFileSync('git', ['-C', repoPath, ...['-c', 'http.followRedirects=false'], 'push', 'origin', `HEAD:${branch}`], {

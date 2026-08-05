@@ -3,9 +3,11 @@
  *
  * After a page row lands in the DB (via importFromContent / putPage), this
  * renders the row to markdown via `serializePageToMarkdown` and writes it to
- * `sync.repo_path` so the brain repo has a committable `.md` artifact that
- * round-trips cleanly through `gbrain sync`. The file is rendered FROM the DB
- * row, so the two sinks cannot diverge.
+ * the resolved source checkout or shared brain-repo checkout so the brain repo
+ * has a committable `.md` artifact. Shared checkouts use the canonical physical
+ * layout that the separate sync/restore seam must mirror: default at the root
+ * and other sources under `.sources/<source_id>/`. The file is rendered FROM
+ * the DB row, so the two sinks cannot diverge.
  *
  * Extracted from the v0.38 `put_page` write-through (operations.ts) so the
  * `put_page` op AND `gbrain brainstorm/lsd --save` share one implementation
@@ -28,8 +30,19 @@ import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
 import { isWriteTargetContained } from './path-confine.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from './brain-repo-durability.ts';
-import { assertClientSourceCheckout, resolveClientSourcePath } from './source-resolver.ts';
-import { prepareClientSourceBinding } from './sources-ops.ts';
+import {
+  assertClientSourceCheckout,
+  resolveClientBrainRepoPath,
+  resolveClientSourcePath,
+} from './source-resolver.ts';
+import {
+  ensureSourceProjectionMarker,
+  resolveProjectedSourcePath,
+} from './brain-repo-layout.ts';
+import {
+  prepareClientBrainRepoBinding,
+  prepareClientSourceBinding,
+} from './sources-ops.ts';
 
 /** Minimal logger surface — structurally compatible with operations.ts `Logger`. */
 export interface WriteThroughLogger {
@@ -48,8 +61,8 @@ export interface WriteThroughResult {
   committed?: boolean;
   /**
    * Non-error reasons the file was not written:
-   *   - no_repo_configured: the resolved target (source `local_path` or, for a
-   *     sole-source brain, `sync.repo_path`) is unset (DB-only by design).
+   *   - no_repo_configured: no client-local binding, source `local_path`, or
+   *     legacy `sync.repo_path` is configured (DB-only by design).
    *   - repo_not_found: target set but missing / not a directory.
    *   - source_repo_belongs_to_other_source: the assigned source has no
    *     `local_path`, and `sync.repo_path` is another source's own working tree
@@ -83,9 +96,9 @@ export interface WritePageThroughOpts {
 
 /**
  * Render the DB row for `slug` to markdown and atomically write it under
- * `sync.repo_path`. Never throws — failures are reported via the result's
- * `skipped` / `error` fields (the DB write is the durable sink; the file is
- * best-effort and reconciled by the next `gbrain sync`).
+ * the resolved checkout. Never throws — failures are reported via the
+ * result's `skipped` / `error` fields (the DB write is the durable sink; the
+ * file is a best-effort projection).
  */
 export async function writePageThrough(
   engine: BrainEngine,
@@ -94,19 +107,24 @@ export async function writePageThrough(
 ): Promise<WriteThroughResult> {
   const sourceId = opts.sourceId ?? 'default';
   try {
-    // #2018: pick the disk target so a page is NEVER written into a different
-    // source's working tree. Two legitimate topologies, plus the leak guard:
-    //   1. The assigned source has its OWN `local_path` (a separate working
-    //      tree) → write at that tree's root (matches how `scanOneSource` reads
-    //      it back; never nested under `.sources/`).
-    //   2. No per-source `local_path` → nest under the host repo
-    //      (`sync.repo_path`): default at the root, non-default under
-    //      `.sources/<id>/` (the established multi-source layout).
-    //   3. LEAK GUARD: if `sync.repo_path` is literally ANOTHER source's own
+    // Resolve even when a matching single-source binding exists so configuring
+    // both checkout modes fails consistently instead of silently choosing one.
+    const configuredSharedBrainRepoPath = resolveClientBrainRepoPath();
+    // Pick the disk target without changing the established single-source
+    // binding. Precedence is: caller operation root → matching
+    // GBRAIN_SOURCE_PATH → GBRAIN_BRAIN_REPO_PATH → registered source path →
+    // legacy sync.repo_path.
+    //
+    // Source-specific roots write `<slug>.md` at their root. Shared roots use
+    // the canonical projection: default at the root and non-default sources at
+    // `.sources/<source_id>/<slug>.md`.
+    //
+    // #2018 LEAK GUARD: if legacy `sync.repo_path` is ANOTHER source's own
     //      `local_path`, nesting this page there would pollute that sibling's
     //      git repo (the reported bug). Skip instead.
     let filePath: string;
     let writeRoot: string;
+    let projectionMarkerPath: string | null = null;
     const operationRoot = opts.operationRoot ? resolve(opts.operationRoot) : null;
     const boundClientPath = resolveClientSourcePath(sourceId);
     if (boundClientPath) {
@@ -123,14 +141,34 @@ export async function writePageThrough(
     const sourceLocalPath =
       operationRoot ??
       clientLocalPath ??
-      srcRows[0]?.local_path ??
       null;
+    // Keep the established operation-root and GBRAIN_SOURCE_PATH bindings
+    // authoritative. The shared binding is resolved only when neither applies,
+    // so adding it cannot change a single-source client's target or validation.
+    const sharedBrainRepoPath = sourceLocalPath ? null : configuredSharedBrainRepoPath;
+    if (sharedBrainRepoPath) {
+      await prepareClientBrainRepoBinding(engine, sourceId);
+    }
     if (sourceLocalPath) {
       if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
         return { written: false, skipped: 'repo_not_found' };
       }
       filePath = join(sourceLocalPath, `${slug}.md`);
       writeRoot = sourceLocalPath;
+    } else if (sharedBrainRepoPath) {
+      if (!existsSync(sharedBrainRepoPath) || !statSync(sharedBrainRepoPath).isDirectory()) {
+        return { written: false, skipped: 'repo_not_found' };
+      }
+      filePath = resolveProjectedSourcePath(sharedBrainRepoPath, `${slug}.md`, sourceId);
+      projectionMarkerPath = ensureSourceProjectionMarker(sharedBrainRepoPath, sourceId);
+      writeRoot = sharedBrainRepoPath;
+    } else if (srcRows[0]?.local_path) {
+      const registeredSourcePath = srcRows[0].local_path;
+      if (!existsSync(registeredSourcePath) || !statSync(registeredSourcePath).isDirectory()) {
+        return { written: false, skipped: 'repo_not_found' };
+      }
+      filePath = join(registeredSourcePath, `${slug}.md`);
+      writeRoot = registeredSourcePath;
     } else {
       const repoPath = await engine.getConfig('sync.repo_path');
       if (!repoPath) {
@@ -227,7 +265,12 @@ export async function writePageThrough(
     let committed = false;
     try {
       if (isDurabilityHardened(writeRoot)) {
-        committed = commitWriteThroughFile(writeRoot, filePath, slug);
+        committed = commitWriteThroughFile(
+          writeRoot,
+          filePath,
+          slug,
+          projectionMarkerPath ? [projectionMarkerPath] : [],
+        );
       }
     } catch { /* best-effort */ }
 

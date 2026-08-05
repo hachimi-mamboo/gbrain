@@ -54,7 +54,9 @@ import {
 import { gbrainPath } from './config.ts';
 import { isValidSourceId } from './source-id.ts';
 import {
+  assertClientBrainRepoCheckout,
   assertClientSourceCheckout,
+  resolveClientBrainRepoPath,
   resolveClientSourcePath,
   resolveSourceWithTier,
   type SourceTier,
@@ -432,18 +434,46 @@ export async function prepareClientSourceBinding(
   engine: BrainEngine,
   sourceId: string,
 ): Promise<PrepareClientSourceBindingResult> {
-  validateSourceId(sourceId);
-  const source = await fetchSourceRow(engine, sourceId);
-  if (!source) {
-    throw new SourceOpError('not_found', `Source "${sourceId}" not found.`);
-  }
-
   const clientPath = resolveClientSourcePath(sourceId);
   if (!clientPath) {
     throw new Error(
       `Client-local binding for source "${sourceId}" requires matching ` +
       `GBRAIN_SOURCE=${sourceId} and an absolute GBRAIN_SOURCE_PATH.`,
     );
+  }
+  return prepareClientLocalBinding(engine, sourceId, clientPath, true);
+}
+
+/**
+ * Retire shared machine paths before one logical source uses the process-local
+ * multi-source brain checkout. The checkout root is intentionally shared by
+ * all source projections and is never written to Postgres.
+ */
+export async function prepareClientBrainRepoBinding(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<PrepareClientSourceBindingResult> {
+  const clientPath = resolveClientBrainRepoPath();
+  if (!clientPath) {
+    throw new Error(
+      `Client-local shared binding for source "${sourceId}" requires an absolute ` +
+      `GBRAIN_BRAIN_REPO_PATH.`,
+    );
+  }
+  assertClientBrainRepoCheckout(clientPath);
+  return prepareClientLocalBinding(engine, sourceId, clientPath, false);
+}
+
+async function prepareClientLocalBinding(
+  engine: BrainEngine,
+  sourceId: string,
+  clientPath: string,
+  validateSourceCheckout: boolean,
+): Promise<PrepareClientSourceBindingResult> {
+  validateSourceId(sourceId);
+  const source = await fetchSourceRow(engine, sourceId);
+  if (!source) {
+    throw new SourceOpError('not_found', `Source "${sourceId}" not found.`);
   }
   const legacyRepoPath = await engine.getConfig('sync.repo_path');
   const sourceRoots = uniquePathSpellings([
@@ -468,7 +498,9 @@ export async function prepareClientSourceBinding(
   if (clearsLocalRemoteLocator) {
     delete preparedSourceConfig.remote_url;
   }
-  assertClientSourceCheckout(sourceId, clientPath, preparedSourceConfig);
+  if (validateSourceCheckout) {
+    assertClientSourceCheckout(sourceId, clientPath, preparedSourceConfig);
+  }
 
   const retiringLegacyBinding =
     source.local_path !== null || clearLegacyRepoPath;
@@ -1426,6 +1458,46 @@ export interface RemoveResult {
 }
 
 /**
+ * Refuse DB-only source removal while a whole-brain Git projection is bound.
+ *
+ * Leaving `.sources/<id>/` in the projection while deleting its DB row makes
+ * the next shared sync rediscover the source. Permanent retirement therefore
+ * has to remove and publish the projected directory before the DB row can be
+ * hard-removed. Archive is only a temporary reversible path while its DB row
+ * remains: this binding is process-local, not a persistent topology flag.
+ */
+export function sourceHardRemovalBlockMessage(
+  sourceId?: string,
+): string | null {
+  if (!resolveClientBrainRepoPath()) return null;
+
+  const target = sourceId ? `source "${sourceId}"` : 'source rows';
+  const projectedPath = sourceId
+    ? `".sources/${sourceId}"`
+    : 'the corresponding ".sources/<id>" directories';
+  const rediscoveredTarget = sourceId ? 'it' : 'them';
+  const archiveGuidance = sourceId
+    ? `Use "gbrain sources archive ${sourceId}" for temporary reversible retirement ` +
+      `while its archived DB row is retained. `
+    : 'Keep archived rows until each Git projection is permanently retired. ';
+
+  return (
+    `Cannot hard-remove ${target} while GBRAIN_BRAIN_REPO_PATH is active: ` +
+    `the Git projection would make a later shared sync rediscover ${rediscoveredTarget}. ` +
+    archiveGuidance +
+    `For permanent retirement, stop shared sync, remove ${projectedPath} ` +
+    `from the projection, commit and push that change, then unset ` +
+    `GBRAIN_BRAIN_REPO_PATH before hard-removing the DB row.`
+  );
+}
+
+export function assertSourceHardRemoveAllowed(sourceId?: string): void {
+  const blockMessage = sourceHardRemovalBlockMessage(sourceId);
+  if (!blockMessage) return;
+  throw new SourceOpError('unmanaged_path', blockMessage);
+}
+
+/**
  * Hard-remove a source row + cascade. v0.28 additions:
  *  - protected-id guard for "default"
  *  - clone-cleanup: delete the on-disk clone IFF its resolved path is
@@ -1448,6 +1520,8 @@ export async function removeSource(
       'Cannot remove the "default" source (it backs the pre-v0.17 brain).',
     );
   }
+
+  assertSourceHardRemoveAllowed(opts.id);
 
   const src = await fetchSourceRow(engine, opts.id);
   if (!src) {
@@ -1542,10 +1616,18 @@ export async function getSourceStatus(
   const archived = archivedRows[0]?.archived === true;
 
   const remoteUrl = getRemoteUrl(src.config);
-  const localPath = resolveClientSourcePath(id) ?? src.local_path;
+  const { resolveClientBrainRepoPath } = await import('./source-resolver.ts');
+  const sharedBrainRepoPath = resolveClientBrainRepoPath();
+  const localPath = sharedBrainRepoPath ?? resolveClientSourcePath(id) ?? src.local_path;
   let cloneState: SourceStatus['clone_state'] = 'not-applicable';
   if (localPath) {
-    cloneState = validateRepoState(localPath, remoteUrl ?? undefined);
+    // A shared brain repo is one checkout for every source, so source-level
+    // remote_url metadata is not its identity. Validate the checkout itself;
+    // the harden/pull path owns remote verification for this shared mode.
+    cloneState = validateRepoState(
+      localPath,
+      sharedBrainRepoPath ? undefined : remoteUrl ?? undefined,
+    );
   }
 
   return {

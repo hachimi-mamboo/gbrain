@@ -10,6 +10,10 @@
  *   - Default priority is high (-10)
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSyncTrigger } from '../src/commands/sync.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
@@ -172,6 +176,28 @@ describe('runSyncTrigger', () => {
     });
     expect(sharedState).not.toContain(stalePath);
     expect(sharedState).not.toContain(clientPath);
+  });
+
+  test('shared brain-repo binding rejects queued trigger before creating a job', async () => {
+    const sharedRepo = mkdtempSync(join(tmpdir(), 'gbrain-trigger-shared-'));
+    execFileSync('git', ['init', '-q', sharedRepo]);
+    try {
+      await withEnv({
+        GBRAIN_BRAIN_REPO_PATH: sharedRepo,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      }, async () => {
+        const { stderr, exitCode } = await capture(['--source', 'default']);
+        expect(exitCode).toBe(2);
+        expect(stderr).toContain('GBRAIN_BRAIN_REPO_PATH');
+        expect(stderr).toContain('gbrain sync --all');
+      });
+
+      const queue = new MinionQueue(engine);
+      expect(await queue.getJobs({ name: 'sync', limit: 5 })).toEqual([]);
+    } finally {
+      rmSync(sharedRepo, { recursive: true, force: true });
+    }
   });
 
   test('--priority normal maps to 0', async () => {

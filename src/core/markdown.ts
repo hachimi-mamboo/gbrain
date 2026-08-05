@@ -701,7 +701,7 @@ function extractTags(frontmatter: Record<string, unknown>): string[] {
 // stamps. This extract is the single source of truth.
 // ---------------------------------------------------------------------------
 
-import { join } from 'node:path';
+import { resolveProjectedSourcePath } from './brain-repo-layout.ts';
 
 /** Options for serializePageToMarkdown. */
 export interface SerializePageOpts {
@@ -758,16 +758,15 @@ export function serializePageToMarkdown(
  * synthesize.ts) and the v0.38 put_page write-through path so both
  * sites compute the same path for the same row.
  *
- * NOTE: caller is responsible for validating `source_id` against path-
- * traversal attacks via `validateSourceId` (src/core/utils.ts) BEFORE
- * passing it here. This helper does the filename math only.
+ * Delegates to brain-repo-layout.ts so future projection migrations have one
+ * physical-path owner. Callers still validate source/page identity before
+ * reaching this helper; the layout owner additionally rejects non-canonical
+ * or hidden logical paths.
  */
 export function resolvePageFilePath(
   brainDir: string,
   slug: string,
   sourceId: string,
 ): string {
-  return sourceId === 'default'
-    ? join(brainDir, `${slug}.md`)
-    : join(brainDir, '.sources', sourceId, `${slug}.md`);
+  return resolveProjectedSourcePath(brainDir, `${slug}.md`, sourceId);
 }

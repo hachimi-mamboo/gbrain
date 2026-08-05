@@ -44,6 +44,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import {
+  canParallelizeSyncAll,
   resolveParallelism,
   buildSyncStatusReport,
 } from '../src/commands/sync.ts';
@@ -86,6 +87,25 @@ describe('resolveParallelism', () => {
 
   test('zero-source edge case returns 1 (no division by zero, no negative worker count)', () => {
     expect(resolveParallelism({ sourceCount: 0, engineKind: 'postgres' })).toBe(1);
+  });
+});
+
+describe('shared brain-repo fan-out', () => {
+  test('one physical checkout is always serialized even when federated v2 is enabled', () => {
+    expect(canParallelizeSyncAll({
+      v2Enabled: true,
+      serial: false,
+      engineKind: 'postgres',
+      sourceCount: 5,
+      sharedCheckout: true,
+    })).toBe(false);
+    expect(canParallelizeSyncAll({
+      v2Enabled: true,
+      serial: false,
+      engineKind: 'postgres',
+      sourceCount: 5,
+      sharedCheckout: false,
+    })).toBe(true);
   });
 });
 
