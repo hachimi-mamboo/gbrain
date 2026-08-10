@@ -12,9 +12,19 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { resolveSourceId, getDefaultSourcePath, __testing } from '../src/core/source-resolver.ts';
+import {
+  resolveSourceId,
+  assertClientBrainRepoCheckout,
+  assertClientBrainRepoRoot,
+  assertClientSourceCheckout,
+  resolveClientBrainRepoPath,
+  resolveClientSourcePath,
+  getDefaultSourcePath,
+  __testing,
+} from '../src/core/source-resolver.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 // ── Stub engine ────────────────────────────────────────────
@@ -268,6 +278,115 @@ describe('getDefaultSourcePath', () => {
     );
     const path = await getDefaultSourcePath(engine, '/custom/path/sub');
     expect(path).toBe('/custom/path');
+  });
+});
+
+// ── client-local source path binding ──────────────────────
+
+describe('resolveClientSourcePath', () => {
+  test('requires an absolute path paired with the resolved source identity', () => {
+    expect(resolveClientSourcePath('wiki', {
+      GBRAIN_SOURCE: 'wiki',
+      GBRAIN_SOURCE_PATH: '/clients/a/wiki',
+    })).toBe('/clients/a/wiki');
+
+    expect(() => resolveClientSourcePath('wiki', {
+      GBRAIN_SOURCE_PATH: '/clients/a/wiki',
+    })).toThrow(/requires GBRAIN_SOURCE/);
+    expect(resolveClientSourcePath('wiki', {
+      GBRAIN_SOURCE: 'default',
+      GBRAIN_SOURCE_PATH: '/clients/a/wiki',
+    })).toBeNull();
+    expect(() => resolveClientSourcePath('wiki', {
+      GBRAIN_SOURCE: 'wiki',
+      GBRAIN_SOURCE_PATH: 'relative/wiki',
+    })).toThrow(/absolute path/);
+  });
+
+  test('remote-backed client checkout must match the shared remote identity', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-client-source-'));
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      execFileSync('git', [
+        '-C', repo, 'remote', 'add', 'origin',
+        'https://github.com/example/actual.git',
+      ]);
+
+      expect(() => assertClientSourceCheckout('wiki', repo, {
+        remote_url: 'https://github.com/example/actual.git',
+      })).not.toThrow();
+      expect(() => assertClientSourceCheckout('wiki', repo, {
+        remote_url: 'https://github.com/example/other.git',
+      })).toThrow(/url-drift/);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('assertClientBrainRepoCheckout', () => {
+  test('requires the shared checkout binding to name the Git repository root', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-client-brain-repo-'));
+    const nested = join(repo, 'nested');
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      mkdirSync(nested);
+
+      expect(() => assertClientBrainRepoCheckout(repo)).not.toThrow();
+      expect(() => assertClientBrainRepoCheckout(nested)).toThrow(/Git checkout root/);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('separates exact-root validation from current projection validation', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-client-stale-layout-'));
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      mkdirSync(join(repo, '.sources', 'project-p'), { recursive: true });
+      writeFileSync(join(repo, '.sources', 'project-p', '.gbrain-source'), 'wrong\n');
+
+      expect(() => assertClientBrainRepoRoot(repo)).not.toThrow();
+      expect(() => assertClientBrainRepoCheckout(repo)).toThrow(/marker/i);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('does not apply the shared-repository-root restriction to GBRAIN_SOURCE_PATH', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-client-source-subdir-'));
+    const nested = join(repo, 'nested');
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      mkdirSync(nested);
+
+      expect(resolveClientSourcePath('wiki', {
+        GBRAIN_SOURCE: 'wiki',
+        GBRAIN_SOURCE_PATH: nested,
+      })).toBe(nested);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveClientBrainRepoPath', () => {
+  test('is an independent absolute client-local checkout binding', () => {
+    expect(resolveClientBrainRepoPath({
+      GBRAIN_BRAIN_REPO_PATH: '/clients/a/brain-repo',
+    })).toBe('/clients/a/brain-repo');
+    expect(resolveClientBrainRepoPath({})).toBeNull();
+    expect(() => resolveClientBrainRepoPath({
+      GBRAIN_BRAIN_REPO_PATH: 'relative/brain-repo',
+    })).toThrow(/absolute path/);
+  });
+
+  test('rejects configuring shared and single-source checkout modes together', () => {
+    expect(() => resolveClientBrainRepoPath({
+      GBRAIN_BRAIN_REPO_PATH: '/clients/a/brain-repo',
+      GBRAIN_SOURCE: 'default',
+      GBRAIN_SOURCE_PATH: '/clients/a/default-source',
+    })).toThrow(/cannot be combined with GBRAIN_SOURCE_PATH/);
   });
 });
 

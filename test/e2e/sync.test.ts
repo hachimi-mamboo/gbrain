@@ -274,7 +274,9 @@ describeE2E('E2E: Git-to-DB Sync Pipeline', () => {
     const syncLogs = logs.filter((l: any) => l.source_type === 'git_sync');
 
     expect(syncLogs.length).toBeGreaterThanOrEqual(1);
-    expect(syncLogs[0].source_ref).toContain(repoPath);
+    expect(syncLogs[0].source_id).toBe('default');
+    expect(syncLogs[0].source_ref).toMatch(/^source:default @ [0-9a-f]{8}$/);
+    expect(syncLogs[0].source_ref).not.toContain(repoPath);
   });
 
   test('--full reimports everything regardless of last_commit', async () => {

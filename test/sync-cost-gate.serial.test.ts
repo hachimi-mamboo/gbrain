@@ -17,7 +17,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -26,6 +26,7 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { CHUNKER_VERSION } from '../src/core/chunkers/code.ts';
 import type { ChunkInput } from '../src/core/types.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 /** Offline embed stub so inline-proceed paths (posture tokenmax) don't network. */
 function stubOfflineEmbed(): void {
@@ -79,15 +80,24 @@ afterEach(() => {
   if (repoPath) rmSync(repoPath, { recursive: true, force: true });
 });
 
-/** Run runSync(args) with process.exit + console.log captured. */
-async function runSyncCaptured(args: string[]): Promise<{ exitCode: number | undefined; stdout: string }> {
+/** Run runSync(args) with process.exit + console output captured. */
+async function runSyncCaptured(args: string[]): Promise<{
+  exitCode: number | undefined;
+  stdout: string;
+  stderr: string;
+}> {
   const { runSync } = await import('../src/commands/sync.ts');
   const origExit = process.exit;
   const origLog = console.log.bind(console);
+  const origError = console.error.bind(console);
   const out: string[] = [];
+  const err: string[] = [];
   let exitCode: number | undefined;
   console.log = (...a: unknown[]) => {
     out.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '));
+  };
+  console.error = (...a: unknown[]) => {
+    err.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '));
   };
   process.exit = ((code?: number) => {
     exitCode = code;
@@ -100,11 +110,87 @@ async function runSyncCaptured(args: string[]): Promise<{ exitCode: number | und
   } finally {
     process.exit = origExit;
     console.log = origLog;
+    console.error = origError;
   }
-  return { exitCode, stdout: out.join('\n') };
+  return { exitCode, stdout: out.join('\n'), stderr: err.join('\n') };
+}
+
+async function expectClientPathAbsentFromSharedState(clientPath: string): Promise<void> {
+  const sources = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+    `SELECT local_path, config FROM sources`,
+  );
+  for (const row of sources) {
+    expect(row.local_path).not.toBe(clientPath);
+    expect(JSON.stringify(row.config)).not.toContain(clientPath);
+  }
+
+  const config = await engine.executeRaw<{ key: string; value: unknown }>(
+    `SELECT key, value FROM config`,
+  );
+  for (const row of config) {
+    expect(JSON.stringify(row.value)).not.toContain(clientPath);
+  }
+
+  const logs = await engine.getIngestLog({ limit: 100 });
+  for (const row of logs) {
+    expect(row.source_ref).not.toContain(clientPath);
+  }
 }
 
 describe('v0.41.31 — sync --all cost gate wiring', () => {
+  test('--all rejects a process-local checkout binding', async () => {
+    const result = await withEnv(
+      { GBRAIN_SOURCE: 'default', GBRAIN_SOURCE_PATH: repoPath },
+      () => runSyncCaptured(['--all', '--no-embed']),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--all cannot be combined with GBRAIN_SOURCE_PATH');
+  });
+
+  test('--all rejects an explicit --repo instead of silently ignoring it', async () => {
+    const { exitCode, stderr } = await runSyncCaptured([
+      '--all', '--repo', repoPath, '--no-embed',
+    ]);
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--repo cannot be combined with --all');
+  });
+
+  test('explicit --repo stays client-local across bootstrap, full sync, and restore', async () => {
+    const commonArgs = [
+      '--source', 'default', '--no-embed', '--no-pull',
+    ];
+
+    const bootstrap = await runSyncCaptured([
+      '--repo', repoPath, ...commonArgs,
+    ]);
+    expect(bootstrap.exitCode).not.toBe(1);
+    await expectClientPathAbsentFromSharedState(repoPath);
+
+    const full = await runSyncCaptured([
+      '--repo', repoPath, '--full', ...commonArgs,
+    ]);
+    expect(full.exitCode).not.toBe(1);
+    await expectClientPathAbsentFromSharedState(repoPath);
+
+    const restoreRoot = mkdtempSync(join(tmpdir(), 'gbrain-costgate-restore-'));
+    const restorePath = join(restoreRoot, 'checkout');
+    try {
+      execFileSync('git', ['clone', '--quiet', repoPath, restorePath]);
+      await resetPgliteState(engine);
+
+      const restore = await runSyncCaptured([
+        '--repo', restorePath, ...commonArgs,
+      ]);
+      expect(restore.exitCode).not.toBe(1);
+      expect(await engine.getPage('topics/foo', { sourceId: 'default' })).not.toBeNull();
+      await expectClientPathAbsentFromSharedState(restorePath);
+    } finally {
+      rmSync(restoreRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test('R-1: deferred sync --all (non-TTY) emits deferred_notice and never exit 2', async () => {
     await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
     // Make the fan-out a clean no-op: last_commit == HEAD so performSync
@@ -243,5 +329,108 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
     // The gate now exists on the single-source path (was ungated before
     // #2139) and proceeds to import rather than blocking.
     expect(stdout.toLowerCase()).toContain('imported');
+  }, 60_000);
+
+  test('single-source client binding retires stale shared paths before sync', async () => {
+    await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    const sharedPath = `${repoPath}-other-client`;
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1, last_commit = $2
+        WHERE id = 'vault'`,
+      [sharedPath, headSha],
+    );
+    await engine.setConfig('sync.repo_path', sharedPath);
+    await engine.setConfig('sync.last_commit', 'stable-bookmark');
+    await engine.executeRaw(
+      `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
+       VALUES ('vault', 'directory', $1, 'legacy client import')`,
+      [sharedPath],
+    );
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES ('sync', 'waiting', $1::jsonb)`,
+      [JSON.stringify({
+        sourceId: 'vault',
+        repoPath: sharedPath,
+        commit: 'queued-commit',
+      })],
+    );
+    await engine.setConfig('sync.cost_gate_min_usd', '0');
+
+    const { exitCode, stdout } = await withEnv(
+      { GBRAIN_SOURCE: 'vault', GBRAIN_SOURCE_PATH: repoPath },
+      () => runSyncCaptured(['--source', 'vault', '--json', '--no-pull']),
+    );
+
+    expect(exitCode).not.toBe(2);
+    expect(stdout).toContain('"gate":"auto_deferred_embeds"');
+    const rows = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+    }>(
+      `SELECT local_path, last_commit FROM sources WHERE id = 'vault'`,
+    );
+    expect(rows[0]?.local_path).toBeNull();
+    expect(rows[0]?.last_commit).toBe(headSha);
+    expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    expect(await engine.getConfig('sync.last_commit')).toBe('stable-bookmark');
+
+    const logs = await engine.getIngestLog({ limit: 10 });
+    const legacyLog = logs.find((entry) => entry.summary === 'legacy client import');
+    expect(legacyLog?.source_ref).toBe('source:vault');
+    const directoryLog = logs.find(
+      (entry) => entry.source_type === 'directory' && entry.summary !== 'legacy client import',
+    );
+    expect(directoryLog?.source_id).toBe('vault');
+    expect(directoryLog?.source_ref).toBe(`source:vault @ ${headSha.slice(0, 8)}`);
+    expect(directoryLog?.source_ref).not.toContain(repoPath);
+    for (const log of logs) {
+      expect(log.source_ref).not.toContain(sharedPath);
+      expect(log.source_ref).not.toContain(repoPath);
+    }
+
+    const jobs = await engine.executeRaw<{
+      status: string;
+      data: Record<string, unknown>;
+    }>(`SELECT status, data FROM minion_jobs WHERE name = 'sync'`);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe('cancelled');
+    expect(jobs[0].data).toEqual({
+      sourceId: 'vault',
+      commit: 'queued-commit',
+    });
+  }, 60_000);
+
+  test('incremental client-local sync logs stable source provenance without its checkout path', async () => {
+    await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    const sharedPath = `${repoPath}-other-client`;
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'vault'`,
+      [sharedPath],
+    );
+
+    await withEnv(
+      { GBRAIN_SOURCE: 'vault', GBRAIN_SOURCE_PATH: repoPath },
+      () => runSyncCaptured(['--source', 'vault', '--no-embed', '--no-pull']),
+    );
+
+    writeFileSync(
+      join(repoPath, 'topics/foo.md'),
+      ['---', 'type: concept', 'title: Foo', '---', '', 'updated client-local content.'].join('\n'),
+    );
+    execSync('git add -A && git commit -m incremental', { cwd: repoPath, stdio: 'pipe' });
+    const incrementalHead = execSync('git rev-parse HEAD', { cwd: repoPath, stdio: 'pipe' }).toString().trim();
+
+    const { exitCode } = await withEnv(
+      { GBRAIN_SOURCE: 'vault', GBRAIN_SOURCE_PATH: repoPath },
+      () => runSyncCaptured(['--source', 'vault', '--no-embed', '--no-pull']),
+    );
+
+    expect(exitCode).not.toBe(1);
+    const logs = await engine.getIngestLog({ limit: 10 });
+    const syncLog = logs.find((entry) => entry.source_type === 'git_sync');
+    expect(syncLog?.source_id).toBe('vault');
+    expect(syncLog?.source_ref).toBe(`source:vault @ ${incrementalHead.slice(0, 8)}`);
+    expect(syncLog?.source_ref).not.toContain(repoPath);
   }, 60_000);
 });

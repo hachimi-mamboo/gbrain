@@ -27,7 +27,10 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import { buildOrFallbackWebsearchQuery } from '../../src/core/search/sql-ranking.ts';
-import { configureGateway } from '../../src/core/ai/gateway.ts';
+import {
+  __setEmbedTransportForTests,
+  configureGateway,
+} from '../../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
@@ -74,6 +77,22 @@ async function seedTitleOnlyPage(): Promise<void> {
       chunk_source: 'compiled_truth',
     },
   ]);
+}
+
+async function seedSameTypeKeywordPages(): Promise<void> {
+  const uniqueTerms = ['amber', 'birch', 'cobalt', 'dune', 'ember'];
+  for (const [index, term] of uniqueTerms.entries()) {
+    const slug = `notes/dedup-fallback-${index + 1}`;
+    const chunkText = `shared fallback cohort signal ${term} unique evidence ${index + 1}`;
+    await engine.putPage(slug, {
+      type: 'note',
+      title: `Fallback Fixture ${index + 1}`,
+      compiled_truth: chunkText,
+    });
+    await engine.upsertChunks(slug, [
+      { chunk_index: 0, chunk_text: chunkText, chunk_source: 'compiled_truth' },
+    ]);
+  }
 }
 
 describe('searchTitles — D1 title candidate arm', () => {
@@ -258,6 +277,66 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
 });
 
 describe('hybridSearch wiring — title arm reaches the fused result set', () => {
+  test('keyword-only path honors dedupOpts.maxTypeRatio', async () => {
+    await seedSameTypeKeywordPages();
+
+    const results = await hybridSearch(engine, 'shared fallback cohort signal', {
+      limit: 10,
+      dedupOpts: { maxTypeRatio: 1 },
+      embeddingColumn: {
+        name: 'embedding',
+        type: 'vector',
+        dimensions: DIM,
+        embeddingModel: 'openai:text-embedding-3-large',
+      },
+      graph_signals: false,
+    });
+
+    expect(results).toHaveLength(5);
+    expect(new Set(results.map(r => r.slug)).size).toBe(5);
+    expect(results.every(r => r.type === 'note')).toBe(true);
+  });
+
+  test('embed-failure keyword fallback honors dedupOpts.maxTypeRatio', async () => {
+    await seedSameTypeKeywordPages();
+    let embedCalls = 0;
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: DIM,
+      env: { OPENAI_API_KEY: 'sk-test' },
+    });
+    __setEmbedTransportForTests(async () => {
+      embedCalls++;
+      throw new Error('stub: embedding provider failed');
+    });
+
+    try {
+      const results = await hybridSearch(engine, 'shared fallback cohort signal', {
+        limit: 10,
+        dedupOpts: { maxTypeRatio: 1 },
+        embeddingColumn: {
+          name: 'embedding',
+          type: 'vector',
+          dimensions: DIM,
+          embeddingModel: 'openai:text-embedding-3-large',
+        },
+        graph_signals: false,
+      });
+
+      expect(embedCalls).toBeGreaterThan(0);
+      expect(results).toHaveLength(5);
+      expect(new Set(results.map(r => r.slug)).size).toBe(5);
+      expect(results.every(r => r.type === 'note')).toBe(true);
+    } finally {
+      __setEmbedTransportForTests(null);
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-large',
+        embedding_dimensions: DIM,
+        env: {},
+      });
+    }
+  });
+
   test('exact-title query surfaces the page through hybridSearch (keyword-only path)', async () => {
     await seedTitleOnlyPage();
     const results = await hybridSearch(engine, 'Chronomancer Codex Ledger', { limit: 5 });

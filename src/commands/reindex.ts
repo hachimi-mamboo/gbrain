@@ -30,6 +30,11 @@ import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
+import { resolveProjectedSourcePath } from '../core/brain-repo-layout.ts';
+import {
+  assertClientBrainRepoCheckout,
+  resolveClientBrainRepoPath,
+} from '../core/source-resolver.ts';
 // v0.41.15.0 (T10, D9): per-batch parallel workers.
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
@@ -185,7 +190,18 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   let skipped = 0;
   let failed = 0;
   const BATCH = 100;
-  const repoPath = opts.repoPath ? resolve(opts.repoPath) : null;
+  const sharedBrainRepoPath = resolveClientBrainRepoPath();
+  if (
+    sharedBrainRepoPath &&
+    opts.repoPath &&
+    resolve(opts.repoPath) !== sharedBrainRepoPath
+  ) {
+    throw new Error(
+      `--repo ${opts.repoPath} conflicts with GBRAIN_BRAIN_REPO_PATH=${sharedBrainRepoPath}.`,
+    );
+  }
+  if (sharedBrainRepoPath) assertClientBrainRepoCheckout(sharedBrainRepoPath);
+  const repoPath = sharedBrainRepoPath ?? (opts.repoPath ? resolve(opts.repoPath) : null);
 
   while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
@@ -210,7 +226,9 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
         reporter.tick();
         try {
           if (row.source_path && repoPath) {
-            const absPath = resolve(repoPath, row.source_path);
+            const absPath = sharedBrainRepoPath
+              ? resolveProjectedSourcePath(repoPath, row.source_path, row.source_id)
+              : resolve(repoPath, row.source_path);
             if (existsSync(absPath)) {
               await importFromFile(engine, absPath, row.source_path, {
                 noEmbed: !!opts.noEmbed,

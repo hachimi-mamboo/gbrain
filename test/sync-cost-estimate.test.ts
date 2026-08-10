@@ -137,4 +137,58 @@ describe('estimateInlineNewTokens — ladder', () => {
     expect(r.tokens).toBe(0);
     expect(r.changedSources).toBe(0);
   });
+
+  test('shared projection delta prices only the selected logical source', () => {
+    mkdirSync(join(repo, '.sources', 'project-p', 'topics'), { recursive: true });
+    writeFileSync(join(repo, 'topics', 'default.md'), 'default body');
+    writeFileSync(join(repo, '.sources', 'project-p', 'topics', 'project.md'), 'project body');
+    const base = commitAll('projection base');
+    writeFileSync(
+      join(repo, '.sources', 'project-p', 'topics', 'project.md'),
+      'project body changed '.repeat(100),
+    );
+    commitAll('project change');
+
+    const defaultEstimate = estimateInlineNewTokens([{
+      local_path: repo,
+      config: {},
+      last_commit: base,
+      chunker_version: CURRENT,
+      projection_source_id: 'default',
+    }], CURRENT);
+    const projectEstimate = estimateInlineNewTokens([{
+      local_path: join(repo, '.sources', 'project-p'),
+      config: {},
+      last_commit: base,
+      chunker_version: CURRENT,
+      projection_source_id: 'project-p',
+    }], CURRENT);
+
+    expect(defaultEstimate.tokens).toBe(0);
+    expect(projectEstimate.tokens).toBeGreaterThan(0);
+  });
+
+  test('shared projection reuses the repo-level pinned target instead of resolving per source', () => {
+    mkdirSync(join(repo, '.sources', 'project-p', 'topics'), { recursive: true });
+    writeFileSync(join(repo, '.sources', 'project-p', 'topics', 'project.md'), 'base');
+    const pinned = commitAll('pinned projection snapshot');
+    writeFileSync(
+      join(repo, '.sources', 'project-p', 'topics', 'project.md'),
+      'later local head '.repeat(100),
+    );
+    commitAll('later head');
+
+    const r = estimateInlineNewTokens([{
+      local_path: join(repo, '.sources', 'project-p'),
+      config: {},
+      last_commit: pinned,
+      chunker_version: CURRENT,
+      projection_source_id: 'project-p',
+      projection_git_target: { commit: pinned, detached: false },
+    }], CURRENT);
+
+    expect(r.tokens).toBe(0);
+    expect(r.estimateKind).toBe('unchanged');
+    expect(r.unchangedSources).toBe(1);
+  });
 });

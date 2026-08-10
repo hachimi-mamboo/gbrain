@@ -42,11 +42,14 @@ import {
 } from '../core/destructive-guard.ts';
 import {
   addSource as opsAddSource,
+  assertSourceHardRemoveAllowed,
+  prepareClientSourceBinding,
   recloneIfMissing,
   SourceOpError,
   type SourceRow as OpsSourceRow,
 } from '../core/sources-ops.ts';
 import {
+  resolveClientSourcePath,
   resolveSourceWithTier,
   SOURCE_TIER_NAMES,
 } from '../core/source-resolver.ts';
@@ -377,6 +380,11 @@ async function runRemove(engine: BrainEngine, args: string[]): Promise<void> {
     process.exit(3);
   }
 
+  // A DB-only delete would be reversed by the next shared projection sync.
+  // Keep the CLI and the sources_remove operation on the same fail-closed
+  // ownership rule; archive remains available while this binding is active.
+  assertSourceHardRemoveAllowed(id);
+
   const src = await fetchSource(engine, id);
   if (!src) {
     console.error(`Source "${id}" not found.`);
@@ -580,6 +588,10 @@ async function runPurge(engine: BrainEngine, args: string[]): Promise<void> {
   const id = args[0];
   const confirmDestructive = args.includes('--confirm-destructive');
 
+  // Both the targeted and expired-row forms permanently delete source rows.
+  // Keep them under the same projection-ownership gate as `sources remove`.
+  assertSourceHardRemoveAllowed(id);
+
   if (id) {
     // Purge a specific source (must be archived)
     const impact = await assessDestructiveImpact(engine, id);
@@ -628,8 +640,10 @@ async function runListArchived(engine: BrainEngine, args: string[]): Promise<voi
   console.log('ARCHIVED SOURCES (soft-deleted)');
   console.log('───────────────────────────────');
   for (const a of archived) {
-    const hours = Math.max(0, Math.round((a.expiresAt.getTime() - Date.now()) / (1000 * 60 * 60)));
-    console.log(`  ${a.id.padEnd(20)}  ${String(a.pageCount).padStart(6)} pages  expires in ${hours}h  (restore: gbrain sources restore ${a.id})`);
+    const expiry = a.expiresAt
+      ? `expires in ${Math.max(0, Math.round((a.expiresAt.getTime() - Date.now()) / (1000 * 60 * 60)))}h`
+      : 'no automatic expiry';
+    console.log(`  ${a.id.padEnd(20)}  ${String(a.pageCount).padStart(6)} pages  ${expiry}  (restore: gbrain sources restore ${a.id})`);
   }
 }
 
@@ -753,7 +767,10 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   const json = args.includes('--json');
   const { loadAllSources } = await import('../core/sources-load.ts');
   const { computeAllSourceMetrics } = await import('../core/source-health.ts');
-  const sources = await loadAllSources(engine, { includeArchived: false });
+  const sources = (await loadAllSources(engine, { includeArchived: false })).map((source) => {
+    const clientPath = resolveClientSourcePath(source.id);
+    return clientPath ? { ...source, local_path: clientPath } : source;
+  });
   if (sources.length === 0) {
     if (json) {
       console.log(JSON.stringify({ schema_version: 1, sources: [] }, null, 2));
@@ -1319,6 +1336,28 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
   }
 }
 
+async function runPrepareClient(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args.find((arg) => !arg.startsWith('-'));
+  const json = args.includes('--json');
+  if (!id) {
+    console.error('Usage: gbrain sources prepare-client <id> [--json]');
+    process.exit(2);
+  }
+
+  const result = await prepareClientSourceBinding(engine, id);
+  if (json) {
+    console.log(JSON.stringify(result));
+    return;
+  }
+  console.log(
+    `Prepared client-local source "${id}": ` +
+    `source_path=${result.cleared_source_local_path ? 'cleared' : 'already-clear'}, ` +
+    `legacy_path=${result.cleared_legacy_repo_path ? 'cleared' : 'already-clear'}, ` +
+    `ingest_logs=${result.sanitized_ingest_log_count}, ` +
+    `jobs=${result.sanitized_job_ids.length} sanitized/${result.cancelled_job_ids.length} cancelled.`,
+  );
+}
+
 // ── Dispatcher ──────────────────────────────────────────────
 
 // v0.40.6.0: my duplicate `runStatus` (line ~895 pre-resolution) was
@@ -1349,6 +1388,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'purge':      return runPurge(engine, rest);
     case 'archived':   return runListArchived(engine, rest);
     case 'current':    return runCurrent(engine, rest);
+    case 'prepare-client': return runPrepareClient(engine, rest);
     // v0.40.5.0 Federated Sync v2 (master) + v0.40.6.0 status dashboard
     // The status function lives at the line-582 declaration (master's
     // source-health.ts-backed version). My duplicate runStatus (line ~895
@@ -1410,6 +1450,10 @@ Subcommands:
                                     brain_default/seed_default). Run this
                                     before destructive ops to verify you're
                                     targeting the brain you think you are.
+  prepare-client <id> [--json]      With matching GBRAIN_SOURCE and absolute
+                                    GBRAIN_SOURCE_PATH, idempotently retire
+                                    historical client paths from shared state
+                                    and invalidate queued path-bearing work.
   federate <id>                     Make source appear in cross-source default search.
   unfederate <id>                   Isolate source from default search.
   set-cr-mode <id> <none|title|per_chunk_synopsis>

@@ -8,6 +8,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -17,6 +18,7 @@ import { resetGateway } from '../src/core/ai/gateway.ts';
 import { writePageThrough } from '../src/core/write-through.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from '../src/core/markdown.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -45,10 +47,10 @@ afterEach(() => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-async function seedPage(slug: string): Promise<void> {
-  await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body ${slug}\n`, {
+async function seedPage(slug: string, sourceId: string = 'default'): Promise<void> {
+  await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body ${sourceId}:${slug}\n`, {
     noEmbed: true,
-    sourceId: 'default',
+    sourceId,
     sourcePath: `${slug}.md`,
   });
 }
@@ -67,6 +69,118 @@ function walkFiles(dir: string): string[] {
 }
 
 describe('writePageThrough', () => {
+  test('shared brain-repo binding separates source-qualified pages in one checkout', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    const slug = 'decisions/retention';
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('project-p', 'Project P', '{}'::jsonb)`,
+    );
+    await seedPage(slug, 'default');
+    await seedPage(slug, 'project-p');
+    await engine.setConfig('sync.repo_path', '');
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: brainDir,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        const defaultResult = await writePageThrough(engine, slug, { sourceId: 'default' });
+        const projectResult = await writePageThrough(engine, slug, { sourceId: 'project-p' });
+
+        const defaultPath = path.join(brainDir, 'decisions', 'retention.md');
+        const projectPath = path.join(
+          brainDir,
+          '.sources',
+          'project-p',
+          'decisions',
+          'retention.md',
+        );
+        expect(defaultResult).toMatchObject({ written: true, path: defaultPath });
+        expect(projectResult).toMatchObject({ written: true, path: projectPath });
+        expect(fs.existsSync(defaultPath)).toBe(true);
+        expect(fs.existsSync(projectPath)).toBe(true);
+        expect(fs.readFileSync(defaultPath, 'utf8')).toContain('# Body default:decisions/retention');
+        expect(fs.readFileSync(projectPath, 'utf8')).toContain('# Body project-p:decisions/retention');
+      },
+    );
+  });
+
+  test('shared brain-repo write refuses a symlink escape into a sibling source projection', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES
+        ('project-p', 'Project P', '{}'::jsonb),
+        ('project-q', 'Project Q', '{}'::jsonb)`,
+    );
+    const projectPDir = path.join(brainDir, '.sources', 'project-p');
+    const projectQDir = path.join(brainDir, '.sources', 'project-q');
+    fs.mkdirSync(projectPDir, { recursive: true });
+    fs.mkdirSync(projectQDir, { recursive: true });
+    fs.symlinkSync(
+      projectQDir,
+      path.join(projectPDir, 'alias'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    await seedPage('alias/leak', 'project-p');
+    await engine.setConfig('sync.repo_path', '');
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: brainDir,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        const result = await writePageThrough(engine, 'alias/leak', {
+          sourceId: 'project-p',
+        });
+
+        expect(result).toEqual({
+          written: false,
+          skipped: 'path_escapes_source_root',
+        });
+        expect(fs.existsSync(path.join(projectQDir, 'leak.md'))).toBe(false);
+      },
+    );
+  });
+
+  test('shared default-source write refuses a symlink into a reserved source projection', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('project-q', 'Project Q', '{}'::jsonb)`,
+    );
+    const projectQDir = path.join(brainDir, '.sources', 'project-q');
+    fs.mkdirSync(projectQDir, { recursive: true });
+    fs.symlinkSync(
+      projectQDir,
+      path.join(brainDir, 'alias'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    await seedPage('alias/leak', 'default');
+    await engine.setConfig('sync.repo_path', '');
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: brainDir,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        const result = await writePageThrough(engine, 'alias/leak', {
+          sourceId: 'default',
+        });
+
+        expect(result).toEqual({
+          written: false,
+          skipped: 'path_escapes_source_root',
+        });
+        expect(fs.existsSync(path.join(projectQDir, 'leak.md'))).toBe(false);
+      },
+    );
+  });
+
   test('writes the file rendered from the saved row; no .tmp leftover', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const slug = 'wiki/ideas/2026-01-01-lsd-foo-abc123';

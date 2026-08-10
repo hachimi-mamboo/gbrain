@@ -895,6 +895,30 @@ const put_page: Operation = {
 
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug };
 
+    // A client-local source binding owns its checkout only in this process.
+    // Validate the shared remote identity and retire any historical shared
+    // paths before importFromContent can persist the page. This must fail
+    // closed here; writePageThrough is intentionally best-effort and runs
+    // after the DB write.
+    const sourceId = ctx.sourceId ?? 'default';
+    const { resolveClientBrainRepoPath, resolveClientSourcePath } = await import('./source-resolver.ts');
+    const sharedBrainRepoPath = resolveClientBrainRepoPath();
+    const clientSourcePath = resolveClientSourcePath(sourceId);
+    if (sharedBrainRepoPath) {
+      const { toRepoRelativeSourcePath } = await import('./brain-repo-layout.ts');
+      // Validate the source-qualified physical mapping before the DB write.
+      // Hidden/reserved logical roots (notably `.sources`) are not bijective
+      // with the shared projection layout and must fail closed.
+      toRepoRelativeSourcePath(`${slug}.md`, sourceId);
+    }
+    if (clientSourcePath) {
+      const { prepareClientSourceBinding } = await import('./sources-ops.ts');
+      await prepareClientSourceBinding(ctx.engine, sourceId);
+    } else if (sharedBrainRepoPath) {
+      const { prepareClientBrainRepoBinding } = await import('./sources-ops.ts');
+      await prepareClientBrainRepoBinding(ctx.engine, sourceId);
+    }
+
     // Empty-overwrite guard: empty/whitespace-only content over an existing
     // non-empty page is almost always an input-plumbing failure (e.g. a
     // caller that meant file input — put has no --file flag — so the missing
@@ -1015,7 +1039,6 @@ const put_page: Operation = {
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
     if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
-      const sourceId = ctx.sourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
       // --save`). Renders the file from the saved DB row and writes it
@@ -2745,6 +2768,7 @@ const sync_brain: Operation = {
     const { performSync } = await import('../commands/sync.ts');
     return performSync(ctx.engine, {
       repoPath: p.repo as string | undefined,
+      sourceId: ctx.sourceId,
       dryRun: ctx.dryRun || (p.dry_run as boolean) || false,
       noEmbed: (p.no_embed as boolean) || false,
       noPull: (p.no_pull as boolean) || false,
@@ -2837,12 +2861,39 @@ const log_ingest: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'log_ingest' };
+    const sourceId = ctx.sourceId ?? 'default';
+    const boundSourceId = process.env.GBRAIN_SOURCE;
+    const { resolveClientBrainRepoPath, resolveClientSourcePath } =
+      await import('./source-resolver.ts');
+    const sharedBrainRepoPath = resolveClientBrainRepoPath();
+    if (sharedBrainRepoPath) {
+      const { prepareClientBrainRepoBinding } = await import('./sources-ops.ts');
+      await prepareClientBrainRepoBinding(ctx.engine, sourceId);
+    } else if (
+      boundSourceId &&
+      process.env.GBRAIN_SOURCE_PATH &&
+      resolveClientSourcePath(boundSourceId)
+    ) {
+      const { prepareClientSourceBindingForStructuredWrite } =
+        await import('./sources-ops.ts');
+      await prepareClientSourceBindingForStructuredWrite(
+        ctx.engine,
+        boundSourceId,
+        {
+          source_type: p.source_type,
+          source_ref: p.source_ref,
+          pages_updated: p.pages_updated,
+          summary: p.summary,
+        },
+        'ingest log fields',
+      );
+    }
     await ctx.engine.logIngest({
       // Thread ctx.sourceId (same pattern as get_chunks/get_page above): on a
       // multi-source brain the ingest event must be attributed to the caller's
       // source, not the shared 'default' bucket. Absent sourceId still falls to
       // the engine's 'default' (single-source brains unchanged).
-      ...(ctx.sourceId ? { source_id: ctx.sourceId } : {}),
+      source_id: sourceId,
       source_type: p.source_type as string,
       source_ref: p.source_ref as string,
       pages_updated: p.pages_updated as string[],
@@ -4095,6 +4146,36 @@ const sources_status: Operation = {
     return getSourceStatus(ctx.engine, p.id as string);
   },
   cliHints: { name: 'sources_status', hidden: true },
+};
+
+const sources_prepare_client: Operation = {
+  name: 'sources_prepare_client',
+  description:
+    'Local-only client-binding entry seam. Uses either matching GBRAIN_SOURCE plus ' +
+    'absolute GBRAIN_SOURCE_PATH or the independent absolute GBRAIN_BRAIN_REPO_PATH, then ' +
+    'idempotently retires historical client paths from shared source/config/' +
+    'ingest/job state without changing source identity, commit, or bookmarks.',
+  params: {
+    id: {
+      type: 'string',
+      required: true,
+      description: 'Existing logical source id entering a client-local checkout binding.',
+    },
+  },
+  mutating: true,
+  scope: 'sources_admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'sources_prepare_client', source_id: p.id };
+    }
+    const { resolveClientBrainRepoPath } = await import('./source-resolver.ts');
+    const { prepareClientBrainRepoBinding, prepareClientSourceBinding } = await import('./sources-ops.ts');
+    return resolveClientBrainRepoPath()
+      ? prepareClientBrainRepoBinding(ctx.engine, p.id as string)
+      : prepareClientSourceBinding(ctx.engine, p.id as string);
+  },
+  cliHints: { name: 'sources_prepare_client', hidden: true },
 };
 
 // ============================================================
@@ -5634,7 +5715,7 @@ export const operations: Operation[] = [
   // v0.30: calibration aggregates over takes
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
-  whoami, sources_add, sources_list, sources_remove, sources_status,
+  whoami, sources_add, sources_list, sources_remove, sources_status, sources_prepare_client,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.42.x (#2390): Life Chronicle timeline reads

@@ -25,6 +25,12 @@ import {
   logBatchRetry as auditLogBatchRetry,
   logBatchExhausted as auditLogBatchExhausted,
 } from '../audit/batch-retry-audit.ts';
+import {
+  resolveClientBrainRepoPath,
+  resolveClientSourcePath,
+} from '../source-resolver.ts';
+import { ClientLocalStructuredPathError } from '../client-local-path.ts';
+import { assertClientBoundStructuredWrite } from '../client-local-write.ts';
 
 /** Options for opting into protected-job-name submission. Passed as a separate
  *  4th arg to `MinionQueue.add()` (NOT folded into `opts`) so user-spread
@@ -49,6 +55,44 @@ export class MinionQueue {
   constructor(private engine: BrainEngine, opts: MinionQueueOpts = {}) {
     this.maxSpawnDepth = opts.maxSpawnDepth ?? DEFAULT_MAX_SPAWN_DEPTH;
     this.maxAttachmentBytes = opts.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES;
+  }
+
+  private async guardClientBoundStructuredWrite(
+    value: unknown,
+    fieldLabel: string,
+  ): Promise<void> {
+    if (resolveClientBrainRepoPath()) {
+      await assertClientBoundStructuredWrite(
+        this.engine,
+        value,
+        fieldLabel,
+      );
+      return;
+    }
+    const sourceId = process.env.GBRAIN_SOURCE;
+    if (!sourceId || !process.env.GBRAIN_SOURCE_PATH) return;
+    if (!resolveClientSourcePath(sourceId)) return;
+    const { prepareClientSourceBindingForStructuredWrite } =
+      await import('../sources-ops.ts');
+    await prepareClientSourceBindingForStructuredWrite(
+      this.engine,
+      sourceId,
+      value,
+      fieldLabel,
+    );
+  }
+
+  private async sanitizeClientBoundError(
+    value: string,
+    fieldLabel: string,
+  ): Promise<string> {
+    try {
+      await this.guardClientBoundStructuredWrite(value, fieldLabel);
+      return value;
+    } catch (error) {
+      if (!(error instanceof ClientLocalStructuredPathError)) throw error;
+      return `client-local source binding omitted path-bearing ${fieldLabel}`;
+    }
   }
 
   /** Verify minion_jobs table exists (migration v5+). Call before first operation. */
@@ -93,6 +137,14 @@ export class MinionQueue {
         `(pass {allowProtectedSubmit: true} as the 4th arg to MinionQueue.add)`,
       );
     }
+    await this.guardClientBoundStructuredWrite(
+      {
+        name: jobName,
+        data: data ?? {},
+        options: opts ?? {},
+      },
+      'queued work. Queue stable source identity/commit only, or run the filesystem operation inline',
+    );
     // v0.38 (S1.7 + D6) — capability-based gate replaces the v0.31.12 Anthropic
     // pin. The subagent loop now routes through `gateway.toolLoop()` so any
     // provider with native tool calling works. Only refuse-at-submit when
@@ -854,6 +906,7 @@ export class MinionQueue {
    * stranding the parent in waiting-children forever.
    */
   async completeJob(id: number, lockToken: string, result?: Record<string, unknown>): Promise<MinionJob | null> {
+    await this.guardClientBoundStructuredWrite(result, 'queued result');
     return this.engine.transaction(async (tx) => {
       // Peek at parent_job_id before the UPDATE so we can lock the parent row
       // FIRST. Without this SELECT FOR UPDATE, two siblings completing
@@ -968,6 +1021,10 @@ export class MinionQueue {
     newStatus: 'delayed' | 'failed' | 'dead',
     backoffMs?: number
   ): Promise<MinionJob | null> {
+    const safeErrorText = await this.sanitizeClientBoundError(
+      errorText,
+      'queued error',
+    );
     return this.engine.transaction(async (tx) => {
       // Lock the parent row first so concurrent sibling completions/failures
       // serialize on the parent — same race fix as completeJob.
@@ -992,7 +1049,7 @@ export class MinionQueue {
           lock_token = NULL, lock_until = NULL, updated_at = now()
          WHERE id = $5 AND status = 'active' AND lock_token = $6
          RETURNING *`,
-        [newStatus, errorText, errorText, backoffMs ?? 0, id, lockToken]
+        [newStatus, safeErrorText, safeErrorText, backoffMs ?? 0, id, lockToken]
       );
       if (rows.length === 0) return null;
 
@@ -1012,7 +1069,7 @@ export class MinionQueue {
           job_name: failed.name,
           result: null,
           outcome: newStatus === 'dead' ? 'dead' : 'failed',
-          error: errorText,
+          error: safeErrorText,
         };
         await tx.executeRaw(
           `INSERT INTO minion_inbox (job_id, sender, payload)
@@ -1029,7 +1086,7 @@ export class MinionQueue {
             `UPDATE minion_jobs SET status = 'failed',
               error_text = $1, finished_at = now(), updated_at = now()
              WHERE id = $2 AND status = 'waiting-children'`,
-            [`child job ${failed.id} failed: ${errorText}`, failed.parent_job_id]
+            [`child job ${failed.id} failed: ${safeErrorText}`, failed.parent_job_id]
           );
         } else if (failed.on_child_fail === 'remove_dep') {
           await tx.executeRaw(
@@ -1111,6 +1168,10 @@ export class MinionQueue {
     errorText: string,
     backoffMs: number,
   ): Promise<MinionJob | null> {
+    const safeErrorText = await this.sanitizeClientBoundError(
+      errorText,
+      'queued error',
+    );
     const rows = await this.engine.executeRaw<Record<string, unknown>>(
       `UPDATE minion_jobs SET
         status = 'delayed',
@@ -1120,7 +1181,7 @@ export class MinionQueue {
         lock_token = NULL, lock_until = NULL, updated_at = now()
        WHERE id = $3 AND status = 'active' AND lock_token = $4
        RETURNING *`,
-      [errorText, backoffMs, id, lockToken],
+      [safeErrorText, backoffMs, id, lockToken],
     );
     if (rows.length === 0) return null;
     return rowToMinionJob(rows[0]);
@@ -1128,11 +1189,33 @@ export class MinionQueue {
 
   /** Update job progress (token-fenced). */
   async updateProgress(id: number, lockToken: string, progress: unknown): Promise<boolean> {
+    await this.guardClientBoundStructuredWrite(progress, 'queued progress');
     const rows = await this.engine.executeRaw<Record<string, unknown>>(
       `UPDATE minion_jobs SET progress = $1::jsonb, updated_at = now()
        WHERE id = $2 AND status = 'active' AND lock_token = $3
        RETURNING id`,
       [progress, id, lockToken]
+    );
+    return rows.length > 0;
+  }
+
+  /** Append one token-fenced worker log entry through the structured-write guard. */
+  async appendLog(
+    id: number,
+    lockToken: string,
+    message: string | Record<string, unknown>,
+  ): Promise<boolean> {
+    await this.guardClientBoundStructuredWrite(message, 'queued worker log');
+    const value = typeof message === 'string'
+      ? message
+      : JSON.stringify(message);
+    const rows = await this.engine.executeRaw<Record<string, unknown>>(
+      `UPDATE minion_jobs
+          SET stacktrace = COALESCE(stacktrace, '[]'::jsonb) || to_jsonb($1::text),
+              updated_at = now()
+        WHERE id = $2 AND status = 'active' AND lock_token = $3
+        RETURNING id`,
+      [value, id, lockToken],
     );
     return rows.length > 0;
   }
@@ -1261,12 +1344,16 @@ export class MinionQueue {
 
   /** Fail the parent when a child fails with fail_parent policy. */
   async failParent(parentId: number, childId: number, errorText: string): Promise<MinionJob | null> {
+    const safeErrorText = await this.sanitizeClientBoundError(
+      errorText,
+      'queued parent error',
+    );
     const rows = await this.engine.executeRaw<Record<string, unknown>>(
       `UPDATE minion_jobs SET status = 'failed',
         error_text = $1, finished_at = now(), updated_at = now()
        WHERE id = $2 AND status = 'waiting-children'
        RETURNING *`,
-      [`child job ${childId} failed: ${errorText}`, parentId]
+      [`child job ${childId} failed: ${safeErrorText}`, parentId]
     );
     return rows.length > 0 ? rowToMinionJob(rows[0]) : null;
   }
@@ -1308,6 +1395,10 @@ export class MinionQueue {
       return null;
     }
 
+    await this.guardClientBoundStructuredWrite(
+      { sender, payload },
+      'queued inbox payload',
+    );
     const rows = await this.engine.executeRaw<Record<string, unknown>>(
       `INSERT INTO minion_inbox (job_id, sender, payload)
        VALUES ($1, $2, $3)

@@ -67,6 +67,7 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from './search/embedding-column.ts';
 import { hasCJK, escapeLikePattern } from './cjk.ts';
+import { assertClientBoundStructuredWrite } from './client-local-write.ts';
 
 type PGLiteDB = PGlite;
 
@@ -1011,6 +1012,18 @@ export class PGLiteEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
     const sourceId = opts?.sourceId ?? 'default';
+    if (page.source_kind || page.source_uri || page.ingested_via) {
+      await assertClientBoundStructuredWrite(
+        this,
+        {
+          source_kind: page.source_kind,
+          source_uri: page.source_uri,
+          ingested_via: page.ingested_via,
+        },
+        'page provenance fields',
+        sourceId,
+      );
+    }
 
     // v0.18.0 Step 5+: source_id is now in the INSERT column list so multi-
     // source callers land on the intended (source_id, slug) row. Omitting it
@@ -5388,6 +5401,12 @@ export class PGLiteEngine implements BrainEngine {
     // v0.31.2 (codex P1 #3): source_id threaded so multi-source brains can
     // scope ingest_log queries. Default 'default' matches the column DEFAULT.
     const sourceId = entry.source_id ?? 'default';
+    await assertClientBoundStructuredWrite(
+      this,
+      entry,
+      'ingest log fields',
+      sourceId,
+    );
     await this.db.query(
       `INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
        VALUES ($1, $2, $3, $4::jsonb, $5)`,

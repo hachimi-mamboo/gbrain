@@ -95,6 +95,139 @@ So inside `~/.gstack/plans/` on a brain that pinned `gstack` to
 the `gstack` source. Outside any registered directory with no env/dotfile
 set, it writes to the default.
 
+## Client-local checkout binding
+
+Clients that share one database and Git remote can keep the same source
+identity while cloning it to different local paths. Set both variables for
+the process running a single-source operation:
+
+```bash
+export GBRAIN_SOURCE=wiki
+export GBRAIN_SOURCE_PATH=/absolute/path/to/this-client/brain-wiki
+```
+
+`GBRAIN_SOURCE_PATH` applies only to the matching `GBRAIN_SOURCE`. It is
+process-local, must be absolute, and never persists or overwrites the shared
+`sources.local_path`. For a single-source operation, an explicit `--repo`
+checkout wins over the matching client binding, which wins over the shared
+source or legacy path. It is not applied to `--all` operations.
+
+`gbrain sync trigger` refuses a matching client-local binding because its
+queued worker cannot inherit process-local state without persisting the path.
+Run `gbrain sync --source <id>` inline in that client instead.
+
+### One client-local checkout for every active source
+
+When one private brain repo is the Git projection for the whole database, bind
+that checkout independently of source selection:
+
+```bash
+export GBRAIN_BRAIN_REPO_PATH=/absolute/path/to/this-client/brain-repo
+unset GBRAIN_SOURCE_PATH
+
+# Restore or reconcile every source represented by the checkout.
+gbrain sync --all --no-embed
+```
+
+`GBRAIN_BRAIN_REPO_PATH` is process-local and must be an absolute path naming
+the Git checkout root. A repo subdirectory is rejected. Within `gbrain sync`,
+this binding supports only the whole-brain `sync --all` path:
+
+| Input | Shared-checkout contract |
+|---|---|
+| No `--all` | Rejected; the binding is a whole-brain projection. |
+| `GBRAIN_SOURCE_PATH` | Rejected; choose shared-checkout or single-source mode. |
+| `--repo` | Rejected; the environment binding already names the checkout. |
+| `--source` | Rejected; source identity comes from the projection layout. |
+| `--src-subpath` | Rejected; monorepo subpath sync is a separate, non-shared mode. |
+| `--watch` | Rejected; run explicit `sync --all` cycles. |
+| `--timeout` | Rejected; one checkout-level pull covers the whole run. |
+
+The physical layout is stable and source-qualified:
+
+| Logical identity | Git path |
+|---|---|
+| `(default, <slug>)` | `<repo>/<slug>.md` |
+| `(<source-id>, <slug>)` | `<repo>/.sources/<source-id>/<slug>.md` |
+| Non-default source identity | `<repo>/.sources/<source-id>/.gbrain-source`, one `<source-id>` line |
+
+`.sources/` is a Git projection detail, never part of a page slug. The `default`
+source owns the repository root. A root `.gbrain-source` is optional, but when
+present it must be a regular file containing exactly `default` followed by one
+LF or CRLF line ending. Non-default markers follow the same read contract with
+their directory's source ID; GBrain always writes LF. Every active non-default
+source's durable form includes its tracked marker. That marker keeps an
+otherwise-empty source directory in Git and lets a fresh clone recover the
+source identity before any page exists.
+
+Do not delete or edit managed markers, and do not replace `.sources/`, a source
+directory, or a marker with a symlink. Discovery fails closed on invalid source
+ids, escaping directories, symlinks, and marker content that does not exactly
+match its directory id. On an admitted live run, `sync --all` discovers direct
+source directories, registers missing identities with `local_path=NULL`, and
+restores the original `source_id` and source-relative slug. Full and incremental
+sync use the same mapping for adds, modifications, deletes, and renames.
+
+On a fresh database, this Git projection restores active page content and source
+IDs only. It does not restore source-catalog metadata such as display names,
+federation/config values, archive state, or archive expiry. Migrate or restore
+that DB/operator metadata separately when it matters.
+
+Archived DB rows are not active sync sources. Shared `sync --all` does not
+import their projection, update their sync bookmark, or create their marker,
+even if an old `.sources/<id>/` directory remains in the checkout. Archive state
+is DB-only: on a fresh database, that old directory is discoverable as an active
+source unless the operator also retired it from Git or restored the catalog.
+While the binding is active, explicit permanent purge is rejected and automatic
+expired-source purge retains the archived row. More importantly, an archive
+created with this binding stores `archive_expires_at=NULL`, so an independent
+maintenance process without the environment binding cannot auto-purge it after
+72 hours. After checkout, layout, pull, and cost admission have succeeded, a
+non-dry-run shared sync also upgrades every older archived row with a TTL to
+this NULL no-auto-expiry state. A bound purge pass defensively upgrades any
+expired row that still reaches it instead of deleting it. Neither a failed
+admission nor `--dry-run` performs that DB migration. This is not a
+database-wide topology flag: an explicit destructive remove/purge from an
+unbound operator process can still delete the row, after which shared sync can
+rediscover its still-present projection as active.
+
+`gbrain sources remove <id>` fails closed while `GBRAIN_BRAIN_REPO_PATH` is
+active because a DB-only delete would be reversed by projection discovery;
+`gbrain sources purge` uses the same guard. Use `gbrain sources archive <id>`
+for temporary reversible retirement while that archived DB row is retained.
+Permanent retirement is an operator workflow: stop shared sync, remove
+`.sources/<id>/`, commit and push that Git change, then unset
+`GBRAIN_BRAIN_REPO_PATH` before hard-removing the DB row.
+
+The entire checkout is one sync coordination boundary: GBrain takes the
+cross-process repo-level `gbrain-sync:brain-repo` lock, processes its logical
+sources serially, and performs one pull before discovery when an origin exists.
+That DB lock serializes shared sync waves only; it is not a universal Git-writer
+lock for write-through, `sources pull`, `sources harden`, DB-free cron jobs, or
+operator Git commands.
+Without `--no-pull`, uncommitted changes fail the run before DB cleanup or
+source registration. `--no-pull` only skips the remote update and can let a
+dirty checkout proceed; incremental change detection still follows committed
+Git history. It neither turns uncommitted files into a new sync anchor nor
+claims that the checkout is current with the remote.
+
+Use the shared hardening command to make the projection format durable:
+
+```bash
+gbrain sources harden --all
+```
+
+This is the formal path that creates or validates markers for every active
+non-default source, tracks them, commits them, and pushes the shared checkout.
+A live sync may materialize a missing marker after admission, but an unhardened
+local marker is not yet a fresh-clone recovery guarantee.
+
+Shared dry-runs are read-only. Neither `gbrain sync --all --dry-run` nor
+`gbrain sources harden --all --dry-run` registers sources, runs client-path
+cleanup, creates projection directories or markers, or changes Git history.
+Ordinary `sources add --path`, `GBRAIN_SOURCE_PATH`, and monorepo
+`--src-subpath` deployments keep their existing non-shared behavior.
+
 ## Federation flag
 
 Every source row stores `config.federated: boolean` in its JSONB config.

@@ -12,6 +12,8 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { runSources } from '../src/commands/sources.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { SourceOpError } from '../src/core/sources-ops.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 // ── Stub engine that records queries ───────────────────────
 
@@ -235,6 +237,31 @@ describe('sources list', () => {
 // ── remove ──────────────────────────────────────────────────
 
 describe('sources remove', () => {
+  test('shared brain-repo binding rejects CLI hard removal before DB teardown', async () => {
+    const { engine, calls } = makeStub();
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: join(tmpdir(), 'brain-repo'),
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        try {
+          await runSources(engine, ['remove', 'gstack', '--yes']);
+          throw new Error('expected throw');
+        } catch (e) {
+          expect(e).toBeInstanceOf(SourceOpError);
+          expect((e as SourceOpError).code).toBe('unmanaged_path');
+          expect((e as SourceOpError).message).toContain(
+            'gbrain sources archive gstack',
+          );
+        }
+      },
+    );
+
+    expect(calls).toEqual([]);
+  });
+
   test("refuses to remove the 'default' source", async () => {
     const { engine } = makeStub();
     const code = await withExitCapture(() => runSources(engine, ['remove', 'default', '--yes']));
@@ -262,6 +289,37 @@ describe('sources remove', () => {
     await runSources(engine, ['remove', 'gstack', '--dry-run']);
     const del = calls.find(c => c.sql.startsWith('DELETE FROM sources'));
     expect(del).toBeUndefined();
+  });
+});
+
+describe('sources purge', () => {
+  test('shared brain-repo binding rejects explicit permanent purge before DB teardown', async () => {
+    const { engine, calls } = makeStub();
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: join(tmpdir(), 'brain-repo'),
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        try {
+          await runSources(engine, [
+            'purge',
+            'gstack',
+            '--confirm-destructive',
+          ]);
+          throw new Error('expected throw');
+        } catch (e) {
+          expect(e).toBeInstanceOf(SourceOpError);
+          expect((e as SourceOpError).code).toBe('unmanaged_path');
+          expect((e as SourceOpError).message).toContain(
+            'commit and push',
+          );
+        }
+      },
+    );
+
+    expect(calls).toEqual([]);
   });
 });
 

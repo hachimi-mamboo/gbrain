@@ -40,6 +40,10 @@ import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
 import { resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
+import {
+  resolveClientSourcePath,
+  resolveSourceWithTier,
+} from '../core/source-resolver.ts';
 
 /**
  * v0.37.7.0 #1162 — classify autopilot reconnect-loop errors.
@@ -385,7 +389,21 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     return;
   }
 
-  const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
+  let clientLocalPath: string | null = null;
+  let clientLocalSourceId: string | null = null;
+  if (process.env.GBRAIN_SOURCE_PATH) {
+    const resolved = await resolveSourceWithTier(engine, null);
+    clientLocalSourceId = resolved.source_id;
+    clientLocalPath = resolveClientSourcePath(resolved.source_id);
+    if (clientLocalPath) {
+      const { prepareClientSourceBinding } = await import('../core/sources-ops.ts');
+      await prepareClientSourceBinding(engine, resolved.source_id);
+    }
+  }
+  const repoPath =
+    parseArg(args, '--repo') ||
+    clientLocalPath ||
+    await engine.getConfig('sync.repo_path');
   const baseInterval = parseInt(parseArg(args, '--interval') || '300', 10);
   const jsonMode = args.includes('--json');
   const forceInline = args.includes('--inline');
@@ -426,6 +444,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   const engineType = cfg?.engine ?? 'pglite';
   const useMinionsDispatch = mode !== 'off' && engineType === 'postgres' && !forceInline;
   const spawnManagedWorker = useMinionsDispatch && !noWorker;
+  if (useMinionsDispatch && clientLocalPath) {
+    console.error(
+      `Client-local source "${clientLocalSourceId}" cannot dispatch filesystem work to a queued worker, ` +
+      `because GBRAIN_SOURCE_PATH is process-local. Run: gbrain autopilot --inline`,
+    );
+    process.exit(2);
+  }
 
   // v0.42 self-upgrade: if a prior tick swapped the binary and exited for
   // relaunch, we're now the relaunched process — reconcile the breadcrumb so a
@@ -753,7 +778,6 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                   'sync',
                   {
                     sourceId: src.id,
-                    repoPath: src.local_path,
                     auto_embed_backfill: true,
                     embed_reason: 'autopilot_freshness',
                   },

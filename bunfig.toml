@@ -18,4 +18,6 @@ timeout = 60_000
 # runs, so audit-emitting code paths (content-sanity, shell-audit, etc.)
 # can't leak fixture events into the operator's real ~/.gbrain/audit/. See
 # test/helpers/audit-dir-preload.ts for the full rationale.
-preload = ["./test/helpers/legacy-embedding-preload.ts", "./test/helpers/audit-dir-preload.ts"]
+# Client bindings are cleared first so no subsequently loaded preload or test
+# module can observe a developer's live checkout paths by accident.
+preload = ["./test/helpers/client-binding-preload.ts", "./test/helpers/legacy-embedding-preload.ts", "./test/helpers/audit-dir-preload.ts"]

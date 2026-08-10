@@ -46,6 +46,18 @@ import {
   type IngestionEvent,
 } from '../core/ingestion/types.ts';
 import { resolveOwnerHolder } from '../core/owner-holder.ts';
+import {
+  allowFullMcpAuditParams,
+  sanitizeClientLocalMcpAuditFields,
+  type ClientLocalMcpAuditFields,
+} from '../core/mcp-audit.ts';
+export {
+  allowFullMcpAuditParams,
+  redactClientLocalMcpAuditError,
+  redactClientLocalMcpAuditOperation,
+  sanitizeClientLocalMcpAuditFields,
+} from '../core/mcp-audit.ts';
+export type { ClientLocalMcpAuditFields } from '../core/mcp-audit.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -320,7 +332,9 @@ interface ServeHttpOptions {
    *
    * Operators running gbrain on their own laptop and debugging agent behavior
    * can flip this on with `--log-full-params`. The flag prints a loud warning
-   * at startup so the privacy posture change is visible.
+   * at startup so the privacy posture change is visible. An active
+   * client-local source binding overrides this opt-in and keeps both the
+   * shared audit row and SSE event summarized.
    */
   logFullParams?: boolean;
   /**
@@ -479,6 +493,7 @@ export async function embeddingWidthStartupWarning(engine: BrainEngine): Promise
 
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
+  const effectiveLogFullParams = allowFullMcpAuditParams(logFullParams);
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
   // gbrain's primary use case is a personal-knowledge brain on a laptop;
   // the pre-v0.34 default exposed brains on every interface. Server
@@ -489,9 +504,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   const bind = options.bind ?? '127.0.0.1';
   const config = loadConfig() || { engine: 'pglite' as const };
 
-  if (logFullParams) {
+  if (logFullParams && effectiveLogFullParams) {
     console.error(
       '[serve-http] WARNING: --log-full-params writes raw request payloads to mcp_request_log + SSE feed. Disable for shared dashboards or production.',
+    );
+  } else if (logFullParams) {
+    console.error(
+      '[serve-http] --log-full-params ignored while a client-local source binding is active; audit payloads remain summarized.',
     );
   }
 
@@ -632,6 +651,33 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     for (const client of sseClients) {
       try { client.write(data); } catch { sseClients.delete(client); }
     }
+  }
+
+  async function writeMcpRequestAudit(
+    fields: ClientLocalMcpAuditFields,
+    latencyMs: number,
+    status: 'success' | 'error',
+  ): Promise<ClientLocalMcpAuditFields> {
+    const safeFields = sanitizeClientLocalMcpAuditFields(fields);
+    try {
+      await executeRawJsonb(
+        engine,
+        `INSERT INTO mcp_request_log (
+           token_name, agent_name, operation, latency_ms, status,
+           error_message, params
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [
+          safeFields.tokenName,
+          safeFields.agentName,
+          safeFields.operation,
+          latencyMs,
+          status,
+          safeFields.errorMessage,
+        ],
+        [safeFields.params],
+      );
+    } catch { /* best effort */ }
+    return safeFields;
   }
 
   // Express 5 app
@@ -1726,18 +1772,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // ever called tools/list, and the v0.26.3 persistence regression test
       // asserting >= 2 rows after tools/list + tools/call was unreachable.
       const latency = Date.now() - startTime;
-      try {
-        await executeRawJsonb(
-          engine,
-          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
-          [null],
-        );
-      } catch { /* best effort */ }
-      broadcastEvent({
-        agent: agentName,
+      const auditFields = await writeMcpRequestAudit({
+        tokenName: authInfo.clientId,
+        agentName,
         operation: 'tools/list',
+        params: null,
+        errorMessage: null,
+      }, latency, 'success');
+      broadcastEvent({
+        agent: auditFields.agentName,
+        operation: auditFields.operation,
         scopes: authInfo.scopes.join(','),
         latency_ms: latency,
         status: 'success',
@@ -1766,22 +1810,27 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // misbehaving agents need to see the full attempt log, not just
         // valid-op success/error.
         const latency = Date.now() - startTime;
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`],
-            [null],
-          );
-        } catch { /* best effort */ }
-        broadcastEvent({
-          agent: agentName,
+        const auditFields = await writeMcpRequestAudit({
+          tokenName: authInfo.clientId,
+          agentName,
           operation: name,
+          params: null,
+          errorMessage: `unknown_operation: ${name}`,
+        }, latency, 'error');
+        const broadcastFields = sanitizeClientLocalMcpAuditFields({
+          ...auditFields,
+          errorMessage: `Unknown: ${name}`,
+        });
+        broadcastEvent({
+          agent: broadcastFields.agentName,
+          operation: broadcastFields.operation,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'error',
-          error: { code: 'unknown_operation', message: `Unknown: ${name}` },
+          error: {
+            code: 'unknown_operation',
+            message: broadcastFields.errorMessage,
+          },
           timestamp: new Date().toISOString(),
         });
         return { content: [{ type: 'text', text: JSON.stringify({ error: 'unknown_operation', message: `Unknown: ${name}` }) }], isError: true };
@@ -1798,22 +1847,24 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // motivation as the unknown-op path — and it makes the v0.26.3
         // persistence regression test reliable across both rejection paths.
         const latency = Date.now() - startTime;
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
-            [null],
-          );
-        } catch { /* best effort */ }
-        broadcastEvent({
-          agent: agentName,
+        const auditFields = await writeMcpRequestAudit({
+          tokenName: authInfo.clientId,
+          agentName,
           operation: name,
+          params: null,
+          errorMessage: `insufficient_scope: requires '${requiredScope}'`,
+        }, latency, 'error');
+        const broadcastFields = sanitizeClientLocalMcpAuditFields({
+          ...auditFields,
+          errorMessage: `requires '${requiredScope}'`,
+        });
+        broadcastEvent({
+          agent: broadcastFields.agentName,
+          operation: broadcastFields.operation,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'error',
-          error: { code: 'insufficient_scope', message: `requires '${requiredScope}'` },
+          error: { code: 'insufficient_scope', message: broadcastFields.errorMessage },
           timestamp: new Date().toISOString(),
         });
         return {
@@ -1844,10 +1895,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // 'tools/list'. Pre-existing string-shaped rows are normalized by
       // migration v41 in src/core/migrate.ts.
       const safeParamsSummary = summarizeMcpParams(name, params);
-      const logParamsObj: unknown = logFullParams
+      const logParamsObj: unknown = effectiveLogFullParams
         ? (params || null)
         : (safeParamsSummary || null);
-      const broadcastParams = logFullParams ? (params || {}) : safeParamsSummary;
+      const broadcastParams = effectiveLogFullParams
+        ? (params || {})
+        : safeParamsSummary;
 
       // v0.31 (D12 / eE1): refactor the inlined op.handler call to go through
       // src/mcp/dispatch.ts so HTTP MCP shares the same dispatch path as
@@ -1894,23 +1947,25 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // real object, not a JSON-encoded string.
         const latency = Date.now() - startTime;
         const errorPayload = serializeError(e);
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message],
-            [logParamsObj],
-          );
-        } catch { /* best effort */ }
-        broadcastEvent({
-          agent: agentName,
+        const auditFields = await writeMcpRequestAudit({
+          tokenName: authInfo.clientId,
+          agentName,
           operation: name,
+          params: logParamsObj,
+          errorMessage: errorPayload.message,
+        }, latency, 'error');
+        const broadcastFields = sanitizeClientLocalMcpAuditFields({
+          ...auditFields,
           params: broadcastParams,
+        });
+        broadcastEvent({
+          agent: broadcastFields.agentName,
+          operation: broadcastFields.operation,
+          params: broadcastFields.params,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'error',
-          error: errorPayload,
+          error: { ...errorPayload, message: broadcastFields.errorMessage },
           timestamp: new Date().toISOString(),
         });
         return { content: [{ type: 'text', text: JSON.stringify({ error: errorPayload }) }], isError: true };
@@ -1926,41 +1981,45 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           const parsed = JSON.parse(toolResult.content[0]?.text ?? '{}');
           errMsg = parsed.error?.message ?? parsed.message ?? errMsg;
         } catch { /* ignore */ }
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errMsg],
-            [logParamsObj],
-          );
-        } catch { /* best effort */ }
-        broadcastEvent({
-          agent: agentName,
+        const auditFields = await writeMcpRequestAudit({
+          tokenName: authInfo.clientId,
+          agentName,
           operation: name,
+          params: logParamsObj,
+          errorMessage: errMsg,
+        }, latency, 'error');
+        const broadcastFields = sanitizeClientLocalMcpAuditFields({
+          ...auditFields,
           params: broadcastParams,
+        });
+        broadcastEvent({
+          agent: broadcastFields.agentName,
+          operation: broadcastFields.operation,
+          params: broadcastFields.params,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'error',
-          error: { code: 'op_error', message: errMsg },
+          error: { code: 'op_error', message: broadcastFields.errorMessage },
           timestamp: new Date().toISOString(),
         });
         return toolResult;
       }
 
-      try {
-        await executeRawJsonb(
-          engine,
-          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, name, latency, 'success'],
-          [logParamsObj],
-        );
-      } catch { /* best effort */ }
-      broadcastEvent({
-        agent: agentName,
+      const auditFields = await writeMcpRequestAudit({
+        tokenName: authInfo.clientId,
+        agentName,
         operation: name,
+        params: logParamsObj,
+        errorMessage: null,
+      }, latency, 'success');
+      const broadcastFields = sanitizeClientLocalMcpAuditFields({
+        ...auditFields,
         params: broadcastParams,
+      });
+      broadcastEvent({
+        agent: broadcastFields.agentName,
+        operation: broadcastFields.operation,
+        params: broadcastFields.params,
         scopes: authInfo.scopes.join(','),
         latency_ms: latency,
         status: 'success',
@@ -2185,18 +2244,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         );
 
         const latency = Date.now() - startTime;
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-            [authInfo.clientId, agentName, 'webhook_ingest', latency, 'success'],
-            [{ content_type: contentType, content_hash: contentHash, bytes: body.length, job_id: job.id }],
-          );
-        } catch { /* best effort */ }
-        broadcastEvent({
-          agent: agentName,
+        const auditFields = await writeMcpRequestAudit({
+          tokenName: authInfo.clientId,
+          agentName,
           operation: 'webhook_ingest',
+          params: {
+            content_type: contentType,
+            content_hash: contentHash,
+            bytes: body.length,
+            job_id: job.id,
+          },
+          errorMessage: null,
+        }, latency, 'success');
+        broadcastEvent({
+          agent: auditFields.agentName,
+          operation: auditFields.operation,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'success',

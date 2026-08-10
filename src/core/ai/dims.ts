@@ -310,8 +310,14 @@ export function dimsProviderOptions(
       // Native sizes: 0.6B=1024, 4B=2560, 8B=4096. Without `dimensions`,
       // Ollama returns the native size and brains configured for narrower
       // widths hard-fail with a dim-mismatch error. Pattern match the bare
-      // model name + any `:tag` (e.g. `qwen3-embedding:4b`, `qwen3-embedding:0.6b`).
-      if (modelId === 'qwen3-embedding' || modelId.startsWith('qwen3-embedding:')) {
+      // model name + `:tag` / server-style `-size` suffix case-insensitively
+      // while preserving the original model id passed to the provider.
+      const normalizedModelId = modelId.toLowerCase();
+      if (
+        normalizedModelId === 'qwen3-embedding' ||
+        normalizedModelId.startsWith('qwen3-embedding:') ||
+        normalizedModelId.startsWith('qwen3-embedding-')
+      ) {
         return { openaiCompatible: { dimensions: dims } };
       }
       // MiniMax embo-01 takes a `type: 'db' | 'query'` field for asymmetric

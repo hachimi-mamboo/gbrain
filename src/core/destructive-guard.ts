@@ -7,13 +7,15 @@
  * Three layers:
  *   1. Impact preview — always shown before destructive actions
  *   2. Confirmation gate — requires --confirm-destructive or interactive "type source name"
- *   3. Soft-delete with TTL — sources are tombstoned for 72h before permanent deletion
+ *   3. Soft-delete — ordinary sources receive a 72h TTL; whole-brain Git
+ *      projection archives persist until an explicit Git-first retirement
  *
  * Design principle: the blast radius should be visible BEFORE you pull the trigger,
- * and recoverable AFTER you pull it (within a grace period).
+ * and recoverable AFTER you pull it (within the applicable archive policy).
  */
 
 import type { BrainEngine } from './engine.ts';
+import { resolveClientBrainRepoPath } from './source-resolver.ts';
 
 // ── Types ───────────────────────────────────────────────────
 
@@ -32,13 +34,14 @@ export interface SoftDeletedSource {
   id: string;
   name: string;
   deletedAt: Date;
-  expiresAt: Date;
+  /** NULL means automatic purge is disabled; explicit operator purge remains. */
+  expiresAt: Date | null;
   pageCount: number;
 }
 
 // ── Constants ───────────────────────────────────────────────
 
-/** Hours before a soft-deleted source is permanently purged. */
+/** Default hours before an ordinary soft-deleted source is permanently purged. */
 export const SOFT_DELETE_TTL_HOURS = 72;
 
 /** Threshold: operations affecting this many pages or more require confirmation. */
@@ -166,11 +169,15 @@ export function checkDestructiveConfirmation(
 // ── Soft Delete ─────────────────────────────────────────────
 
 /**
- * Soft-delete a source: mark `archived = true` with a 72h TTL. Pages remain
+ * Soft-delete a source: mark `archived = true`. Ordinary sources receive a
+ * 72h TTL; a source archived from a bound whole-brain Git projection receives
+ * no automatic expiry so an unbound maintenance process cannot delete its DB
+ * tombstone and let projection discovery reactivate it. Pages remain
  * in DB; the source is hidden from search via `buildVisibilityClause` and
  * federation is disabled via the existing `config.federated` JSONB key. After
- * TTL expires, the autopilot purge phase or manual `gbrain sources purge`
- * permanently removes the row (cascade delete to pages + chunks).
+ * an ordinary archive's TTL expires, autopilot may purge it; explicit
+ * `gbrain sources purge` remains the operator-controlled permanent path
+ * (cascade delete to pages + chunks).
  *
  * v0.26.5: archive state moved from `config` JSONB keys to real columns
  * (`archived`, `archived_at`, `archive_expires_at`). Migration v34 backfills
@@ -184,8 +191,16 @@ export async function softDeleteSource(
   // Atomic: only flip rows that are currently active. Returns the metadata
   // we need without a follow-up SELECT. RETURNING projects the columns the
   // caller cares about; pageCount is a separate count.
-  const expiresClause = `now() + (${SOFT_DELETE_TTL_HOURS} || ' hours')::interval`;
-  const rows = await engine.executeRaw<{ id: string; name: string; archived_at: string; archive_expires_at: string }>(
+  const sharedProjectionArchive = resolveClientBrainRepoPath() !== null;
+  const expiresClause = sharedProjectionArchive
+    ? 'NULL'
+    : `now() + (${SOFT_DELETE_TTL_HOURS} || ' hours')::interval`;
+  const rows = await engine.executeRaw<{
+    id: string;
+    name: string;
+    archived_at: string;
+    archive_expires_at: string | null;
+  }>(
     `UPDATE sources
      SET archived = true,
          archived_at = now(),
@@ -208,7 +223,9 @@ export async function softDeleteSource(
     id: sourceId,
     name: row.name,
     deletedAt: new Date(row.archived_at),
-    expiresAt: new Date(row.archive_expires_at),
+    expiresAt: row.archive_expires_at
+      ? new Date(row.archive_expires_at)
+      : null,
     pageCount,
   };
 }
@@ -254,7 +271,7 @@ export async function listArchivedSources(
     id: string;
     name: string;
     archived_at: string;
-    archive_expires_at: string;
+    archive_expires_at: string | null;
     page_count: number;
   }>(
     `SELECT
@@ -269,7 +286,9 @@ export async function listArchivedSources(
     id: row.id,
     name: row.name,
     deletedAt: new Date(row.archived_at),
-    expiresAt: new Date(row.archive_expires_at),
+    expiresAt: row.archive_expires_at
+      ? new Date(row.archive_expires_at)
+      : null,
     pageCount: row.page_count,
   }));
 }
@@ -280,11 +299,38 @@ export async function listArchivedSources(
  *
  * v0.26.5: moved from JSONB-driven iteration to a single set-based DELETE
  * with `archived = true AND archive_expires_at <= now()`. Server-side
- * filter; one round-trip; cascade-friendly.
+ * filter; one round-trip; cascade-friendly. A bound whole-brain Git projection
+ * converts expired candidates to persistent no-auto-expiry tombstones and
+ * returns no purged ids, so maintenance cannot delete a row that shared sync
+ * would immediately rediscover.
  */
 export async function purgeExpiredSources(
   engine: BrainEngine,
 ): Promise<string[]> {
+  if (resolveClientBrainRepoPath()) {
+    // Persist the no-auto-expiry tombstone for any pre-existing shared
+    // projection archive created before this contract landed. Returning []
+    // keeps the purge API honest: no source row was deleted.
+    const protectedRows = await engine.executeRaw<{ id: string }>(
+      `UPDATE sources
+       SET archive_expires_at = NULL
+       WHERE archived = true
+         AND archive_expires_at IS NOT NULL
+         AND archive_expires_at <= now()
+       RETURNING id`,
+    );
+    if (protectedRows.length > 0) {
+      const protectedIds = protectedRows.map((row) => row.id).sort();
+      console.error(
+        `[gbrain] WARN: disabled automatic purge for expired source(s) ` +
+        `${protectedIds.join(', ')} while ` +
+        `GBRAIN_BRAIN_REPO_PATH is active. Retire and push each ` +
+        `".sources/<id>" Git projection before explicit permanent purge.`,
+      );
+    }
+    return [];
+  }
+
   const rows = await engine.executeRaw<{ id: string }>(
     `DELETE FROM sources
      WHERE archived = true
@@ -322,6 +368,20 @@ export function formatImpact(impact: DestructiveImpact): string {
 }
 
 export function formatSoftDelete(sd: SoftDeletedSource): string {
+  if (!sd.expiresAt) {
+    return [
+      ``,
+      `Source "${sd.id}" archived (soft-deleted).`,
+      `  ${sd.pageCount.toLocaleString()} pages preserved with no automatic expiry.`,
+      `  Removed from search. Data intact.`,
+      `  Automatic source purge disabled for this archived row.`,
+      ``,
+      `  Restore: gbrain sources restore ${sd.id}`,
+      `  Permanent retirement: remove and push its Git projection first, then unset the shared binding and purge explicitly.`,
+      ``,
+    ].join('\n');
+  }
+
   const hours = Math.round((sd.expiresAt.getTime() - Date.now()) / (1000 * 60 * 60));
   return [
     ``,

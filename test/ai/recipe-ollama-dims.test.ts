@@ -8,8 +8,19 @@
  * brains configured for smaller widths.
  */
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { dimsProviderOptions } from '../../src/core/ai/dims.ts';
+import {
+  __setEmbedTransportForTests,
+  configureGateway,
+  embed,
+  resetGateway,
+} from '../../src/core/ai/gateway.ts';
+
+afterEach(() => {
+  __setEmbedTransportForTests(null);
+  resetGateway();
+});
 
 describe('dims: ollama Matryoshka models', () => {
   test('qwen3-embedding:4b threads dimensions=1536', () => {
@@ -32,10 +43,38 @@ describe('dims: ollama Matryoshka models', () => {
       .toEqual({ openaiCompatible: { dimensions: 1024 } });
   });
 
+  test('preserves exact Qwen3 server model casing while threading dimensions', () => {
+    expect(dimsProviderOptions('openai-compatible', 'Qwen3-Embedding-8B', 1024))
+      .toEqual({ openaiCompatible: { dimensions: 1024 } });
+  });
+
   test('unrelated openai-compat model returns undefined (regression guard)', () => {
     expect(dimsProviderOptions('openai-compatible', 'nomic-embed-text', 768))
       .toBeUndefined();
     expect(dimsProviderOptions('openai-compatible', 'mxbai-embed-large', 1024))
       .toBeUndefined();
+  });
+});
+
+describe('gateway: exact Qwen3 server model wire shape', () => {
+  test('keeps Qwen3-Embedding-8B unchanged and requests 1024 dimensions', async () => {
+    configureGateway({
+      embedding_model: 'llama-server:Qwen3-Embedding-8B',
+      embedding_dimensions: 1024,
+      env: {},
+    });
+
+    let captured: any;
+    __setEmbedTransportForTests((async (args: any) => {
+      captured = args;
+      return { embeddings: [new Array(1024).fill(0)] };
+    }) as any);
+
+    await embed(['document']);
+
+    expect(captured.model.modelId).toBe('Qwen3-Embedding-8B');
+    expect(captured.providerOptions).toEqual({
+      openaiCompatible: { dimensions: 1024 },
+    });
   });
 });

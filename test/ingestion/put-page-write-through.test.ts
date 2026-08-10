@@ -11,11 +11,13 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { resetGateway } from '../../src/core/ai/gateway.ts';
+import { withEnv } from '../helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -85,6 +87,117 @@ function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
 const putPage = operations.find((o) => o.name === 'put_page')!;
 
 describe('put_page write-through — happy path', () => {
+  test('matching client-local source binding retires stale shared paths before write-through', async () => {
+    const clientDir = path.join(tmpRoot, 'client-brain');
+    const sharedDir = path.join(tmpRoot, 'shared-db-path');
+    fs.mkdirSync(clientDir, { recursive: true });
+    fs.mkdirSync(sharedDir, { recursive: true });
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1, last_commit = 'stable-source-commit'
+        WHERE id = 'default'`,
+      [sharedDir],
+    );
+    await engine.setConfig('sync.repo_path', sharedDir);
+    await engine.setConfig('sync.last_commit', 'stable-bookmark');
+    await engine.executeRaw(
+      `INSERT INTO ingest_log (source_id, source_type, source_ref, summary)
+       VALUES ('default', 'directory', $1, 'legacy client import')`,
+      [sharedDir],
+    );
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (name, status, data)
+       VALUES ('sync', 'waiting', $1::jsonb)`,
+      [JSON.stringify({
+        sourceId: 'default',
+        repoPath: sharedDir,
+        commit: 'queued-commit',
+      })],
+    );
+
+    const result = await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: undefined,
+        GBRAIN_SOURCE: 'default',
+        GBRAIN_SOURCE_PATH: clientDir,
+      },
+      async () => (await putPage.handler(makeCtx(), {
+        slug: 'inbox/client-bound',
+        content: '---\ntitle: Client bound\n---\n\nclient-local body',
+      })) as { write_through?: { written: boolean; path?: string } },
+    );
+
+    const clientFile = path.join(clientDir, 'inbox/client-bound.md');
+    expect(result.write_through).toMatchObject({ written: true, path: clientFile });
+    expect(fs.existsSync(clientFile)).toBe(true);
+    expect(fs.existsSync(path.join(sharedDir, 'inbox/client-bound.md'))).toBe(false);
+    const rows = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+      config: unknown;
+    }>(
+      `SELECT local_path, last_commit, config FROM sources WHERE id = 'default'`,
+    );
+    expect(rows[0]?.local_path).toBeNull();
+    expect(rows[0]?.last_commit).toBe('stable-source-commit');
+    expect(JSON.stringify(rows[0]?.config)).not.toContain(clientDir);
+    expect(JSON.stringify(rows[0]?.config)).not.toContain(sharedDir);
+    expect(await engine.getConfig('sync.repo_path')).toBeNull();
+    expect(await engine.getConfig('sync.last_commit')).toBe('stable-bookmark');
+
+    const config = await engine.executeRaw<{ value: unknown }>(`SELECT value FROM config`);
+    for (const row of config) {
+      expect(JSON.stringify(row.value)).not.toContain(clientDir);
+      expect(JSON.stringify(row.value)).not.toContain(sharedDir);
+    }
+    const logs = await engine.getIngestLog({ limit: 10 });
+    for (const row of logs) {
+      expect(row.source_ref).not.toContain(clientDir);
+      expect(row.source_ref).not.toContain(sharedDir);
+    }
+    expect(logs.some((row) => row.source_ref === 'source:default')).toBe(true);
+
+    const jobs = await engine.executeRaw<{
+      status: string;
+      data: Record<string, unknown>;
+    }>(`SELECT status, data FROM minion_jobs WHERE name = 'sync'`);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe('cancelled');
+    expect(jobs[0].data).toEqual({
+      sourceId: 'default',
+      commit: 'queued-commit',
+    });
+  });
+
+  test('client-local binding refuses a checkout whose remote identity drifted', async () => {
+    const clientDir = path.join(tmpRoot, 'wrong-remote');
+    fs.mkdirSync(clientDir, { recursive: true });
+    execFileSync('git', ['init', '-q', clientDir]);
+    execFileSync('git', [
+      '-C', clientDir, 'remote', 'add', 'origin',
+      'https://github.com/example/actual.git',
+    ]);
+    await engine.executeRaw(
+      `UPDATE sources SET config = $1::text::jsonb WHERE id = 'default'`,
+      [JSON.stringify({ remote_url: 'https://github.com/example/expected.git' })],
+    );
+
+    await expect(withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: undefined,
+        GBRAIN_SOURCE: 'default',
+        GBRAIN_SOURCE_PATH: clientDir,
+      },
+      async () => putPage.handler(makeCtx(), {
+        slug: 'inbox/wrong-remote',
+        content: '---\ntitle: Wrong remote\n---\n\nmust not project here',
+      }),
+    )).rejects.toThrow(/url-drift/);
+
+    expect(await engine.getPage('inbox/wrong-remote', { sourceId: 'default' })).toBeNull();
+    expect(await engine.getIngestLog({ limit: 10 })).toEqual([]);
+    expect(fs.existsSync(path.join(clientDir, 'inbox/wrong-remote.md'))).toBe(false);
+  });
+
   test('writes the markdown file to disk at brainDir/<slug>.md', async () => {
     const ctx = makeCtx();
     const content = '---\ntitle: Test\n---\n\n# WT body';
@@ -210,6 +323,30 @@ describe('put_page write-through — multi-source filing', () => {
     expect(result.write_through?.written).toBe(true);
     expect(result.write_through?.path).toBe(path.join(brainDir, '.sources/team-x/shared/page.md'));
     expect(fs.existsSync(result.write_through!.path!)).toBe(true);
+  });
+
+  test('shared projection rejects reserved/non-canonical slugs before the DB write', async () => {
+    const sharedRepo = path.join(tmpRoot, 'shared-brain-repo');
+    fs.mkdirSync(path.join(sharedRepo, '.sources', 'project-p'), { recursive: true });
+    execFileSync('git', ['init', '-q', sharedRepo]);
+    const sentinel = path.join(sharedRepo, '.sources', 'project-p', 'sentinel.md');
+    fs.writeFileSync(sentinel, 'unchanged\n');
+
+    for (const slug of ['.sources/project-p/escape', 'notes//collision']) {
+      await expect(withEnv({
+        GBRAIN_BRAIN_REPO_PATH: sharedRepo,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      }, () => putPage.handler(makeCtx(), {
+        slug,
+        content: '---\ntitle: Rejected\n---\n\nmust not persist',
+      }))).rejects.toThrow(/reserved hidden segment|canonical POSIX path/);
+
+      expect(await engine.getPage(slug, { sourceId: 'default' })).toBeNull();
+      expect(fs.readFileSync(sentinel, 'utf8')).toBe('unchanged\n');
+    }
+    expect(fs.existsSync(path.join(sharedRepo, '.sources', 'project-p', 'escape.md'))).toBe(false);
+    expect(fs.existsSync(path.join(sharedRepo, 'notes', 'collision.md'))).toBe(false);
   });
 });
 
