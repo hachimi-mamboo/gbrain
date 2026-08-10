@@ -1121,7 +1121,7 @@ export async function hybridSearch(
     }
     // T3/T4 — alias hop + evidence stamp even without an embedding provider
     // (the named-thing fix is most valuable exactly when vector is unavailable).
-    const noEmbedHopped = await applyAliasHop(engine, dedupResults(noEmbedResults), query, {
+    const noEmbedHopped = await applyAliasHop(engine, dedupResults(noEmbedResults, opts?.dedupOpts), query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
@@ -1354,7 +1354,7 @@ export async function hybridSearch(
       await runPostFusionStages(engine, fallbackResults, postFusionOpts);
       fallbackResults.sort((a, b) => b.score - a.score);
     }
-    const kwHopped = await applyAliasHop(engine, dedupResults(fallbackResults), query, {
+    const kwHopped = await applyAliasHop(engine, dedupResults(fallbackResults, opts?.dedupOpts), query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
