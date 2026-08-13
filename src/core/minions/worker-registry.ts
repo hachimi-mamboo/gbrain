@@ -142,6 +142,23 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
   }
 }
 
+/** Parse the POSIX `ps etime` shape (`[[dd-]hh:]mm:ss`) into milliseconds. */
+export function parseProcessElapsedMs(value: string): number | null {
+  const trimmed = value.trim();
+  const match = /^(?:(\d+)-(\d{2}):(\d{2}):(\d{2})|(\d{2}):(\d{2}):(\d{2})|(\d{2}):(\d{2}))$/.exec(trimmed);
+  if (!match) return null;
+
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? match[5] ?? 0);
+  const minutes = Number(match[3] ?? match[6] ?? match[8]);
+  const seconds = Number(match[4] ?? match[7] ?? match[9]);
+  if (![days, hours, minutes, seconds].every(Number.isSafeInteger)) return null;
+  if (hours > 23 || minutes > 59 || seconds > 59) return null;
+
+  const elapsedMs = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+  return Number.isSafeInteger(elapsedMs) ? elapsedMs : null;
+}
+
 /**
  * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
@@ -160,17 +177,8 @@ function processStartMs(pid: number): number | null {
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const dayParts = out.split('-');
-    if (dayParts.length > 2) return null;
-    const days = dayParts.length === 2 ? Number(dayParts[0]) : 0;
-    const clock = dayParts.at(-1)!.split(':').map(Number);
-    if (clock.length !== 2 && clock.length !== 3) return null;
-    const [hours, minutes, seconds] = clock.length === 3
-      ? clock
-      : [0, clock[0]!, clock[1]!];
-    if (![days, hours, minutes, seconds].every(Number.isFinite)) return null;
-    if (days < 0 || hours < 0 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) return null;
-    const elapsedMs = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+    const elapsedMs = parseProcessElapsedMs(out);
+    if (elapsedMs === null) return null;
     return Date.now() - elapsedMs;
   } catch {
     return null;
