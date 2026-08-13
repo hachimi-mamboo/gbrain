@@ -69,7 +69,7 @@ describe('exit contract over a multi-brain run (PGLite exitCode-hijack guard)', 
     expect(doc.cells.length).toBeGreaterThan(0);
     expect(doc.seed_failures).toEqual([]);
     expect(r.stderr).not.toContain('not a git repository');
-  }, 60_000);
+  }, 120_000); // Reproduced at 67s under the full parallel shard runner.
 
   test('clean run: exit 0, --out is complete valid JSON with the glossary block', () => {
     const out = join(root, 'r1.json');
