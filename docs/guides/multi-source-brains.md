@@ -172,6 +172,10 @@ match its directory id. On an admitted live run, `sync --all` discovers direct
 source directories, registers missing identities with `local_path=NULL`, and
 restores the original `source_id` and source-relative slug. Full and incremental
 sync use the same mapping for adds, modifications, deletes, and renames.
+The first admitted bound operation also performs an idempotent cleanup of stale
+client-local path state and cancels queued work that still depends on the old
+checkout; source identity, stable remote configuration, commit, and sync
+bookmark remain unchanged.
 
 On a fresh database, this Git projection restores active page content and source
 IDs only. It does not restore source-catalog metadata such as display names,

@@ -159,6 +159,35 @@ The quarantine has grown to dozens of files — treat it as debt: every addition
 
 ### Unit test inventory
 
+#### Shared checkout and client-binding regression cluster
+
+`test/helpers/client-binding-preload.ts` must remain the first preload in
+`bunfig.toml`. It clears inherited `GBRAIN_SOURCE`, `GBRAIN_SOURCE_PATH`, and
+`GBRAIN_BRAIN_REPO_PATH` before test modules load, while the later preloads keep
+their existing responsibilities. This prevents a developer's live checkout
+binding from changing test routing or making local absolute paths enter fixtures.
+
+The focused cluster for the shared multi-source projection and client-local path
+boundary is:
+
+- `test/brain-repo-layout.test.ts` and `test/source-resolver.test.ts` — layout,
+  markers, mutually exclusive bindings, exact Git-root and remote validation.
+- `test/sources-ops.test.ts` and
+  `test/e2e/client-source-binding-postgres.test.ts` — transactional client
+  preparation, idempotency, stable-state preservation, and real-Postgres parity.
+- `test/write-through.test.ts`,
+  `test/ingestion/put-page-write-through.test.ts`, and
+  `test/sync-brain-repo-projection.serial.test.ts` — per-source projection,
+  symlink-escape rejection, write-through, discovery, and fresh-checkout sync.
+- `test/brain-repo-durability.serial.test.ts` and `test/durability-cron.test.ts`
+  — marker hardening, canonical confinement, absolute scheduled invocation, and
+  quiet successful pulls.
+- `test/destructive-guard.test.ts` — archive, restore, purge, and Git-first
+  retirement behavior under the shared binding.
+- `test/minions.test.ts`, `test/serve-http-client-binding-audit.test.ts`, and
+  `test/http-transport.test.ts` — structured queue, worker, request-log, and
+  admin-event path sanitation.
+
 `bun test` runs all tests without a database. E2E tests skip gracefully when `DATABASE_URL` is not set.
 
 Unit tests and what they cover:
