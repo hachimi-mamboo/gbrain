@@ -116,9 +116,9 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
   beforeAll(async () => {
     // Truncate + apply schema/migrations before any subprocess hits the DB.
     await setupDB();
-    // setupDB's ALL_TABLES list does not include sources / oauth_clients —
-    // those accumulate across runs and cause Q4 pre-flight collisions on
-    // re-run. Wipe them explicitly. CASCADE on sources cleans pages too.
+    // setupDB resets sources, but the OAuth/access-token tables are not in
+    // ALL_TABLES. Clear those auth fixtures explicitly; keep the source delete
+    // as a local defensive reset for this subprocess-heavy file.
     {
       const { getConn } = await import('./helpers.ts');
       const sql = getConn();

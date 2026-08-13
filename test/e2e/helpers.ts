@@ -48,11 +48,15 @@ const ALL_TABLES = [
   'timeline_entries',
   'page_versions',
   'ingest_log',
+  'mcp_request_log',
   'files',
   // v0.43 (#2095): volunteered-context feedback log — no FK to pages (slug
   // join), but stale rows poison stats/count assertions across runs.
   'context_volunteer_events',
-  'pages',       // last because of foreign keys
+  'pages',
+  // Source-scoped E2E files add logical sources. Clear them last so the next
+  // file cannot inherit routing state; initSchema below re-seeds `default`.
+  'sources',
   'config',
   'minion_attachments',
   'minion_inbox',

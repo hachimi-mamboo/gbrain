@@ -104,11 +104,9 @@ describeE2E('embed --stale cursor pagination (D7 + REGRESSION)', () => {
   });
 
   afterAll(async () => {
-    // setupDB's ALL_TABLES truncate list does NOT include `sources`
-    // (the `default` row is treated as fixed). This test adds an
-    // `other-source` row for the D7 cases; clean it up so later tests
-    // running on the same DB don't see a never-synced source (which
-    // mechanical.test.ts:`gbrain doctor` would correctly fail on).
+    // setupDB resets sources before each file. Also remove this file's
+    // `other-source` immediately so a shared DB is clean after teardown and
+    // mechanical.test.ts:`gbrain doctor` cannot see a never-synced source.
     try {
       await getConn()`DELETE FROM sources WHERE id <> 'default'`;
     } catch {
