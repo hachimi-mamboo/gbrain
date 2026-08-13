@@ -28,9 +28,9 @@
  */
 
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync, realpathSync,
 } from 'fs';
-import { join, dirname, relative, isAbsolute } from 'path';
+import { join, dirname, relative, isAbsolute, sep } from 'path';
 import { execFileSync, execSync } from 'child_process';
 import {
   GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
@@ -434,6 +434,18 @@ export function isDurabilityHardened(repoPath: string): boolean {
   }
 }
 
+function repoRelativeExistingPath(repoPath: string, absPath: string): string | null {
+  try {
+    const repoRoot = realpathSync(repoPath);
+    const target = realpathSync(absPath);
+    const rel = relative(repoRoot, target);
+    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+    return rel;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * #2426: best-effort commit of a single write-through artifact so DB writes
  * reach git (the post-commit hook then background-pushes). Pre-fix,
@@ -453,13 +465,15 @@ export function commitWriteThroughFile(
   managedCompanionPaths: string[] = [],
 ): boolean {
   try {
-    const relPaths = [absPath, ...managedCompanionPaths].map((path) => relative(repoPath, path));
-    if (relPaths.some((path) => !path || path.startsWith('..') || isAbsolute(path))) return false;
+    const relPaths = [absPath, ...managedCompanionPaths]
+      .map((path) => repoRelativeExistingPath(repoPath, path));
+    if (relPaths.some((path) => path === null)) return false;
+    const confinedPaths = relPaths as string[];
     const gitOpts = { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } } as const;
-    execFileSync('git', ['-C', repoPath, 'add', '--', ...relPaths], gitOpts);
+    execFileSync('git', ['-C', repoPath, 'add', '--', ...confinedPaths], gitOpts);
     execFileSync(
       'git',
-      ['-C', repoPath, 'commit', '-m', `gbrain: write-through ${slug}`, '--', ...relPaths],
+      ['-C', repoPath, 'commit', '-m', `gbrain: write-through ${slug}`, '--', ...confinedPaths],
       gitOpts,
     );
     return true;
@@ -482,17 +496,18 @@ export function commitManagedPathsAndPush(
 ): boolean {
   try {
     if (absPaths.length === 0) return true;
-    const relPaths = absPaths.map((path) => relative(repoPath, path));
-    if (relPaths.some((path) => !path || path.startsWith('..') || isAbsolute(path))) return false;
+    const relPaths = absPaths.map((path) => repoRelativeExistingPath(repoPath, path));
+    if (relPaths.some((path) => path === null)) return false;
+    const confinedPaths = relPaths as string[];
     const branch = currentBranch(repoPath);
     if (!branch || branch === 'HEAD') return false;
     const localGitEnv = { ...process.env, ...GIT_ENV };
-    execFileSync('git', ['-C', repoPath, 'add', '--', ...relPaths], {
+    execFileSync('git', ['-C', repoPath, 'add', '--', ...confinedPaths], {
       stdio: 'ignore', timeout: 30_000, env: localGitEnv,
     });
     let hasStagedChanges = true;
     try {
-      execFileSync('git', ['-C', repoPath, 'diff', '--cached', '--quiet', '--', ...relPaths], {
+      execFileSync('git', ['-C', repoPath, 'diff', '--cached', '--quiet', '--', ...confinedPaths], {
         stdio: 'ignore', timeout: 10_000, env: localGitEnv,
       });
       hasStagedChanges = false;
@@ -503,7 +518,7 @@ export function commitManagedPathsAndPush(
       execFileSync('git', [
         '-C', repoPath,
         '-c', 'core.hooksPath=/dev/null',
-        'commit', '-m', message, '--', ...relPaths,
+        'commit', '-m', message, '--', ...confinedPaths,
       ], {
         stdio: 'ignore', timeout: 30_000, env: localGitEnv,
       });
@@ -988,8 +1003,8 @@ function commitScaffolding(
   const resolver = findResolverFile(repoPath);
   if (resolver) paths.push(relative(repoPath, resolver));
   for (const managedPath of managedPaths) {
-    const rel = relative(repoPath, managedPath);
-    if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+    const rel = repoRelativeExistingPath(repoPath, managedPath);
+    if (!rel) {
       return {
         status: 'needs_attention',
         detail: `managed durability path escapes repo: ${managedPath}`,

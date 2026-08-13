@@ -4,7 +4,7 @@
  * redirected to a tmp dir; installCron:false so the suite never touches launchd.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, chmodSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, realpathSync, statSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
@@ -161,7 +161,7 @@ describe('hardenBrainRepo', () => {
       expect(output.reports).toHaveLength(1);
       expect(output.reports[0]).toMatchObject({
         source_id: 'brain-repo',
-        repo_path: work,
+        repo_path: realpathSync(work),
       });
 
       // A preview may read every source and inspect Git, but must not retire
@@ -204,7 +204,7 @@ describe('hardenBrainRepo', () => {
       expect(output.reports).toHaveLength(1);
       expect(output.reports[0]).toMatchObject({
         source_id: 'brain-repo',
-        repo_path: work,
+        repo_path: realpathSync(work),
         clean_against_origin: true,
       });
       expect(output.reports[0].steps).toContainEqual(expect.objectContaining({

@@ -164,7 +164,7 @@ try {
       env.GBRAIN_HOME = home;
       env.GBRAIN_SELF_UPGRADE_MODE = 'notify';
       env.PATH = `${bin}:/usr/bin:/bin`;
-      const result = Bun.spawnSync([wrapper], { env, stdout: 'pipe', stderr: 'pipe' });
+      const result = Bun.spawnSync([wrapper], { cwd: repo, env, stdout: 'pipe', stderr: 'pipe' });
 
       expect({
         exitCode: result.exitCode,
