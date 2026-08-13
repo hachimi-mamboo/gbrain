@@ -344,8 +344,8 @@ describe('hardenBrainRepo', () => {
 
   test('shared unharden removes the checkout-level durability identity', async () => {
     const engine = await sharedBrainEngine();
-    const sharedWrapper = join(process.env.GBRAIN_HOME!, 'brain-pull-brain-repo.sh');
-    mkdirSync(process.env.GBRAIN_HOME!, { recursive: true });
+    const sharedWrapper = join(process.env.GBRAIN_HOME!, '.gbrain', 'brain-pull-brain-repo.sh');
+    mkdirSync(join(process.env.GBRAIN_HOME!, '.gbrain'), { recursive: true });
     writeFileSync(sharedWrapper, '#!/bin/sh\n', { mode: 0o755 });
 
     try {

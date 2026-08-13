@@ -150,14 +150,28 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
  */
 function processStartMs(pid: number): number | null {
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    // `lstart` has no timezone suffix. Parsing it in a process whose TZ differs
+    // from the host (for example a UTC test runner on an Asia/Shanghai Mac)
+    // shifts the result and can misclassify the current process as PID reuse.
+    // `etime` is a timezone-free [[dd-]hh:]mm:ss duration on both BSD and GNU ps.
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const dayParts = out.split('-');
+    if (dayParts.length > 2) return null;
+    const days = dayParts.length === 2 ? Number(dayParts[0]) : 0;
+    const clock = dayParts.at(-1)!.split(':').map(Number);
+    if (clock.length !== 2 && clock.length !== 3) return null;
+    const [hours, minutes, seconds] = clock.length === 3
+      ? clock
+      : [0, clock[0]!, clock[1]!];
+    if (![days, hours, minutes, seconds].every(Number.isFinite)) return null;
+    if (days < 0 || hours < 0 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) return null;
+    const elapsedMs = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+    return Date.now() - elapsedMs;
   } catch {
     return null;
   }
