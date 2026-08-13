@@ -24,7 +24,7 @@ describe('renderCronWrapper (D2 DB-free)', () => {
   const w = renderCronWrapper('wiki', '/data/clones/wiki', 'main', ['/usr/local/bin/gbrain'], '/home/u/.gbrain/brain-push.log');
 
   test('calls the DB-free path command, not the engine-opening one', () => {
-    expect(w).toContain("sources pull --path '/data/clones/wiki'");
+    expect(w).toContain("--quiet sources pull --path '/data/clones/wiki'");
     expect(w).toContain("--branch 'main'");
     expect(w).not.toMatch(/sources pull '?wiki'?(\s|$)/); // never `sources pull wiki`
   });
@@ -59,7 +59,7 @@ describe('renderCronWrapper (D2 DB-free)', () => {
     writeFileSync(cli, `#!/usr/bin/env bun
 import { writeFileSync } from 'node:fs';
 import { renderCronWrapper, resolveGbrainCliInvocation } from ${JSON.stringify(durabilityModule)};
-if (process.argv[2] === 'sources') {
+if (process.argv.slice(2).includes('sources')) {
   writeFileSync(${JSON.stringify(output)}, JSON.stringify(process.argv.slice(2)));
 } else {
   process.stdout.write(renderCronWrapper(
@@ -69,17 +69,18 @@ if (process.argv[2] === 'sources') {
 `);
     chmodSync(cli, 0o755);
     symlinkSync('../gbrain/src/cli.ts', shim);
+    writeFileSync(join(launchdPath, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
     try {
       const body = execFileSync(shim, [], {
         encoding: 'utf-8', env: { HOME: home, PATH: `${binDir}:${dirname(process.execPath)}:/usr/bin:/bin` },
       });
-      expect(body).toContain(`exec '${process.execPath}' '${realpathSync(cli)}' sources pull`);
+      expect(body).toContain(`exec '${process.execPath}' '${realpathSync(cli)}' --quiet sources pull`);
       writeFileSync(wrapper, body);
       chmodSync(wrapper, 0o755);
       execFileSync(wrapper, [], { env: { HOME: home, PATH: launchdPath } });
       expect(JSON.parse(readFileSync(output, 'utf-8'))).toEqual([
-        'sources', 'pull', '--path', repo, '--branch', 'main',
+        '--quiet', 'sources', 'pull', '--path', repo, '--branch', 'main',
       ]);
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -113,6 +114,67 @@ try {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  test('scheduled pull stays quiet with a fresh upgrade-available cache', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-cron-quiet-'));
+    const bare = join(home, 'origin.git');
+    const repo = join(home, 'brain');
+    const bin = join(home, 'bin');
+    const wrapper = join(home, 'pull.sh');
+    const cli = realpathSync(join(import.meta.dir, '..', 'src', 'cli.ts'));
+    const git = (...args: string[]) => execFileSync('git', args, {
+      cwd: repo,
+      stdio: 'ignore',
+    });
+
+    try {
+      execFileSync('git', ['init', '--bare', '--initial-branch=main', bare], { stdio: 'ignore' });
+      mkdirSync(repo);
+      git('init', '--initial-branch=main');
+      git('config', 'user.email', 'cron-test@example.invalid');
+      git('config', 'user.name', 'cron test');
+      writeFileSync(join(repo, 'README.md'), '# brain\n');
+      git('add', 'README.md');
+      git('commit', '-m', 'initial');
+      git('remote', 'add', 'origin', bare);
+      git('push', '-u', 'origin', 'main');
+
+      // The production pull deliberately rejects file:// fetches. Keep the
+      // external Git boundary hermetic while exercising the real CLI path:
+      // origin/main already exists from the push, so network fetch/pull are no-ops.
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, 'git'),
+        '#!/bin/sh\nfor arg in "$@"; do case "$arg" in fetch|pull) exit 0;; esac; done\nexec /usr/bin/git "$@"\n',
+        { mode: 0o755 },
+      );
+
+      mkdirSync(join(home, '.gbrain'));
+      writeFileSync(join(home, '.gbrain', 'last-update-check'), 'UPGRADE_AVAILABLE 0.45.9.0 0.99.0\n');
+      writeFileSync(
+        wrapper,
+        renderCronWrapper('brain-repo', repo, 'main', [process.execPath, cli], join(home, 'pull.log')),
+        { mode: 0o755 },
+      );
+
+      const env: Record<string, string> = { ...process.env } as Record<string, string>;
+      delete env.NODE_ENV;
+      delete env.GBRAIN_SKIP_STARTUP_HOOKS;
+      env.HOME = home;
+      env.GBRAIN_HOME = home;
+      env.GBRAIN_SELF_UPGRADE_MODE = 'notify';
+      env.PATH = `${bin}:/usr/bin:/bin`;
+      const result = Bun.spawnSync([wrapper], { env, stdout: 'pipe', stderr: 'pipe' });
+
+      expect({
+        exitCode: result.exitCode,
+        stdout: result.stdout.toString().trim(),
+        stderr: result.stderr.toString(),
+      }).toEqual({ exitCode: 0, stdout: 'up to date (main)', stderr: '' });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe('generateBrainPullPlist (D12 launchd)', () => {
@@ -147,6 +209,7 @@ describe('installDurabilityCron — crontab probe [B2/D-cloud]', () => {
     const shim = mkdtempSync(join(tmpdir(), 'shim-cron-'));
     // -l lists empty; writing the new tab (crontab -) fails.
     writeFileSync(join(shim, 'crontab'), '#!/bin/sh\ncase "$1" in -l) exit 0;; esac\nexit 1\n', { mode: 0o755 });
+    writeFileSync(join(shim, 'gbrain'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const home = mkdtempSync(join(tmpdir(), 'gb-cron2-'));
     await withEnv({ PATH: `${shim}:${process.env.PATH ?? ''}`, GBRAIN_HOME: home }, async () => {
       const r = installDurabilityCron('wiki', '/data/clones/wiki', 'main', 1800, false, 'linux');

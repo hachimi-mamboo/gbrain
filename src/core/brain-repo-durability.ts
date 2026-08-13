@@ -707,7 +707,7 @@ if ! git -C '${q(repoPath)}' rev-parse --is-inside-work-tree >/dev/null 2>&1; th
   echo "$(date -u +%FT%TZ) [cron] not a git work tree, skipping: ${q(repoPath)}" >> "${q(logPath)}" 2>/dev/null || true
   exit 0
 fi
-exec ${command} sources pull --path '${q(repoPath)}' --branch '${q(branch)}'
+exec ${command} --quiet sources pull --path '${q(repoPath)}' --branch '${q(branch)}'
 `;
 }
 
