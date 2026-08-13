@@ -17,6 +17,7 @@ import { SLUG_WORD_CHARS } from './cjk.ts';
 // import keeps the pruneDir helper's deps near its callsite.
 import { existsSync, statSync, realpathSync } from 'fs';
 import { join as pathJoin, resolve as pathResolve } from 'path';
+import { execFileSync } from 'child_process';
 import type { BrainEngine } from './engine.ts';
 
 export interface SyncManifest {
@@ -649,8 +650,32 @@ export function sameRepoDir(a: string, b: string): boolean {
 export interface GlobalAnchorOwnership {
   owns: boolean;
   /** The path ownership was judged against (global key first, else the
-   * default source's local_path), or null on a truly fresh brain. */
+   * default source's local_path), or null when pathless. */
   configured: string | null;
+  /** Existing pathless commit identity, when ownership could not be judged
+   * from a legacy persisted path. */
+  anchorCommit: string | null;
+}
+
+/**
+ * A shared brain may retain a Git bookmark but no checkout path. Prove that
+ * the candidate checkout contains that commit without persisting a new local
+ * path. Object membership (rather than ancestry) deliberately permits a
+ * rebased or force-pushed branch when the old bookmarked object is still in
+ * the repository.
+ */
+function repoContainsCommit(dir: string, commit: string): boolean {
+  // Accept both SHA-1 and SHA-256 object formats; reject arbitrary revisions.
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit)) return false;
+  try {
+    execFileSync('git', ['-C', dir, 'cat-file', '-e', `${commit}^{commit}`], {
+      stdio: 'ignore',
+      timeout: 30_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -664,11 +689,12 @@ export interface GlobalAnchorOwnership {
  *   1. the operation resolves to the default source (or the legacy
  *      no-sourceId path, which is default-by-definition), AND
  *   2. `dir` matches the brain repo's configured identity — the global key
- *      when set, else the default source row's `local_path` when set
- *      (modern sync writes its anchor THERE, leaving the global unset, so
- *      an unset global alone must not green-light a bootstrap).
- * Only when neither identity exists is this a fresh brain, and bootstrap
- * is allowed.
+ *      when set, else the default source row's `local_path` when set, else
+ *      membership of the existing commit bookmark in the candidate repo.
+ *      The commit fallback preserves ownership without persisting a client
+ *      checkout path in shared state.
+ * Only when neither path nor commit identity exists is this a fresh brain,
+ * and bootstrap is allowed.
  */
 export async function ownsGlobalSyncAnchor(
   engine: BrainEngine,
@@ -676,26 +702,45 @@ export async function ownsGlobalSyncAnchor(
   dir: string,
 ): Promise<GlobalAnchorOwnership> {
   if (sourceId && sourceId !== 'default') {
-    return { owns: false, configured: null };
+    return { owns: false, configured: null, anchorCommit: null };
   }
   const globalPath = await engine.getConfig('sync.repo_path');
   if (globalPath) {
-    return { owns: sameRepoDir(globalPath, dir), configured: globalPath };
+    return { owns: sameRepoDir(globalPath, dir), configured: globalPath, anchorCommit: null };
   }
+  const globalCommit = await engine.getConfig('sync.last_commit');
   // Global unset — the brain identity may still live on the default source
   // row (modern sync writes anchors there). Best-effort: a query failure
-  // falls through to bootstrap, preserving pre-#2114 behavior on exotic
-  // engines rather than refusing writes.
+  // still permits the global commit fallback on pre-sources-table brains.
+  let defaultCommit: string | null = null;
   try {
-    const rows = await engine.executeRaw<{ local_path: string | null }>(
-      `SELECT local_path FROM sources WHERE id = 'default'`,
+    const rows = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+    }>(
+      `SELECT local_path, last_commit FROM sources WHERE id = 'default'`,
     );
     const defaultLocal = rows[0]?.local_path ?? null;
     if (defaultLocal) {
-      return { owns: sameRepoDir(defaultLocal, dir), configured: defaultLocal };
+      return {
+        owns: sameRepoDir(defaultLocal, dir),
+        configured: defaultLocal,
+        anchorCommit: null,
+      };
     }
+    defaultCommit = rows[0]?.last_commit ?? null;
   } catch {
-    // sources table unavailable (pre-v0.18 brain mid-upgrade) — treat as fresh.
+    // sources table unavailable (pre-v0.18 brain mid-upgrade).
   }
-  return { owns: true, configured: null };
+  const anchorCommit = sourceId === 'default'
+    ? defaultCommit ?? globalCommit
+    : globalCommit ?? defaultCommit;
+  if (anchorCommit) {
+    return {
+      owns: repoContainsCommit(dir, anchorCommit),
+      configured: null,
+      anchorCommit,
+    };
+  }
+  return { owns: true, configured: null, anchorCommit: null };
 }

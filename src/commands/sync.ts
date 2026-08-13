@@ -1484,12 +1484,21 @@ export async function writeSyncAnchor(
   // anchor. Refuse to move them for a directory that isn't the brain repo.
   const anchorDir = which === 'repo_path' ? value : repoDir;
   if (anchorDir !== undefined) {
-    const { owns, configured } = await ownsGlobalSyncAnchor(engine, undefined, anchorDir);
+    const { owns, configured, anchorCommit } = await ownsGlobalSyncAnchor(
+      engine,
+      undefined,
+      anchorDir,
+    );
     if (!owns) {
+      const identity = configured ??
+        (anchorCommit ? `existing commit anchor ${anchorCommit.slice(0, 8)}` : '(unset)');
+      const remediation = configured
+        ? ` To make that directory the brain repo: ` +
+          `gbrain config set sync.repo_path "${anchorDir}"`
+        : ' The candidate checkout does not contain the existing commit anchor.';
       serr(
-        `[sync] sync.${which} stays at ${configured ?? '(unset)'} — not moving the ` +
-        `global anchor for "${anchorDir}". To make that directory the brain repo: ` +
-        `gbrain config set sync.repo_path "${anchorDir}"`,
+        `[sync] sync.${which} stays at ${identity} — not moving the ` +
+        `global anchor for "${anchorDir}".${remediation}`,
       );
       return;
     }

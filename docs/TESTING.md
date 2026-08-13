@@ -182,6 +182,10 @@ boundary is:
 - `test/brain-repo-durability.serial.test.ts` and `test/durability-cron.test.ts`
   — marker hardening, canonical confinement, absolute scheduled invocation, and
   quiet successful pulls.
+- `test/import-repo-path-guard.test.ts` and `test/e2e/sync.test.ts` — explicit
+  checkout imports do not write the checkout path into shared DB state, a
+  pathless Git commit bookmark rejects a checkout that does not contain the
+  saved commit, and legacy path anchors remain compatible.
 - `test/destructive-guard.test.ts` — archive, restore, purge, and Git-first
   retirement behavior under the shared binding.
 - `test/minions.test.ts`, `test/serve-http-client-binding-audit.test.ts`, and

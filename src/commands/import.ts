@@ -632,7 +632,7 @@ export async function runImport(
     // rule live in ownsGlobalSyncAnchor (shared with writeSyncAnchor's
     // legacy branch in sync.ts, so the two layers cannot drift).
     const { ownsGlobalSyncAnchor } = await import('../core/sync.ts');
-    const { owns, configured } = await ownsGlobalSyncAnchor(engine, sourceId, dir);
+    const { owns, configured, anchorCommit } = await ownsGlobalSyncAnchor(engine, sourceId, dir);
 
     if (owns) {
       if (failures.length === 0) {
@@ -646,11 +646,19 @@ export async function runImport(
       }
       await engine.setConfig('sync.last_run', new Date().toISOString());
     } else if ((sourceId ?? 'default') === 'default') {
-      console.error(
-        `\n[import] sync.repo_path stays at ${configured ?? '(unset)'} — NOT repointing to "${dir}". ` +
-        `Sync bookmarks were not advanced. If this directory IS your brain repo, run: ` +
-        `gbrain config set sync.repo_path "${dir}"`,
-      );
+      if (configured) {
+        console.error(
+          `\n[import] sync.repo_path stays at ${configured} — NOT repointing to "${dir}". ` +
+          `Sync bookmarks were not advanced. If this directory IS your brain repo, run: ` +
+          `gbrain config set sync.repo_path "${dir}"`,
+        );
+      } else {
+        console.error(
+          `\n[import] Sync bookmarks stay on the existing commit anchor ` +
+          `${anchorCommit?.slice(0, 8) ?? '(unknown)'} — NOT repointing to "${dir}". ` +
+          `The candidate checkout does not contain the existing commit anchor.`,
+        );
+      }
     }
     // Non-default sources: deliberately silent no-op — the globals are not
     // this import's to move (its sync anchors live on the `sources` row).

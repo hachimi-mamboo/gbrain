@@ -1,6 +1,7 @@
 /**
  * #2114 — `gbrain import <dir>` (and the sync layer's legacy anchor path)
- * must not silently repoint the global brain repo.
+ * must not silently repoint the global brain repo. Client-local checkout
+ * paths must also never be newly persisted to shared state.
  *
  * Pre-fix, the sync-checkpoint block at the end of `runImport` wrote
  * `sync.repo_path` and `sync.last_run` unconditionally (and `sync.last_commit`
@@ -13,8 +14,10 @@
  *
  * The guard (shared `ownsGlobalSyncAnchor` in core/sync.ts, used by BOTH
  * layers): only the default source may move the globals, and only for the
- * configured brain repo — the global key when set, else the default source
- * row's local_path when set. Only a truly fresh brain bootstraps.
+ * configured brain repo — the legacy global key when set, else the default
+ * source row's local_path when set, else a repo containing the existing
+ * commit bookmark. A fresh brain may bootstrap the non-path bookmark fields,
+ * but import never creates `sync.repo_path`.
  *
  * Hermetic: PGLite in-memory; `GBRAIN_HOME` overridden via `withEnv` so
  * runImport's checkpoint file NEVER touches the real `~/.gbrain` (the
@@ -147,7 +150,11 @@ describe('import sync-bookmark guard (#2114)', () => {
       await (engine as any).db.exec(`DELETE FROM ${t}`);
     }
     await (engine as any).db.exec(`DELETE FROM sources WHERE id <> 'default'`);
-    await (engine as any).db.exec(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await (engine as any).db.exec(
+      `UPDATE sources
+          SET local_path = NULL, last_commit = NULL, last_sync_at = NULL
+        WHERE id = 'default'`,
+    );
     repoA = makeGitRepo('gbrain-2114-a-');
     repoB = makeGitRepo('gbrain-2114-b-');
     cleanups.push(repoA, repoB);
@@ -157,18 +164,18 @@ describe('import sync-bookmark guard (#2114)', () => {
     for (const d of cleanups) rmSync(d, { recursive: true, force: true });
   });
 
-  test('first import bootstraps sync.repo_path (fresh-brain flow unchanged)', async () => {
+  test('first import records a bookmark without persisting its checkout path', async () => {
     expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
 
     const result = await run([repoA, '--no-embed', '--json']);
     expect(result.imported).toBeGreaterThanOrEqual(1);
 
-    expect(await engine.getConfig('sync.repo_path')).toBe(repoA);
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
     expect(await engine.getConfig('sync.last_commit')).toBe(headOf(repoA));
     expect(await engine.getConfig('sync.last_run')).toBeTruthy();
   });
 
-  test('importing a DIFFERENT git repo does not clobber the configured brain repo', async () => {
+  test('the pathless commit anchor blocks a DIFFERENT repo from clobbering bookmarks', async () => {
     await run([repoA, '--no-embed', '--json']);
     const anchorBefore = await engine.getConfig('sync.last_commit');
     expect(anchorBefore).toBe(headOf(repoA)); // premise: clean first import took the anchor
@@ -183,27 +190,31 @@ describe('import sync-bookmark guard (#2114)', () => {
 
     // The #2114 clobber: pre-fix, repo_path + last_run moved to repoB
     // unconditionally (and last_commit with them on a clean import).
-    expect(await engine.getConfig('sync.repo_path')).toBe(repoA);
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
     expect(await engine.getConfig('sync.last_commit')).toBe(anchorBefore);
     expect(await engine.getConfig('sync.last_run')).toBe(lastRunBefore);
 
-    // The refusal is loud, and names the intentional-repoint command.
+    // The refusal is loud and explains the pathless ownership check.
     expect(notices).toContain('NOT repointing');
-    expect(notices).toContain('gbrain config set sync.repo_path');
+    expect(notices).toContain('existing commit anchor');
   });
 
-  test('re-importing the SAME repo still advances the bookmark', async () => {
+  test('another checkout of the SAME pathless repo advances the bookmark without copying its path', async () => {
     await run([repoA, '--no-embed', '--json']);
     const firstHead = headOf(repoA);
     expect(await engine.getConfig('sync.last_commit')).toBe(firstHead);
 
-    commitNewFile(repoA, 'second.md');
-    const secondHead = headOf(repoA);
+    const cloneParent = mkdtempSync(join(tmpdir(), 'gbrain-2114-clone-'));
+    cleanups.push(cloneParent);
+    const secondCheckout = join(cloneParent, 'checkout');
+    execFileSync('git', ['clone', '--quiet', repoA, secondCheckout], { env: GIT_ENV });
+    commitNewFile(secondCheckout, 'second.md');
+    const secondHead = headOf(secondCheckout);
     expect(secondHead).not.toBe(firstHead);
 
-    await run([repoA, '--no-embed', '--json']);
+    await run([secondCheckout, '--no-embed', '--json']);
     expect(await engine.getConfig('sync.last_commit')).toBe(secondHead);
-    expect(await engine.getConfig('sync.repo_path')).toBe(repoA);
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
   });
 
   test('non-canonical CONFIGURED spelling still counts as the same repo (realpath compare)', async () => {
@@ -238,15 +249,35 @@ describe('import sync-bookmark guard (#2114)', () => {
     expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
 
     const notices = await captureStderr(async () => {
-      await run([repoB, '--no-embed', '--json']);
+      await run([repoB, '--source-id', 'default', '--no-embed', '--json']);
     });
     expect(notices).toContain('NOT repointing');
     expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
     expect(await engine.getConfig('sync.last_commit')).toBeFalsy();
 
-    // The REAL brain repo may align the global with the source row.
-    await run([repoA, '--no-embed', '--json']);
-    expect(await engine.getConfig('sync.repo_path')).toBe(repoA);
+    // The REAL brain repo may advance the bookmark, but its local path stays
+    // solely on the pre-existing source row rather than being copied global.
+    await run([repoA, '--source-id', 'default', '--no-embed', '--json']);
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
+    expect(await engine.getConfig('sync.last_commit')).toBe(headOf(repoA));
+  });
+
+  test('a pathless default-source commit blocks a foreign repo after client path retirement', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = NULL, last_commit = $1 WHERE id = 'default'`,
+      [headOf(repoA)],
+    );
+
+    const notices = await captureStderr(async () => {
+      await run([repoB, '--source-id', 'default', '--no-embed', '--json']);
+    });
+    expect(notices).toContain('existing commit anchor');
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
+    expect(await engine.getConfig('sync.last_commit')).toBeFalsy();
+
+    await run([repoA, '--source-id', 'default', '--no-embed', '--json']);
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
+    expect(await engine.getConfig('sync.last_commit')).toBe(headOf(repoA));
   });
 
   test('non-default source import never touches the global sync.* keys', async () => {
@@ -260,16 +291,16 @@ describe('import sync-bookmark guard (#2114)', () => {
     expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
     expect(await engine.getConfig('sync.last_commit')).toBeFalsy();
 
-    // Case 2: globals configured — a non-default import must leave them alone.
+    // Case 2: a pathless default import owns the global commit bookmark.
     await run([repoA, '--no-embed', '--json']);
-    expect(await engine.getConfig('sync.repo_path')).toBe(repoA);
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
     const anchorBefore = await engine.getConfig('sync.last_commit');
     expect(anchorBefore).toBe(headOf(repoA)); // premise: clean default import took the anchor
 
     commitNewFile(repoB, 'more.md');
     await run([repoB, '--source-id', 'work-code', '--no-embed', '--json']);
 
-    expect(await engine.getConfig('sync.repo_path')).toBe(repoA);
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
     expect(await engine.getConfig('sync.last_commit')).toBe(anchorBefore);
   });
 
@@ -299,5 +330,21 @@ describe('import sync-bookmark guard (#2114)', () => {
       `SELECT local_path FROM sources WHERE id = 'default'`,
     );
     expect(rows[0]?.local_path).toBe(repoA);
+  });
+
+  test('writeSyncAnchor uses the pathless commit anchor to reject a foreign repo', async () => {
+    await engine.setConfig('sync.last_commit', headOf(repoA));
+
+    const notices = await captureStderr(async () => {
+      await writeSyncAnchor(engine, undefined, 'last_commit', headOf(repoB), undefined, repoB);
+    });
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
+    expect(await engine.getConfig('sync.last_commit')).toBe(headOf(repoA));
+    expect(notices).toContain('existing commit anchor');
+
+    commitNewFile(repoA, 'next-anchor.md');
+    await writeSyncAnchor(engine, undefined, 'last_commit', headOf(repoA), undefined, repoA);
+    expect(await engine.getConfig('sync.last_commit')).toBe(headOf(repoA));
+    expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
   });
 });

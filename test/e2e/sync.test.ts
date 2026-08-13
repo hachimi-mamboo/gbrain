@@ -254,7 +254,7 @@ describeE2E('E2E: Git-to-DB Sync Pipeline', () => {
     expect(ops).not.toBeNull();
   });
 
-  test('sync stores last_commit and last_run in config', async () => {
+  test('sync stores non-path bookmarks without persisting the explicit checkout', async () => {
     const engine = getEngine();
 
     const lastCommit = await engine.getConfig('sync.last_commit');
@@ -264,7 +264,7 @@ describeE2E('E2E: Git-to-DB Sync Pipeline', () => {
     expect(lastCommit).toBeTruthy();
     expect(lastCommit!.length).toBe(40); // full SHA
     expect(lastRun).toBeTruthy();
-    expect(repoPathConfig).toBe(repoPath);
+    expect(repoPathConfig).toBeFalsy();
   });
 
   test('sync logs to ingest_log', async () => {
