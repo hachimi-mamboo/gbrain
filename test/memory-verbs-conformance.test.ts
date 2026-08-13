@@ -516,8 +516,8 @@ describe('conformance runner — negative self-test [F3]', () => {
     const honest = await runConformance(lyingClient((_v, b) => b), { marker: 'pos1' });
     const failures = honest.results.filter(r => r.status === 'fail');
     expect(failures).toEqual([]);
-  }, 20_000); // v0.45.7: two full runConformance passes now exercise 7 verbs;
-  // the default 5s budget flakes under the parallel shard runner (red-team F6).
+  }, 60_000); // Four full runConformance passes now exercise 7 verbs;
+  // 20s reproduced as a timeout even in isolation; keep shard headroom (red-team F6).
 });
 
 describe('fixture mirror + surface invariants', () => {
