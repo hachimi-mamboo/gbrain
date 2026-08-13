@@ -19,6 +19,7 @@ import { existsSync, statSync, realpathSync } from 'fs';
 import { join as pathJoin, resolve as pathResolve } from 'path';
 import { execFileSync } from 'child_process';
 import type { BrainEngine } from './engine.ts';
+import { isUndefinedTableError } from './utils.ts';
 
 export interface SyncManifest {
   added: string[];
@@ -667,10 +668,36 @@ export interface GlobalAnchorOwnership {
 function repoContainsCommit(dir: string, commit: string): boolean {
   // Accept both SHA-1 and SHA-256 object formats; reject arbitrary revisions.
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit)) return false;
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    // This is an ownership read, not a fetch. It must stay local and
+    // non-interactive even for a partial clone.
+    GIT_NO_LAZY_FETCH: '1',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    GCM_INTERACTIVE: 'never',
+    GIT_OPTIONAL_LOCKS: '0',
+  };
+  // Ambient repository/object-store overrides can make `git -C dir` inspect
+  // another checkout or borrow its objects. Strip every such selector before
+  // treating object membership as an ownership signal.
+  for (const key of [
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_INDEX_FILE',
+    'GIT_SHALLOW_FILE',
+    'GIT_REPLACE_REF_BASE',
+  ]) {
+    delete env[key];
+  }
   try {
     execFileSync('git', ['-C', dir, 'cat-file', '-e', `${commit}^{commit}`], {
       stdio: 'ignore',
       timeout: 30_000,
+      env,
     });
     return true;
   } catch {
@@ -729,8 +756,11 @@ export async function ownsGlobalSyncAnchor(
       };
     }
     defaultCommit = rows[0]?.last_commit ?? null;
-  } catch {
-    // sources table unavailable (pre-v0.18 brain mid-upgrade).
+  } catch (error) {
+    // Only a genuinely pre-sources-table brain may use the global fallback.
+    // Connection, permission, timeout, and other database errors must fail
+    // closed rather than masquerading as a fresh brain.
+    if (!isUndefinedTableError(error)) throw error;
   }
   const anchorCommit = sourceId === 'default'
     ? defaultCommit ?? globalCommit

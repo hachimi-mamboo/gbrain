@@ -648,9 +648,8 @@ export async function runImport(
     } else if ((sourceId ?? 'default') === 'default') {
       if (configured) {
         console.error(
-          `\n[import] sync.repo_path stays at ${configured} — NOT repointing to "${dir}". ` +
-          `Sync bookmarks were not advanced. If this directory IS your brain repo, run: ` +
-          `gbrain config set sync.repo_path "${dir}"`,
+          `\n[import] Sync bookmarks remain on the existing local checkout anchor — ` +
+          `NOT repointing to "${dir}". The candidate checkout does not match that anchor.`,
         );
       } else {
         console.error(

@@ -35,6 +35,8 @@ import { execFileSync } from 'child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runImport } from '../src/commands/import.ts';
 import { writeSyncAnchor } from '../src/commands/sync.ts';
+import { ownsGlobalSyncAnchor } from '../src/core/sync.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
@@ -197,6 +199,7 @@ describe('import sync-bookmark guard (#2114)', () => {
     // The refusal is loud and explains the pathless ownership check.
     expect(notices).toContain('NOT repointing');
     expect(notices).toContain('existing commit anchor');
+    expect(notices).not.toContain('gbrain config set sync.repo_path');
   });
 
   test('another checkout of the SAME pathless repo advances the bookmark without copying its path', async () => {
@@ -252,6 +255,7 @@ describe('import sync-bookmark guard (#2114)', () => {
       await run([repoB, '--source-id', 'default', '--no-embed', '--json']);
     });
     expect(notices).toContain('NOT repointing');
+    expect(notices).not.toContain('gbrain config set sync.repo_path');
     expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
     expect(await engine.getConfig('sync.last_commit')).toBeFalsy();
 
@@ -346,5 +350,79 @@ describe('import sync-bookmark guard (#2114)', () => {
     await writeSyncAnchor(engine, undefined, 'last_commit', headOf(repoA), undefined, repoA);
     expect(await engine.getConfig('sync.last_commit')).toBe(headOf(repoA));
     expect(await engine.getConfig('sync.repo_path')).toBeFalsy();
+  });
+
+  test('a sources lookup error fails closed instead of masquerading as a fresh brain', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = NULL, last_commit = $1 WHERE id = 'default'`,
+      [headOf(repoA)],
+    );
+    const failingEngine = {
+      getConfig: engine.getConfig.bind(engine),
+      executeRaw: async () => {
+        throw new Error('injected connection reset');
+      },
+    } as unknown as BrainEngine;
+
+    await expect(
+      ownsGlobalSyncAnchor(failingEngine, 'default', repoB),
+    ).rejects.toThrow('injected connection reset');
+  });
+
+  test('ambient Git object-store overrides cannot make a foreign checkout own an anchor', async () => {
+    const anchor = headOf(repoA);
+    const poisonedEnv = {
+      ...GIT_ENV,
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: join(repoA, '.git', 'objects'),
+    };
+    // Premise: un-sanitized Git can resolve repoA's object while pointed at
+    // repoB solely because the ambient alternate-object store is inherited.
+    expect(() => execFileSync(
+      'git',
+      ['-C', repoB, 'cat-file', '-e', `${anchor}^{commit}`],
+      { stdio: 'ignore', env: poisonedEnv },
+    )).not.toThrow();
+
+    // Spawn with the poison present from process start: Bun does not reliably
+    // propagate a process.env mutation to a child when execFileSync omits env.
+    const script = [
+      `import { ownsGlobalSyncAnchor } from './src/core/sync.ts';`,
+      `const engine = {`,
+      `  getConfig: async (key) => key === 'sync.last_commit' ? ${JSON.stringify(anchor)} : null,`,
+      `  executeRaw: async () => [],`,
+      `};`,
+      `console.log(JSON.stringify(await ownsGlobalSyncAnchor(engine, undefined, ${JSON.stringify(repoB)})));`,
+    ].join('\n');
+    const output = execFileSync(process.execPath, ['-e', script], {
+      cwd: join(import.meta.dir, '..'),
+      encoding: 'utf-8',
+      env: poisonedEnv,
+    });
+    const ownership = JSON.parse(output) as { owns: boolean; anchorCommit: string | null };
+    expect(ownership.owns).toBe(false);
+    expect(ownership.anchorCommit).toBe(anchor);
+  });
+
+  test('explicit-default and legacy callers use their documented commit precedence', async () => {
+    await engine.setConfig('sync.last_commit', headOf(repoB));
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = NULL, last_commit = $1 WHERE id = 'default'`,
+      [headOf(repoA)],
+    );
+
+    expect((await ownsGlobalSyncAnchor(engine, 'default', repoA)).owns).toBe(true);
+    expect((await ownsGlobalSyncAnchor(engine, 'default', repoB)).owns).toBe(false);
+    expect((await ownsGlobalSyncAnchor(engine, undefined, repoB)).owns).toBe(true);
+    expect((await ownsGlobalSyncAnchor(engine, undefined, repoA)).owns).toBe(false);
+  });
+
+  test('legacy last_commit writes without a repo directory fail closed', async () => {
+    await engine.setConfig('sync.last_commit', headOf(repoA));
+    const notices = await captureStderr(async () => {
+      await writeSyncAnchor(engine, undefined, 'last_commit', headOf(repoB));
+    });
+
+    expect(await engine.getConfig('sync.last_commit')).toBe(headOf(repoA));
+    expect(notices).toContain('repo directory was not provided');
   });
 });

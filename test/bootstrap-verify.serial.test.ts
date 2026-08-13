@@ -178,6 +178,42 @@ describe('verifyWorkspace — keyless pass', () => {
     expect(runs[0].ok).toBe(true); // newest = this run
   }, 240_000);
 
+  test('probe rows are hard-deleted when write-through reports failure after DB writes', async () => {
+    const putPage = operations.find((op) => op.name === 'put_page');
+    if (!putPage) throw new Error('put_page operation missing');
+    const originalHandler = putPage.handler;
+    putPage.handler = (async (ctx: OperationContext, params: Record<string, unknown>) => {
+      const result = await originalHandler(ctx, params);
+      if (params.slug === VERIFY_PROBE_SLUG) {
+        rmSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`), { force: true });
+        return {
+          ...(result as Record<string, unknown>),
+          write_through: { written: false, skipped: 'injected write-through failure' },
+        };
+      }
+      return result;
+    }) as typeof putPage.handler;
+
+    try {
+      const res = await verifyWorkspace(engine, ws, {
+        sourceId: 'workspace',
+        gbrainHomeDir: home,
+        capabilities: KEYLESS,
+      });
+      expect(check(res.checks, 'roundtrip').some((c) => !c.ok)).toBe(true);
+
+      const probePages = await engine.executeRaw<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1 AND slug IN ($2, $3)`,
+        ['workspace', VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG],
+      );
+      expect(probePages[0].n).toBe(0);
+      expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`))).toBe(false);
+      expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_ENTITY_SLUG}.md`))).toBe(false);
+    } finally {
+      putPage.handler = originalHandler;
+    }
+  }, 240_000);
+
   test('a user fact that merely CONTAINS the magic-token substring survives verify [8b]', async () => {
     // A real user fact from a different page, plus a legacy NULL-slug fact,
     // both mentioning the token STRING. The probe cleanup must scope to the

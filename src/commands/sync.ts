@@ -1446,7 +1446,7 @@ export async function writeSyncAnchor(
   // #2114: the repo dir this anchor write is FOR. Required to guard the
   // legacy branch's `last_commit` writes (where `value` is a hash, not a
   // dir). `repo_path` writes self-describe via `value`. Callers that omit
-  // it on a legacy-path last_commit write keep pre-#2114 behavior.
+  // it on a legacy-path last_commit write fail closed.
   repoDir?: string,
 ): Promise<void> {
   if (sourceId) {
@@ -1483,25 +1483,32 @@ export async function writeSyncAnchor(
   // silently repointed put_page write-through and poisoned the incremental
   // anchor. Refuse to move them for a directory that isn't the brain repo.
   const anchorDir = which === 'repo_path' ? value : repoDir;
-  if (anchorDir !== undefined) {
-    const { owns, configured, anchorCommit } = await ownsGlobalSyncAnchor(
-      engine,
-      undefined,
-      anchorDir,
+  if (anchorDir === undefined) {
+    serr(
+      `[sync] sync.${which} was not changed: the legacy global write cannot ` +
+      `prove checkout ownership because its repo directory was not provided.`,
     );
-    if (!owns) {
-      const identity = configured ??
-        (anchorCommit ? `existing commit anchor ${anchorCommit.slice(0, 8)}` : '(unset)');
-      const remediation = configured
-        ? ` To make that directory the brain repo: ` +
-          `gbrain config set sync.repo_path "${anchorDir}"`
-        : ' The candidate checkout does not contain the existing commit anchor.';
-      serr(
-        `[sync] sync.${which} stays at ${identity} — not moving the ` +
-        `global anchor for "${anchorDir}".${remediation}`,
-      );
-      return;
-    }
+    return;
+  }
+  const { owns, configured, anchorCommit } = await ownsGlobalSyncAnchor(
+    engine,
+    undefined,
+    anchorDir,
+  );
+  if (!owns) {
+    const identity = configured
+      ? 'existing local checkout anchor'
+      : anchorCommit
+        ? `existing commit anchor ${anchorCommit.slice(0, 8)}`
+        : '(unset)';
+    const reason = configured
+      ? 'The candidate checkout does not match the existing local anchor.'
+      : 'The candidate checkout does not contain the existing commit anchor.';
+    serr(
+      `[sync] sync.${which} stays at ${identity} — not moving the ` +
+      `global anchor for "${anchorDir}". ${reason}`,
+    );
+    return;
   }
   await engine.setConfig(`sync.${which}`, value);
 }

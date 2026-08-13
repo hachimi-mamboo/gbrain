@@ -533,22 +533,57 @@ interface RoundtripOutcome {
   checks: VerifyCheck[];
 }
 
-/** The G1/CX2-5 core: put_page (real op, remote:false) → committed file under
- * brain/ → sweep → graph floor via link tables → get_page → search → magic
- * moment (keyless fence fact) → delete probes. */
-async function runRoundtrip(
+/** Best-effort G13 cleanup shared by every roundtrip exit path. */
+async function cleanupRoundtripProbes(
+  engine: BrainEngine,
+  ws: string,
+  sourceId: string,
+  checks: VerifyCheck[],
+): Promise<void> {
+  const deleteWarnings: string[] = [];
+  for (const slug of [VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]) {
+    try {
+      // Verifier artifacts must be physically removed. The public delete_page
+      // operation intentionally performs a recoverable soft delete.
+      await engine.deletePage(slug, { sourceId });
+    } catch (e) {
+      deleteWarnings.push(`${slug}: ${(e as Error).message}`);
+    }
+    try {
+      rmSync(join(ws, 'brain', `${slug}.md`), { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  try {
+    // Exact-identity delete (see sweepProbeLeftovers): only facts whose fence
+    // lives on a probe page, never a token substring match over user facts.
+    await engine.executeRaw(
+      `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug IN ($2, $3)`,
+      [sourceId, VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG],
+    );
+  } catch {
+    /* best effort */
+  }
+  if (deleteWarnings.length > 0) {
+    checks.push({ id: 'probe_cleanup', ok: false, warn: true, detail: `probe deletion incomplete: ${deleteWarnings.join('; ')}` });
+  }
+}
+
+/** The G1/CX2-5 core after stale-probe sweep: put_page (real op,
+ * remote:false) → committed file under brain/ → sweep → graph floor via link
+ * tables → get_page → search → magic moment (keyless fence fact). */
+async function runRoundtripCore(
   engine: BrainEngine,
   ws: string,
   sourceId: string,
   opts: VerifyOpts,
-): Promise<RoundtripOutcome> {
-  const checks: VerifyCheck[] = [];
+  checks: VerifyCheck[],
+): Promise<void> {
   const ctx = localCtx(engine, sourceId, opts.log);
   const putPage = findOp('put_page');
   const getPage = findOp('get_page');
   const queryOp = findOp('query');
-
-  await sweepProbeLeftovers(engine, ws, sourceId);
 
   // 1. Write both probe pages through the REAL op handler [G1].
   let writeThroughDetail = '';
@@ -576,11 +611,11 @@ async function runRoundtrip(
           `The workspace source must be registered with its brain/ dir as local_path ` +
           `(gbrain sources add ${sourceId} --path ${join(ws, 'brain')}) or agent writes never reach the repo.`,
       });
-      return { checks };
+      return;
     }
   } catch (e) {
     checks.push({ id: 'roundtrip', ok: false, detail: `put_page failed: ${(e as Error).message}` });
-    return { checks };
+    return;
   }
 
   // 2. Sweep — the `gbrain sweep --once` equivalent, run in-process because
@@ -596,7 +631,7 @@ async function runRoundtrip(
     opts.log?.(`[verify] sweep: facts=${report.factsReconciled} links=${report.linksExtracted} timeline=${report.timelineExtracted}`);
   } catch (e) {
     checks.push({ id: 'graph_floor', ok: false, detail: `maintenance sweep failed: ${(e as Error).message}` });
-    return { checks };
+    return;
   }
 
   // 3. Graph floor: ≥1 extracted edge, answered through the link tables.
@@ -650,37 +685,23 @@ async function runRoundtrip(
     checks.push({ id: 'magic_moment', ok: false, detail: `facts read-back failed: ${(e as Error).message}` });
   }
 
-  // 6. Hard-delete the probes [G13] — they are fixed verifier artifacts, not
-  // user content. The public delete_page op is intentionally a recoverable
-  // soft delete, so using it here would leave both probe rows in shared DBs.
-  // Cleanup failure is a WARNING, never a verify fail.
-  const deleteWarnings: string[] = [];
-  for (const slug of [VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]) {
-    try {
-      await engine.deletePage(slug, { sourceId });
-    } catch (e) {
-      deleteWarnings.push(`${slug}: ${(e as Error).message}`);
-    }
-    try {
-      rmSync(join(ws, 'brain', `${slug}.md`), { force: true });
-    } catch {
-      /* best effort */
-    }
-  }
-  try {
-    // Exact-identity delete (see sweepProbeLeftovers): only facts whose fence
-    // lives on a probe page, never a token substring match over user facts.
-    await engine.executeRaw(
-      `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug IN ($2, $3)`,
-      [sourceId, VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG],
-    );
-  } catch {
-    /* best effort */
-  }
-  if (deleteWarnings.length > 0) {
-    checks.push({ id: 'probe_cleanup', ok: false, warn: true, detail: `probe deletion incomplete: ${deleteWarnings.join('; ')}` });
-  }
+}
 
+/** Run the roundtrip and hard-delete fixed probes on success, handled failure,
+ * or an unexpected throw. Cleanup failure remains a warning. */
+async function runRoundtrip(
+  engine: BrainEngine,
+  ws: string,
+  sourceId: string,
+  opts: VerifyOpts,
+): Promise<RoundtripOutcome> {
+  const checks: VerifyCheck[] = [];
+  await sweepProbeLeftovers(engine, ws, sourceId);
+  try {
+    await runRoundtripCore(engine, ws, sourceId, opts, checks);
+  } finally {
+    await cleanupRoundtripProbes(engine, ws, sourceId, checks);
+  }
   return { checks };
 }
 
