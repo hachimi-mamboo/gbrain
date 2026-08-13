@@ -547,7 +547,6 @@ async function runRoundtrip(
   const putPage = findOp('put_page');
   const getPage = findOp('get_page');
   const queryOp = findOp('query');
-  const deletePage = findOp('delete_page');
 
   await sweepProbeLeftovers(engine, ws, sourceId);
 
@@ -651,11 +650,14 @@ async function runRoundtrip(
     checks.push({ id: 'magic_moment', ok: false, detail: `facts read-back failed: ${(e as Error).message}` });
   }
 
-  // 6. Delete the probes [G13] — failure is a WARNING, never a verify fail.
+  // 6. Hard-delete the probes [G13] — they are fixed verifier artifacts, not
+  // user content. The public delete_page op is intentionally a recoverable
+  // soft delete, so using it here would leave both probe rows in shared DBs.
+  // Cleanup failure is a WARNING, never a verify fail.
   const deleteWarnings: string[] = [];
   for (const slug of [VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]) {
     try {
-      await deletePage.handler(ctx, { slug });
+      await engine.deletePage(slug, { sourceId });
     } catch (e) {
       deleteWarnings.push(`${slug}: ${(e as Error).message}`);
     }

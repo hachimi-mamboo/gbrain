@@ -161,6 +161,11 @@ describe('verifyWorkspace — keyless pass', () => {
     // Probe cleanup [G13]: pages, files, and the reconciled fact are gone.
     expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`))).toBe(false);
     expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_ENTITY_SLUG}.md`))).toBe(false);
+    const probePages = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1 AND slug IN ($2, $3)`,
+      ['workspace', VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG],
+    );
+    expect(probePages[0].n).toBe(0);
     const facts = await engine.executeRaw<{ fact: string }>(
       `SELECT fact FROM facts WHERE source_id = $1 AND fact LIKE $2`,
       ['workspace', `%${VERIFY_MAGIC_TOKEN}%`],
