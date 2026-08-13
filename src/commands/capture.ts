@@ -31,6 +31,8 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import matter from 'gray-matter';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
@@ -581,7 +583,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
     // is always 'capture-cli'; ingested_via is 'put_page' (the write API),
     // source_uri identifies the file path or stdin marker.
     const sourceUri = parsed.filePath
-      ? `file://${parsed.filePath}`
+      ? pathToFileURL(resolvePath(parsed.filePath)).href
       : parsed.stdin
         ? 'stdin'
         : 'cli-positional';

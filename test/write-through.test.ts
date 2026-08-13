@@ -9,6 +9,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -103,6 +104,41 @@ describe('writePageThrough', () => {
         expect(fs.existsSync(projectPath)).toBe(true);
         expect(fs.readFileSync(defaultPath, 'utf8')).toContain('# Body default:decisions/retention');
         expect(fs.readFileSync(projectPath, 'utf8')).toContain('# Body project-p:decisions/retention');
+      },
+    );
+  });
+
+  test('shared brain-repo updates a non-default source at its recorded projection path', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('project-p', 'Project P', '{}'::jsonb)`,
+    );
+    const slug = 'library/decisions/retention-policy';
+    const recordedPath = 'Library/Decisions/Retention Policy.md';
+    await importFromContent(engine, slug, `---\ntitle: Retention Policy\ntype: note\n---\n\n# Current policy\n`, {
+      noEmbed: true,
+      sourceId: 'project-p',
+      sourcePath: recordedPath,
+    });
+    const projectionRoot = path.join(brainDir, '.sources', 'project-p');
+    const authoredPath = path.join(projectionRoot, recordedPath);
+    fs.mkdirSync(path.dirname(authoredPath), { recursive: true });
+    fs.writeFileSync(authoredPath, 'stale\n');
+    await engine.setConfig('sync.repo_path', '');
+
+    await withEnv(
+      {
+        GBRAIN_BRAIN_REPO_PATH: brainDir,
+        GBRAIN_SOURCE: undefined,
+        GBRAIN_SOURCE_PATH: undefined,
+      },
+      async () => {
+        const result = await writePageThrough(engine, slug, { sourceId: 'project-p' });
+
+        expect(result).toMatchObject({ written: true, path: authoredPath });
+        expect(fs.readFileSync(authoredPath, 'utf8')).toContain('# Current policy');
+        expect(fs.existsSync(path.join(projectionRoot, `${slug}.md`))).toBe(false);
+        expect(fs.existsSync(path.join(brainDir, recordedPath))).toBe(false);
       },
     );
   });
@@ -232,6 +268,137 @@ describe('writePageThrough', () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const res = await writePageThrough(engine, 'wiki/ideas/does-not-exist');
     expect(res).toEqual({ written: false, skipped: 'page_not_found_after_write' });
+  });
+
+  test('[REGRESSION twin] honors the recorded source_path instead of minting a slug-named twin', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    // A human-authored vault file whose on-disk name is NOT its slug — the
+    // normal case for Obsidian (Title Case, spaces) once slugified.
+    const slug = 'library/people/steve-jobs';
+    const authored = 'Library/People/Steve Jobs.md';
+    await importFromContent(engine, slug, `---\ntitle: Steve Jobs\ntype: person\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+      sourcePath: authored,
+    });
+    fs.mkdirSync(path.join(brainDir, 'Library', 'People'), { recursive: true });
+    fs.writeFileSync(path.join(brainDir, authored), 'stale\n');
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(path.join(brainDir, authored));
+    // The authored file was UPDATED in place...
+    expect(fs.readFileSync(path.join(brainDir, authored), 'utf8')).not.toBe('stale\n');
+    // ...and no slug-derived twin appeared anywhere in the tree.
+    const twin = resolvePageFilePath(brainDir, slug, 'default');
+    expect(fs.existsSync(twin)).toBe(false);
+    expect(walkFiles(brainDir).sort()).toEqual([path.join(brainDir, authored)]);
+  });
+
+  test('[REGRESSION twin] null source_path still falls back to the slug-derived path', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'inbox/2026-01-01-abc123';
+    // Born via put/capture: no file of record, so source_path stays NULL.
+    await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+    });
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(resolvePageFilePath(brainDir, slug, 'default'));
+  });
+
+  test('[REGRESSION twin] falls back to a contained file:// source_uri when source_path is null (capture --file of a vault file)', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'library/companies/postiz';
+    const authored = 'Library/Companies/Postiz.md';
+    // `capture --file` records the absolute path as source_uri and leaves
+    // source_path NULL — the exact shape that used to mint a twin.
+    await importFromContent(engine, slug, `---\ntitle: Postiz\ntype: company\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+    });
+    await engine.executeRaw(`UPDATE pages SET source_uri = $1 WHERE slug = $2`, [
+      pathToFileURL(path.join(brainDir, authored)).href,
+      slug,
+    ]);
+    fs.mkdirSync(path.join(brainDir, 'Library', 'Companies'), { recursive: true });
+    fs.writeFileSync(path.join(brainDir, authored), 'stale\n');
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(path.join(brainDir, authored));
+    // NB: no `existsSync(slug path)` assertion here — this slug differs from the
+    // authored name only by CASE, so a case-insensitive FS (macOS/Windows) folds
+    // the two and existsSync would report a twin that isn't there. walkFiles
+    // enumerates real directory entries, so it is case-truthful on every FS.
+    expect(walkFiles(brainDir).sort()).toEqual([path.join(brainDir, authored)]);
+  });
+
+  test('[REGRESSION twin] a file:// source_uri OUTSIDE the repo is ignored', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'inbox/from-elsewhere';
+    await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+    });
+    // A file captured from outside the brain repo has no file of record inside it.
+    await engine.executeRaw(`UPDATE pages SET source_uri = $1 WHERE slug = $2`, [
+      pathToFileURL(path.join(tmpRoot, 'outside', 'Notes.md')).href,
+      slug,
+    ]);
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(resolvePageFilePath(brainDir, slug, 'default'));
+    expect(fs.existsSync(path.join(tmpRoot, 'outside', 'Notes.md'))).toBe(false);
+  });
+
+  test('[REGRESSION twin] a traversing source_path is ignored, not joined', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'wiki/ideas/hostile-1';
+    await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+      sourcePath: `${slug}.md`,
+    });
+    // Simulate a hostile / corrupted row after the fact.
+    await engine.executeRaw(`UPDATE pages SET source_path = $1 WHERE slug = $2`, [
+      '../../escaped.md',
+      slug,
+    ]);
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    // Falls back to the slug path rather than escaping the write root.
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(resolvePageFilePath(brainDir, slug, 'default'));
+    expect(fs.existsSync(path.join(tmpRoot, '..', 'escaped.md'))).toBe(false);
+  });
+
+  test('[REGRESSION twin] preserves a legal leading space in recorded source_path', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'library/people/leading-space';
+    const authored = ' Library/People/Alice.md';
+    await importFromContent(engine, slug, `---\ntitle: Alice\ntype: person\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+      sourcePath: authored,
+    });
+    fs.mkdirSync(path.dirname(path.join(brainDir, authored)), { recursive: true });
+    fs.writeFileSync(path.join(brainDir, authored), 'stale\n');
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(path.join(brainDir, authored));
+    expect(fs.existsSync(path.join(brainDir, 'Library', 'People', 'Alice.md'))).toBe(false);
+    expect(fs.existsSync(resolvePageFilePath(brainDir, slug, 'default'))).toBe(false);
   });
 
   test('[REGRESSION #2018] default page (null local_path) in a multi-source brain → skipped, no leak into a sibling source repo', async () => {

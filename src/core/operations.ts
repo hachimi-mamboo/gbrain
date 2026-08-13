@@ -5,12 +5,13 @@
 
 import { lstatSync, realpathSync } from 'fs';
 import { resolve, relative, sep } from 'path';
+import { fileURLToPath } from 'url';
 import type { BrainEngine } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
-import { writePageThrough } from './write-through.ts';
+import { writePageThrough, type WriteThroughResult } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags, stampUnverifiedExtractions } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
@@ -33,6 +34,11 @@ export { MEMORY_VERBS_VERSION };
 import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
 import { ALL_SOURCES } from './source-id.ts';
+import {
+  BRAIN_REPO_SOURCES_DIR,
+  resolveSourceProjectionRoot,
+} from './brain-repo-layout.ts';
+import { isWriteTargetContained } from './path-confine.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import {
@@ -1194,6 +1200,50 @@ const put_page: Operation = {
     const { resolveClientBrainRepoPath, resolveClientSourcePath } = await import('./source-resolver.ts');
     const sharedBrainRepoPath = resolveClientBrainRepoPath();
     const clientSourcePath = resolveClientSourcePath(sourceId);
+    let localFileSourcePath: string | undefined;
+    if (
+      ctx.remote === false &&
+      provenanceUri?.startsWith('file://') &&
+      (clientSourcePath || sharedBrainRepoPath)
+    ) {
+      const sourceRoot = clientSourcePath ?? resolveSourceProjectionRoot(sharedBrainRepoPath!, sourceId);
+      const forbiddenSharedRoot = sharedBrainRepoPath && sourceId === 'default'
+        ? resolve(sharedBrainRepoPath, BRAIN_REPO_SOURCES_DIR)
+        : null;
+      let capturedFilePath: string | null = null;
+      try {
+        capturedFilePath = fileURLToPath(provenanceUri);
+      } catch {
+        // A malformed local file locator must not bypass the path guard or
+        // make an otherwise valid capture fail. Drop it below.
+      }
+      let relativePath: string | null = null;
+      if (
+        capturedFilePath &&
+        isWriteTargetContained(capturedFilePath, sourceRoot) &&
+        !(forbiddenSharedRoot && isWriteTargetContained(capturedFilePath, forbiddenSharedRoot))
+      ) {
+        try {
+          relativePath = relative(realpathSync(sourceRoot), realpathSync(capturedFilePath))
+            .split(sep)
+            .join('/');
+        } catch {
+          // The path changed between confinement and canonicalization. Treat
+          // it as external instead of persisting a stale local locator.
+        }
+      }
+      if (relativePath) {
+        if (
+          relativePath.toLowerCase().endsWith('.md') &&
+          !relativePath.split('/')[0]?.startsWith('.')
+        ) localFileSourcePath = relativePath;
+        provenanceUri = `source:${sourceId}/${relativePath}`;
+      } else {
+        // The input may legitimately live outside the bound checkout. Keep
+        // the capture, but never persist its machine-local locator.
+        provenanceUri = `source:${sourceId}`;
+      }
+    }
     if (sharedBrainRepoPath) {
       const { toRepoRelativeSourcePath } = await import('./brain-repo-layout.ts');
       // Validate the source-qualified physical mapping before the DB write.
@@ -1267,6 +1317,7 @@ const put_page: Operation = {
       // not strictly local is remote (matches CV6 / v0.26.9 F7b posture).
       remote: ctx.remote !== false,
       ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+      ...(localFileSourcePath ? { sourcePath: localFileSourcePath } : {}),
       // v0.39.0.0 T1.5: pack-aware type inference (loaded above; legacy
       // inferType behavior when undefined).
       ...(activePack ? { activePack } : {}),
@@ -1347,7 +1398,10 @@ const put_page: Operation = {
     // Trust gating:
     //   - Subagent sandbox (viaSubagent without allowedSlugPrefixes) → DB-only.
     //   - All other writes → write-through.
-    let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
+    // put_page's own trust-gating produces two skip reasons ('subagent_sandbox',
+    // 'dry_run') that never come out of writePageThrough itself — widen the
+    // field rather than losing the commit/pushed/lastPushStatus typing.
+    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
     if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
