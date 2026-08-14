@@ -12,16 +12,25 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import matter from 'gray-matter';
 import { runCapture, __testing } from '../../src/commands/capture.ts';
+import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
+import { withEnv } from '../helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
 let brainDir: string;
 
 beforeAll(async () => {
+  // Keep capture's put_page integration hermetic under CI's fake provider keys.
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: {},
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -29,6 +38,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  resetGateway();
 });
 
 beforeEach(async () => {
@@ -205,6 +215,156 @@ describe('capture — local install integration', () => {
     const page = await engine.getPage('inbox/from-file');
     expect(page).not.toBeNull();
     expect(page?.compiled_truth).toContain('body content here');
+  });
+
+  test('--file in a shared source projection preserves its source-relative path without leaking the checkout', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('project-p', 'Project P', '{}'::jsonb)`,
+    );
+    await engine.setConfig('sync.repo_path', '');
+
+    const projectionRoot = path.join(brainDir, '.sources', 'project-p');
+    const sourcePath = 'Library/People/Alice.md';
+    const authoredFile = path.join(projectionRoot, sourcePath);
+    fs.mkdirSync(path.dirname(authoredFile), { recursive: true });
+    fs.writeFileSync(authoredFile, '# Alice\n\nportable source path');
+
+    const logCaptured: string[] = [];
+    const origLog = console.log;
+    const origExit = process.exit;
+    let exitCode: number | null = null;
+    console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
+    process.exit = ((code?: number) => {
+      exitCode = code ?? 0;
+      throw new Error('__captured_process_exit__');
+    }) as typeof process.exit;
+    try {
+      await withEnv(
+        {
+          GBRAIN_BRAIN_REPO_PATH: brainDir,
+          GBRAIN_SOURCE: undefined,
+          GBRAIN_SOURCE_PATH: undefined,
+        },
+        () => runCapture(engine, [
+          '--file', authoredFile,
+          '--source', 'project-p',
+          '--slug', 'people/alice',
+          '--quiet',
+        ]),
+      );
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== '__captured_process_exit__') throw error;
+    } finally {
+      console.log = origLog;
+      process.exit = origExit;
+    }
+
+    expect(exitCode).toBeNull();
+    expect(logCaptured[0]).toBe('people/alice');
+    const rows = await engine.executeRaw<{
+      source_path: string | null;
+      source_uri: string | null;
+    }>(
+      `SELECT source_path, source_uri FROM pages WHERE source_id = 'project-p' AND slug = 'people/alice'`,
+    );
+    expect(rows[0]?.source_path).toBe(sourcePath);
+    expect(rows[0]?.source_uri).toBe(`source:project-p/${sourcePath}`);
+    expect(rows[0]?.source_uri).not.toContain(brainDir);
+    expect(fs.readFileSync(authoredFile, 'utf8')).toContain('portable source path');
+    expect(fs.existsSync(path.join(projectionRoot, 'people', 'alice.md'))).toBe(false);
+  });
+
+  test('--file outside a shared source projection is captured without persisting its local path', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('project-p', 'Project P', '{}'::jsonb)`,
+    );
+    await engine.setConfig('sync.repo_path', '');
+
+    const externalFile = path.join(tmpRoot, 'external.md');
+    fs.writeFileSync(externalFile, '# External\n\ncontent outside the checkout');
+    const logCaptured: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
+    try {
+      await withEnv(
+        {
+          GBRAIN_BRAIN_REPO_PATH: brainDir,
+          GBRAIN_SOURCE: undefined,
+          GBRAIN_SOURCE_PATH: undefined,
+        },
+        () => runCapture(engine, [
+          '--file', externalFile,
+          '--source', 'project-p',
+          '--slug', 'inbox/external',
+          '--quiet',
+        ]),
+      );
+    } finally {
+      console.log = origLog;
+    }
+
+    expect(logCaptured[0]).toBe('inbox/external');
+    const rows = await engine.executeRaw<{
+      source_path: string | null;
+      source_uri: string | null;
+    }>(
+      `SELECT source_path, source_uri FROM pages WHERE source_id = 'project-p' AND slug = 'inbox/external'`,
+    );
+    expect(rows[0]?.source_path).toBeNull();
+    expect(rows[0]?.source_uri).toBe('source:project-p');
+    expect(rows[0]?.source_uri).not.toContain(tmpRoot);
+    expect(fs.existsSync(path.join(
+      brainDir,
+      '.sources',
+      'project-p',
+      'inbox',
+      'external.md',
+    ))).toBe(true);
+  });
+
+  test('default-source --file does not claim or rewrite another shared projection', async () => {
+    execFileSync('git', ['init', '--quiet'], { cwd: brainDir, stdio: 'ignore' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('project-p', 'Project P', '{}'::jsonb)`,
+    );
+    await engine.setConfig('sync.repo_path', '');
+
+    const projectFile = path.join(brainDir, '.sources', 'project-p', 'Private.md');
+    fs.mkdirSync(path.dirname(projectFile), { recursive: true });
+    fs.writeFileSync(projectFile, '# Project P\n\nsource-owned content');
+    const original = fs.readFileSync(projectFile, 'utf8');
+    const origLog = console.log;
+    console.log = () => {};
+    try {
+      await withEnv(
+        {
+          GBRAIN_BRAIN_REPO_PATH: brainDir,
+          GBRAIN_SOURCE: undefined,
+          GBRAIN_SOURCE_PATH: undefined,
+        },
+        () => runCapture(engine, [
+          '--file', projectFile,
+          '--source', 'default',
+          '--slug', 'inbox/copied-from-project-p',
+          '--quiet',
+        ]),
+      );
+    } finally {
+      console.log = origLog;
+    }
+
+    const rows = await engine.executeRaw<{
+      source_path: string | null;
+      source_uri: string | null;
+    }>(
+      `SELECT source_path, source_uri FROM pages WHERE source_id = 'default' AND slug = 'inbox/copied-from-project-p'`,
+    );
+    expect(rows[0]?.source_path).toBeNull();
+    expect(rows[0]?.source_uri).toBe('source:default');
+    expect(fs.readFileSync(projectFile, 'utf8')).toBe(original);
+    expect(fs.existsSync(path.join(brainDir, 'inbox', 'copied-from-project-p.md'))).toBe(true);
   });
 
   test('--json emits structured output', async () => {

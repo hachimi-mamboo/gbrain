@@ -6,13 +6,16 @@
 import { describe, test, expect } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import {
-  chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { withEnv } from './helpers/with-env.ts';
 import {
   generateBrainPullPlist,
   renderCronWrapper,
+  installDurabilityCron,
+  durabilityJobStatus,
 } from '../src/core/brain-repo-durability.ts';
 
 const TOKEN = 'ghp_SHOULD_NEVER_APPEAR';
@@ -21,14 +24,16 @@ describe('renderCronWrapper (D2 DB-free)', () => {
   const w = renderCronWrapper('wiki', '/data/clones/wiki', 'main', ['/usr/local/bin/gbrain'], '/home/u/.gbrain/brain-push.log');
 
   test('calls the DB-free path command, not the engine-opening one', () => {
-    expect(w).toContain("sources pull --path '/data/clones/wiki'");
+    expect(w).toContain("--quiet sources pull --path '/data/clones/wiki'");
     expect(w).toContain("--branch 'main'");
     expect(w).not.toMatch(/sources pull '?wiki'?(\s|$)/); // never `sources pull wiki`
   });
 
-  test('self-disables when the captured checkout is gone', () => {
-    expect(w).toContain("if [ ! -d '/data/clones/wiki/.git' ]");
-    expect(w).toContain('path gone, skipping');
+  test('self-disables via git rev-parse (recognizes worktrees where the git marker is a FILE), not a bare dir test', () => {
+    expect(w).toContain("if ! git -C '/data/clones/wiki' rev-parse --is-inside-work-tree");
+    expect(w).not.toContain("-d '/data/clones/wiki/.git'");
+    expect(w).not.toContain("-d '/data/clones/wiki'");
+    expect(w).toContain('not a git work tree, skipping');
   });
 
   test('sources the shell profile (secret-free) and never bakes a token', () => {
@@ -54,7 +59,7 @@ describe('renderCronWrapper (D2 DB-free)', () => {
     writeFileSync(cli, `#!/usr/bin/env bun
 import { writeFileSync } from 'node:fs';
 import { renderCronWrapper, resolveGbrainCliInvocation } from ${JSON.stringify(durabilityModule)};
-if (process.argv[2] === 'sources') {
+if (process.argv.slice(2).includes('sources')) {
   writeFileSync(${JSON.stringify(output)}, JSON.stringify(process.argv.slice(2)));
 } else {
   process.stdout.write(renderCronWrapper(
@@ -64,17 +69,18 @@ if (process.argv[2] === 'sources') {
 `);
     chmodSync(cli, 0o755);
     symlinkSync('../gbrain/src/cli.ts', shim);
+    writeFileSync(join(launchdPath, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
     try {
       const body = execFileSync(shim, [], {
         encoding: 'utf-8', env: { HOME: home, PATH: `${binDir}:${dirname(process.execPath)}:/usr/bin:/bin` },
       });
-      expect(body).toContain(`exec '${process.execPath}' '${realpathSync(cli)}' sources pull`);
+      expect(body).toContain(`exec '${process.execPath}' '${realpathSync(cli)}' --quiet sources pull`);
       writeFileSync(wrapper, body);
       chmodSync(wrapper, 0o755);
       execFileSync(wrapper, [], { env: { HOME: home, PATH: launchdPath } });
       expect(JSON.parse(readFileSync(output, 'utf-8'))).toEqual([
-        'sources', 'pull', '--path', repo, '--branch', 'main',
+        '--quiet', 'sources', 'pull', '--path', repo, '--branch', 'main',
       ]);
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -108,6 +114,67 @@ try {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  test('scheduled pull stays quiet with a fresh upgrade-available cache', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-cron-quiet-'));
+    const bare = join(home, 'origin.git');
+    const repo = join(home, 'brain');
+    const bin = join(home, 'bin');
+    const wrapper = join(home, 'pull.sh');
+    const cli = realpathSync(join(import.meta.dir, '..', 'src', 'cli.ts'));
+    const git = (...args: string[]) => execFileSync('git', args, {
+      cwd: repo,
+      stdio: 'ignore',
+    });
+
+    try {
+      execFileSync('git', ['init', '--bare', '--initial-branch=main', bare], { stdio: 'ignore' });
+      mkdirSync(repo);
+      git('init', '--initial-branch=main');
+      git('config', 'user.email', 'cron-test@example.invalid');
+      git('config', 'user.name', 'cron test');
+      writeFileSync(join(repo, 'README.md'), '# brain\n');
+      git('add', 'README.md');
+      git('commit', '-m', 'initial');
+      git('remote', 'add', 'origin', bare);
+      git('push', '-u', 'origin', 'main');
+
+      // The production pull deliberately rejects file:// fetches. Keep the
+      // external Git boundary hermetic while exercising the real CLI path:
+      // origin/main already exists from the push, so network fetch/pull are no-ops.
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, 'git'),
+        '#!/bin/sh\nfor arg in "$@"; do case "$arg" in fetch|pull) exit 0;; esac; done\nexec /usr/bin/git "$@"\n',
+        { mode: 0o755 },
+      );
+
+      mkdirSync(join(home, '.gbrain'));
+      writeFileSync(join(home, '.gbrain', 'last-update-check'), 'UPGRADE_AVAILABLE 0.45.9.0 0.99.0\n');
+      writeFileSync(
+        wrapper,
+        renderCronWrapper('brain-repo', repo, 'main', [process.execPath, cli], join(home, 'pull.log')),
+        { mode: 0o755 },
+      );
+
+      const env: Record<string, string> = { ...process.env } as Record<string, string>;
+      delete env.NODE_ENV;
+      delete env.GBRAIN_SKIP_STARTUP_HOOKS;
+      env.HOME = home;
+      env.GBRAIN_HOME = home;
+      env.GBRAIN_SELF_UPGRADE_MODE = 'notify';
+      env.PATH = `${bin}:/usr/bin:/bin`;
+      const result = Bun.spawnSync([wrapper], { cwd: repo, env, stdout: 'pipe', stderr: 'pipe' });
+
+      expect({
+        exitCode: result.exitCode,
+        stdout: result.stdout.toString().trim(),
+        stderr: result.stderr.toString(),
+      }).toEqual({ exitCode: 0, stdout: 'up to date (main)', stderr: '' });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe('generateBrainPullPlist (D12 launchd)', () => {
@@ -122,5 +189,107 @@ describe('generateBrainPullPlist (D12 launchd)', () => {
     expect(plist).toContain('<string>com.gbrain.brain-pull.wiki</string>');
     expect(plist).toContain('/home/u/.gbrain/brain-pull-wiki.sh');
     expect(plist.includes(TOKEN)).toBe(false);
+  });
+});
+
+
+describe('installDurabilityCron — crontab probe [B2/D-cloud]', () => {
+  test('crontab absent on a non-darwin host → skipped (expected in containers), never needs_attention', async () => {
+    const empty = mkdtempSync(join(tmpdir(), 'no-bin-'));
+    const home = mkdtempSync(join(tmpdir(), 'gb-cron-'));
+    await withEnv({ PATH: empty, GBRAIN_HOME: home }, async () => {
+      const r = installDurabilityCron('wiki', '/data/clones/wiki', 'main', 1800, false, 'linux');
+      expect(r.status).toBe('skipped');
+      expect(r.detail).toContain('no crontab on this host');
+      expect(r.detail).toContain('post-commit auto-push');
+    });
+  });
+
+  test('crontab present but failing → needs_attention (a real breakage stays loud)', async () => {
+    const shim = mkdtempSync(join(tmpdir(), 'shim-cron-'));
+    // -l lists empty; writing the new tab (crontab -) fails.
+    writeFileSync(join(shim, 'crontab'), '#!/bin/sh\ncase "$1" in -l) exit 0;; esac\nexit 1\n', { mode: 0o755 });
+    writeFileSync(join(shim, 'gbrain'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const home = mkdtempSync(join(tmpdir(), 'gb-cron2-'));
+    await withEnv({ PATH: `${shim}:${process.env.PATH ?? ''}`, GBRAIN_HOME: home }, async () => {
+      const r = installDurabilityCron('wiki', '/data/clones/wiki', 'main', 1800, false, 'linux');
+      expect(r.status).toBe('needs_attention');
+      expect(r.detail).toContain('crontab install failed');
+    });
+  });
+
+  test('dry-run on a crontab-less host still reports the honest skip', async () => {
+    const empty = mkdtempSync(join(tmpdir(), 'no-bin2-'));
+    await withEnv({ PATH: empty }, async () => {
+      const r = installDurabilityCron('wiki', '/data/clones/wiki', 'main', 1800, true, 'linux');
+      expect(r.status).toBe('skipped');
+    });
+  });
+});
+
+describe('durabilityJobStatus — presence + liveness [D7]', () => {
+  test('no scheduler binaries at all → kind none (never throws)', async () => {
+    const empty = mkdtempSync(join(tmpdir(), 'no-bin3-'));
+    const home = mkdtempSync(join(tmpdir(), 'jb-home-'));
+    await withEnv({ PATH: empty, HOME: home }, async () => {
+      const s = durabilityJobStatus('wiki', 1800, 'linux');
+      expect(s.kind).toBe('none');
+      expect(s.wrapperPresent).toBe(false);
+    });
+  });
+
+  test('crontab line present (shim) → kind crontab, live', async () => {
+    const shim = mkdtempSync(join(tmpdir(), 'shim-jb-'));
+    writeFileSync(
+      join(shim, 'crontab'),
+      '#!/bin/sh\ncase "$1" in -l) echo "*/30 * * * * /x.sh # com.gbrain.brain-pull.wiki"; exit 0;; esac\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const home = mkdtempSync(join(tmpdir(), 'jb-home2-'));
+    await withEnv({ PATH: shim, HOME: home }, async () => {
+      const s = durabilityJobStatus('wiki', 1800, 'linux');
+      expect(s.kind).toBe('crontab');
+      expect(s.live).toBe(true);
+    });
+  });
+
+  test('stale pull log is reported (logFresh false)', async () => {
+    const empty = mkdtempSync(join(tmpdir(), 'no-bin4-'));
+    const home = mkdtempSync(join(tmpdir(), 'jb-home3-'));
+    const logDir = join(home, '.gbrain');
+    // A log last touched 3 hours ago against a 30-min interval.
+    mkdirSync(logDir, { recursive: true });
+    const log = join(logDir, 'brain-pull.log');
+    writeFileSync(log, 'old\n');
+    const old = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    utimesSync(log, old, old);
+    await withEnv({ PATH: empty, HOME: home }, async () => {
+      const s = durabilityJobStatus('wiki', 1800, 'linux');
+      expect(s.logFresh).toBe(false);
+    });
+  });
+});
+
+describe('durabilityJobStatus — darwin launchd liveness [D7]', () => {
+  async function darwinFixture(launchctlExit: number): Promise<ReturnType<typeof durabilityJobStatus>> {
+    const home = mkdtempSync(join(tmpdir(), 'jb-mac-'));
+    const plistDir = join(home, 'Library', 'LaunchAgents');
+    mkdirSync(plistDir, { recursive: true });
+    writeFileSync(join(plistDir, 'com.gbrain.brain-pull.wiki.plist'), '<plist/>');
+    const shim = mkdtempSync(join(tmpdir(), 'shim-lc-'));
+    writeFileSync(join(shim, 'launchctl'), `#!/bin/sh\nexit ${launchctlExit}\n`, { mode: 0o755 });
+    return withEnv({ PATH: shim, HOME: home }, async () => durabilityJobStatus('wiki', 1800, 'darwin'));
+  }
+
+  test('plist present + launchctl reports loaded → live', async () => {
+    const s = await darwinFixture(0);
+    expect(s.kind).toBe('launchd');
+    expect(s.live).toBe(true);
+  });
+
+  test('plist present but NOT loaded (the dead-job shape [D7]) → live=false', async () => {
+    const s = await darwinFixture(1);
+    expect(s.kind).toBe('launchd');
+    expect(s.live).toBe(false);
   });
 });

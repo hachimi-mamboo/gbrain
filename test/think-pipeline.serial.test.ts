@@ -177,6 +177,12 @@ describe('runThink (with stub client)', () => {
     expect(result.gaps).toEqual(['no info on funding history']);
     expect(result.takesGathered).toBeGreaterThan(0);
     expect(result.warnings).not.toContain('LLM_OUTPUT_NOT_JSON');
+    // think's own cost was previously unsurfaced anywhere (not in this CLI's
+    // output, not in budget_ledger, and invisible to a wrapping caller's own
+    // token accounting since the LLM call is think's own, separate call).
+    // usage flows through from the real client.create() response so the CLI
+    // can compute cost_usd from it via canonicalLookup(modelUsed).
+    expect(result.usage).toEqual({ input_tokens: 10, output_tokens: 10 });
   });
 
   test('passes the question into page excerpt selection', async () => {
@@ -280,7 +286,9 @@ describe('runThink (with stub client)', () => {
     // used to be stamped NO_ANTHROPIC_API_KEY, sending operators to debug
     // env/keychain when the fix was the model id. Model validity beats the key
     // check in probeChatModel, so the honest label holds even keyless.
-    await engine.setConfig('models.think', 'anthropic:claude-bogus-9');
+    // voyage has no chat touchpoint — the surviving unknown_model trigger now
+    // that unlisted ids on chat-capable providers pass through to the provider.
+    await engine.setConfig('models.think', 'voyage:voyage-3');
     try {
       const result = await withoutAnthropicKey(() => runThink(engine, { question: 'bad model test' }));
       expect(result.warnings).toContain('MODEL_NOT_USABLE:unknown_model');
@@ -352,9 +360,9 @@ describe('runThink — #1698 explicit-model hard error', () => {
     ).rejects.toThrow(/not usable.*unknown_provider/);
   });
 
-  test('explicit typo native --model THROWS (unknown_model)', async () => {
+  test('explicit --model on a chat-less provider THROWS (unknown_model)', async () => {
     await expect(
-      runThink(engine, { question: 'x', model: 'anthropic:claude-bogus-9', modelExplicit: true }),
+      runThink(engine, { question: 'x', model: 'voyage:voyage-3', modelExplicit: true }),
     ).rejects.toThrow(/not usable.*unknown_model/);
   });
 
@@ -415,6 +423,19 @@ describe('runThink + persistSynthesis — #1698 never persist empty', () => {
       question: 'stub full', stubResponse: { answer: 'has content', citations: [], gaps: [] },
     });
     expect(full.synthesisOk).toBe(true);
+  });
+
+  test('opts.stubResponse path never made a real LLM call — usage stays null', async () => {
+    // Same distinction synthesisOk already makes: opts.stubResponse bypasses
+    // client.create() entirely, so there is no real usage to report. cost_usd
+    // must not be computed (and should render as null in --json) when this
+    // happens, since there is nothing to compute it from. Since the [E2]
+    // MEMORY_VERBS usage-accounting change, "no LLM ran" is spelled `null`
+    // (the frozen cost-block contract), not `undefined`.
+    const result = await runThink(engine, {
+      question: 'stub no usage', stubResponse: { answer: 'has content', citations: [], gaps: [] },
+    });
+    expect(result.usage).toBeNull();
   });
 
   test('pre-existing ThinkResult literal without synthesisOk still persists (back-compat)', async () => {

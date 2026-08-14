@@ -337,7 +337,9 @@ async function resolveAIOptions(opts: ResolveAIOptionsArgs): Promise<ResolvedAIO
       process.exit(1);
     }
     out.embedding_model = `${shorthand}:${firstModel}`;
-    out.embedding_dimensions = recipe.touchpoints.embedding!.default_dims;
+    // #2051: width follows the model actually chosen, not the recipe default.
+    const { embeddingDimsForModel } = await import('../core/ai/model-resolver.ts');
+    out.embedding_dimensions = embeddingDimsForModel(recipe, firstModel);
   }
 
   if (dimsArg !== null && !Number.isNaN(dimsArg) && dimsArg > 0) {
@@ -361,8 +363,13 @@ async function resolveAIOptions(opts: ResolveAIOptionsArgs): Promise<ResolvedAIO
       );
       process.exit(1);
     }
-    if (recipe?.touchpoints.embedding?.default_dims) {
-      out.embedding_dimensions = recipe.touchpoints.embedding.default_dims;
+    // #2051: resolve the width from the SPECIFIC model, not the recipe-wide
+    // default. `--embedding-model ollama:bge-m3` must yield 1024, not Ollama's
+    // nomic-shaped 768.
+    if (recipe) {
+      const { embeddingDimsForModel } = await import('../core/ai/model-resolver.ts');
+      const dims = embeddingDimsForModel(recipe, out.embedding_model);
+      if (dims > 0) out.embedding_dimensions = dims;
     }
   }
 
@@ -525,9 +532,11 @@ async function resolveEmbeddingByEnv(out: ResolvedAIOptions, nonInteractive: boo
       // legacy OpenAI 1536), not the recipe's 2560.
       const { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } =
         await import('../core/ai/defaults.ts');
+      const { embeddingDimsForModel } = await import('../core/ai/model-resolver.ts');
+      // #2051: non-canonical models resolve per-model, not recipe-wide.
       const dims = fullModel === DEFAULT_EMBEDDING_MODEL
         ? DEFAULT_EMBEDDING_DIMENSIONS
-        : tp.default_dims;
+        : embeddingDimsForModel(r, model);
       out.embedding_model = fullModel;
       out.embedding_dimensions = dims;
       console.error(
@@ -1040,6 +1049,9 @@ async function initPGLite(opts: {
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
     config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
+    // MEMORY_VERBS v1 [D6C]: TTHW stamp — `gbrain protocol stats` derives
+    // install→first-verb-call from this. Idempotent on re-init.
+    config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
     saveConfig(config);
     if (opts.schemaPack) {
       process.stderr.write(
@@ -1077,6 +1089,7 @@ async function initPGLite(opts: {
       } else {
         console.log('Next: gbrain import <dir>');
       }
+      printMemoryVerbsQuickstart();
       console.log('');
       console.log('When you outgrow local: gbrain migrate --to supabase');
       reportModStatus();
@@ -1094,6 +1107,26 @@ async function initPGLite(opts: {
   }
 }
 
+/**
+ * MEMORY_VERBS v1 quickstart funnel (E3 + D4B + T1 consent). Printed at the
+ * end of both init epilogues. The copy-next block is EXACTLY three commands
+ * (codex DX 9): wire the harness, write a memory, prove the resurrection.
+ * The demo uses the facts arm only, so it works with NO embedding key [F-B].
+ */
+function printMemoryVerbsQuickstart(): void {
+  console.log('');
+  console.log('Give your agent memory (copy these three commands):');
+  console.log('  claude mcp add gbrain -- gbrain serve --surface verbs');
+  console.log('  gbrain remember "I prefer dark mode in every editor" --provenance demo --entity people/me');
+  console.log('  gbrain recall --entity people/me');
+  console.log('Now ask your agent in a NEW session — it remembers.');
+  console.log('');
+  console.log('Note: memories agents save are readable by every agent connected to');
+  console.log('this brain; use visibility:"private" for local-only facts.');
+  console.log('Other harnesses (Codex, OpenClaw): docs/protocol/MEMORY_VERBS_v1.md');
+  console.log('If `claude` is not found: install Claude Code first, or use the per-harness blocks in that doc.');
+}
+
 async function initPostgres(opts: {
   databaseUrl: string;
   jsonOutput: boolean;
@@ -1108,12 +1141,12 @@ async function initPostgres(opts: {
 
   // v0.37.10.0 T6 (D11) + v0.37.11.0 Lane B.2: ALWAYS configure gateway BEFORE
   // initSchema. Same preflight contract as PGLite. Refuse to call initSchema
-  // until the gateway-resolved dim is validated. Schema substitution in
-  // src/schema.sql is currently a static `vector(1536)` for Postgres (unlike
-  // PGLite's templated dim), so a Voyage/ZE-configured Postgres brain will
-  // still need a future schema rewrite path — preflight makes the
-  // not-yet-supported case fail loud rather than silently produce a stuck
-  // 1536d column.
+  // until the gateway-resolved dim is validated. PostgresEngine.initSchema()
+  // passes the resolved model and dimensions through getPostgresSchema(),
+  // which templates the static `vector(1536)` source before executing it.
+  // Preflight therefore prevents an invalid dimension from reaching schema
+  // generation, while the post-init assertion below guards against templating
+  // drift.
   let resolvedDim: number | undefined;
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
@@ -1288,6 +1321,8 @@ async function initPostgres(opts: {
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
     config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
+    // MEMORY_VERBS v1 [D6C]: TTHW stamp (see the PGLite path).
+    config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
     saveConfig(config);
     console.log('Config saved to ~/.gbrain/config.json');
     if (opts.schemaPack) {
@@ -1322,6 +1357,7 @@ async function initPostgres(opts: {
       } else {
         console.log('Next: gbrain import <dir>');
       }
+      printMemoryVerbsQuickstart();
       reportModStatus();
       const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
       const { VERSION } = await import('../version.ts');

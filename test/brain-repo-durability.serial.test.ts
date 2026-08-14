@@ -4,12 +4,12 @@
  * redirected to a tmp dir; installCron:false so the suite never touches launchd.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, chmodSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, realpathSync, statSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import {
-  hardenBrainRepo, unhardenBrainRepo, acceptPat,
+  hardenBrainRepo, unhardenBrainRepo, acceptPat, maintainPushLog,
 } from '../src/core/brain-repo-durability.ts';
 import { runHarden, runPull, runUnharden } from '../src/commands/sources-harden.ts';
 import { runSync } from '../src/commands/sync.ts';
@@ -118,7 +118,9 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'brd-'));
   oldHome = process.env.HOME; oldGbrainHome = process.env.GBRAIN_HOME;
   process.env.HOME = mkdtempSync(join(root, 'home-'));
-  process.env.GBRAIN_HOME = join(process.env.HOME, '.gbrain');
+  // CX2-8: GBRAIN_HOME is a PARENT dir (config.ts semantics — `.gbrain` is
+  // appended by the resolver), so the effective home is $HOME/.gbrain.
+  process.env.GBRAIN_HOME = process.env.HOME;
   process.env.GBRAIN_GIT_ALLOW_FILE_TRANSPORT = '1';
   makePair();
 });
@@ -159,7 +161,7 @@ describe('hardenBrainRepo', () => {
       expect(output.reports).toHaveLength(1);
       expect(output.reports[0]).toMatchObject({
         source_id: 'brain-repo',
-        repo_path: work,
+        repo_path: realpathSync(work),
       });
 
       // A preview may read every source and inspect Git, but must not retire
@@ -202,7 +204,7 @@ describe('hardenBrainRepo', () => {
       expect(output.reports).toHaveLength(1);
       expect(output.reports[0]).toMatchObject({
         source_id: 'brain-repo',
-        repo_path: work,
+        repo_path: realpathSync(work),
         clean_against_origin: true,
       });
       expect(output.reports[0].steps).toContainEqual(expect.objectContaining({
@@ -342,8 +344,8 @@ describe('hardenBrainRepo', () => {
 
   test('shared unharden removes the checkout-level durability identity', async () => {
     const engine = await sharedBrainEngine();
-    const sharedWrapper = join(process.env.GBRAIN_HOME!, 'brain-pull-brain-repo.sh');
-    mkdirSync(process.env.GBRAIN_HOME!, { recursive: true });
+    const sharedWrapper = join(process.env.GBRAIN_HOME!, '.gbrain', 'brain-pull-brain-repo.sh');
+    mkdirSync(join(process.env.GBRAIN_HOME!, '.gbrain'), { recursive: true });
     writeFileSync(sharedWrapper, '#!/bin/sh\n', { mode: 0o755 });
 
     try {
@@ -641,7 +643,7 @@ describe('hardenBrainRepo', () => {
 
   test('D11 — writes a repo-scoped credential (0600 store, local config, ownership key)', async () => {
     await harden();
-    const store = join(process.env.GBRAIN_HOME!, 'git-credentials');
+    const store = join(process.env.HOME!, '.gbrain', 'git-credentials');
     expect(existsSync(store)).toBe(true);
     expect(statSync(store).mode & 0o077).toBe(0); // not group/other readable
     expect(git(work, 'config', '--local', '--get', 'credential.helper')).toContain('store --file');
@@ -651,7 +653,7 @@ describe('hardenBrainRepo', () => {
   test('D11 — reuses an existing credential.helper (no plaintext store written)', async () => {
     git(work, 'config', 'credential.helper', 'osxkeychain');
     await harden();
-    const store = join(process.env.GBRAIN_HOME!, 'git-credentials');
+    const store = join(process.env.HOME!, '.gbrain', 'git-credentials');
     expect(existsSync(store)).toBe(false);
     expect(git(work, 'config', '--local', '--get', 'credential.helper')).toBe('osxkeychain');
   });
@@ -705,16 +707,54 @@ describe('hardenBrainRepo', () => {
     expect(existsSync(join(work, 'remote-ahead.md'))).toBe(false);
   });
 
-  test('dry-run preserves an already-current helper file mode', async () => {
-    await harden();
-    const helper = join(work, 'scripts', 'brain-commit-push.sh');
-    chmodSync(helper, 0o644);
-    const beforeMode = statSync(helper).mode & 0o777;
-
+  test('dry-run does not chmod an already-current helper (#3736)', async () => {
+    await harden(); // real run installs scripts/brain-commit-push.sh at 0o755
+    const helperPath = join(work, 'scripts', 'brain-commit-push.sh');
+    chmodSync(helperPath, 0o644); // simulate perms drifting away from +x, content unchanged
     await harden({ dryRun: true });
+    expect(statSync(helperPath).mode & 0o777).toBe(0o644); // untouched — preview must not mutate
+  });
 
-    expect(beforeMode).toBe(0o644);
-    expect(statSync(helper).mode & 0o777).toBe(0o644);
+  test('non-dry-run restores the exec bit on an already-current helper', async () => {
+    await harden();
+    const helperPath = join(work, 'scripts', 'brain-commit-push.sh');
+    chmodSync(helperPath, 0o644);
+    await harden();
+    expect(statSync(helperPath).mode & 0o111).toBeTruthy(); // exec bit restored
+  });
+
+  test('CX2-3 — parent-repo-aware: a subdirectory target hardens the repo ROOT', async () => {
+    // Workspace layout: the source dir is `repo/brain` while the enclosing
+    // repo owns `.git`. Pre-fix the `.git` assertion failed on the subdir.
+    const sub = join(work, 'brain');
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(sub, 'note.md'), '# note\n');
+    git(work, 'add', 'brain/note.md'); git(work, 'commit', '-qm', 'brain dir');
+    const r = await hardenBrainRepo({ repoPath: sub, sourceId: 'wiki', pat: PAT, installCron: false });
+    expect(r.repo_path).toBe(git(work, 'rev-parse', '--show-toplevel'));
+    // scaffolding landed at the ROOT, not inside brain/
+    expect(existsSync(join(work, 'scripts', 'brain-commit-push.sh'))).toBe(true);
+    expect(existsSync(join(sub, 'scripts'))).toBe(false);
+    expect(r.needs_attention).toEqual([]);
+  });
+
+  test('S3#10 — maintainPushLog chmods 0600 and rotates at 1MB', async () => {
+    const home = join(process.env.HOME!, '.gbrain');
+    mkdirSync(home, { recursive: true });
+    const log = join(home, 'brain-push.log');
+    writeFileSync(log, 'x'.repeat(1024 * 1024 + 1), { mode: 0o644 });
+    maintainPushLog();
+    // rotated: predecessor kept as .1, fresh log is empty + 0600
+    expect(existsSync(`${log}.1`)).toBe(true);
+    expect(readFileSync(log, 'utf-8')).toBe('');
+    expect(statSync(log).mode & 0o077).toBe(0);
+    // small log: chmod only, no rotation
+    rmSync(`${log}.1`);
+    writeFileSync(log, 'small\n', { mode: 0o644 });
+    maintainPushLog();
+    expect(existsSync(`${log}.1`)).toBe(false);
+    expect(readFileSync(log, 'utf-8')).toBe('small\n');
+    expect(statSync(log).mode & 0o077).toBe(0);
   });
 });
 

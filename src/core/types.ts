@@ -294,6 +294,15 @@ export interface PageFilters {
   /** ISO date string (YYYY-MM-DD or full ISO timestamp). Filter to pages updated_at > value. */
   updated_after?: string;
   /**
+   * v0.45.7 — keyset cursor for deterministic pagination through pages sharing
+   * one `updated_at`. `WHERE p.updated_at > ts OR (p.updated_at = ts AND
+   * p.slug > slug)`. Supersedes `updated_after` when set; pair with
+   * `sort: 'updated_asc'` (total order). Used by the `delta` verb's session
+   * cursor so a >limit same-timestamp cluster pages cleanly instead of
+   * livelocking. `slug` empty ⇒ start of the `ts` bucket.
+   */
+  updatedAfterKeyset?: { updatedAt: string; slug: string };
+  /**
    * Prefix-match filter on slug. Implemented as `WHERE slug LIKE prefix || '%'`
    * in both engines so it uses the (source_id, slug) UNIQUE constraint's btree
    * index for efficient range scans on large brains. Used by storage-tiering
@@ -349,7 +358,12 @@ export interface GetPageOpts {
 /** v0.29: literal ORDER BY fragments for the PageFilters.sort enum. Whitelisted. */
 export const PAGE_SORT_SQL: Record<NonNullable<PageFilters['sort']>, string> = {
   updated_desc: 'p.updated_at DESC',
-  updated_asc:  'p.updated_at ASC',
+  // v0.45.7: slug tiebreaker makes updated_asc a TOTAL order, so keyset
+  // pagination (updatedAfterKeyset) can page deterministically through a
+  // cluster of pages sharing one updated_at (bulk syncs stamp identical
+  // now() across a transaction). Without the tiebreaker, rows at the same
+  // timestamp order arbitrarily and a >limit tie cluster is unpageable.
+  updated_asc:  'p.updated_at ASC, p.slug ASC',
   created_desc: 'p.created_at DESC',
   slug:         'p.slug ASC',
 };
@@ -610,6 +624,29 @@ export interface StaleChunkRow {
 }
 
 /**
+ * A page with non-empty `compiled_truth` and/or `timeline` (both are
+ * chunked independently by the healer) but ZERO `content_chunks` rows,
+ * returned by `listChunklessPagesWithContent`. `embed --stale` scans
+ * `content_chunks` (embedding IS NULL) — a page written directly via
+ * `putPage` that never went through the chunking step (e.g. an
+ * enrichment-generated entity stub) has no chunk row to go stale, so it is
+ * invisible to that scan forever. This is the safety-net detection: find
+ * such pages so `embed --stale` can chunk them and fold the resulting
+ * NULL-embedding chunks into the same run.
+ *
+ * Quarantined and `embed_skip` pages are excluded by the underlying query
+ * (`src/core/quarantine.ts` / `src/core/embed-skip.ts`) — both are
+ * INTENTIONALLY chunkless by design (content-quality gate), not drift.
+ */
+export interface ChunklessPageRow {
+  id: number;
+  slug: string;
+  source_id: string;
+  compiled_truth: string;
+  timeline: string;
+}
+
+/**
  * v0.42.7 (#1696) — a page that needs link/timeline extraction, returned by
  * `listStalePagesForExtraction`. Carries the page CONTENT (compiled_truth +
  * timeline + frontmatter) so `gbrain extract --stale` extracts in ~1 query per
@@ -699,6 +736,17 @@ export interface SearchResult {
    * Absent when the page is clean.
    */
   content_flag?: { reason: string; detail: string };
+  /**
+   * Extraction quarantine lane (issue #160): true when the result's page is
+   * an unverified auto-extracted entity stub (frontmatter
+   * `provenance: 'auto-extracted'` + `status: 'unverified'`). Such pages are
+   * excluded from the compiled-truth authority boost and the namespace
+   * source-boost — they rank as ordinary content — and this marker tells the
+   * agent the page has NOT been reviewed by the owner. Stamped pre-fusion by
+   * `stampUnverifiedExtractions` (hybrid.ts). Absent for reviewed/ordinary
+   * pages.
+   */
+  unverified?: boolean;
   /**
    * v0.36 (cross-modal wave): the chunk's modality discriminator from
    * content_chunks.modality. 'text' for the existing text-embedding rows,
@@ -1192,7 +1240,11 @@ export interface CodeEdgeResult {
 // Links
 export interface Link {
   from_slug: string;
+  /** Exact source identity of the from-page joined by from_page_id. */
+  from_source_id: string;
   to_slug: string;
+  /** Exact source identity of the to-page joined by to_page_id. */
+  to_source_id: string;
   link_type: string;
   context: string;
   /**
@@ -1210,6 +1262,8 @@ export interface Link {
    * multiple pages reference the same (from, to, type) tuple.
    */
   origin_slug?: string | null;
+  /** Exact source identity of origin_slug; null when absent or grant-redacted. */
+  origin_source_id?: string | null;
   /**
    * The frontmatter field name that created this edge (e.g. 'key_people',
    * 'investors'). Used for debug output and the `unresolved` response list.

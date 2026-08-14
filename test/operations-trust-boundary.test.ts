@@ -86,8 +86,17 @@ describe('operations contract — every op has scope + correct mutability shape'
       'users_admin',
       'agent',
     ]);
+    // Remote-gated exception (#2598, same allowlist as test/oauth.test.ts):
+    // `think` is read-scoped for OAuth/MCP because its handler forces
+    // save/take OFF for remote callers before persistence — pinned by
+    // test/takes-mcp-allowlist.serial.test.ts. Local CLI can still persist.
+    const REMOTE_READ_ONLY_MUTATING_OPS = new Set(['think']);
     for (const op of operations) {
       if (op.mutating === true) {
+        if (REMOTE_READ_ONLY_MUTATING_OPS.has(op.name)) {
+          expect(op.scope, `remote-gated mutating op "${op.name}" should be read-scoped`).toBe('read');
+          continue;
+        }
         expect(
           WRITE_CLASS_SCOPES.has(op.scope ?? 'read'),
           `mutating op "${op.name}" has read-tier scope "${op.scope}"; expected one of ${[...WRITE_CLASS_SCOPES].join('/')}`,
@@ -153,6 +162,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'purge_deleted_pages',
       'get_recent_transcripts',
       'code_traversal_cache_clear',
+      'migrate_embeddings',
     ];
     const lookup = new Map(operations.map(op => [op.name, op] as const));
     for (const name of KNOWN_LOCAL_ONLY) {

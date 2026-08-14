@@ -51,7 +51,8 @@ import {
   OPENROUTER_CACHE_HEADER,
   openrouterRequiresExplicitPromptCache,
 } from './recipes/openrouter.ts';
-import { resolveModel, TIER_DEFAULTS } from '../model-config.ts';
+import { resolveModel } from '../model-config.ts';
+import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey } from './anthropic-key.ts';
@@ -124,6 +125,20 @@ let _config: AIGatewayConfig | null = null;
 const _modelCache = new Map<string, any>();
 
 /**
+ * Materialize `applyResolveAuth`'s SDK-shaped result ({apiKey}|{headers}) into
+ * raw HTTP headers: a Bearer-style apiKey becomes an Authorization header;
+ * custom/default headers ride alongside (they win on conflict, matching the
+ * SDK's header-after-apiKey ordering). Single source for the reranker wire path
+ * and the doctor's base-URL probe.
+ */
+export function authToHeaders(auth: { apiKey?: string; headers?: Record<string, string> }): Record<string, string> {
+  return {
+    ...(auth.apiKey ? { Authorization: `Bearer ${auth.apiKey}` } : {}),
+    ...(auth.headers ?? {}),
+  };
+}
+
+/**
  * Recover the process-global gateway for foreground command entrypoints that
  * were reached without cli.ts's normal engine-connect initialization (#2590).
  * Existing configured gateways, including their DB-resolved model overrides,
@@ -133,49 +148,6 @@ export function configureGatewayIfUninitialized(): void {
   if (_config) return;
   const config = loadConfig();
   if (config) configureGateway(buildGatewayConfig(config));
-}
-
-/**
- * v0.31.12 recipe-models merge: per-gateway-instance set of model ids the
- * user opted into via config. Keyed by provider id (`anthropic`, `openai`,
- * etc.). Passed into `assertTouchpoint` so native-recipe allowlist checks
- * skip these models — provider 404s surface at HTTP call time instead of
- * config-build time.
- *
- * Replaces the earlier plan to soften `assertTouchpoint` from throw to
- * warn (Codex F4/F5 — too broad, removed fail-fast for chat/expand/embed
- * across all callers). This narrower approach preserves fail-fast for
- * source-code typos while allowing config-time model selection of any id.
- */
-const _extendedModels: Map<string, Set<string>> = new Map();
-
-/**
- * v0.31.12 — register a model id under its provider so `assertTouchpoint`
- * (called via the gateway's chat/embed/expand entry points) permits it
- * even when it isn't in the recipe's declared `models:` array.
- *
- * Idempotent + safe to call before/after configureGateway. Exported only
- * for the `gbrain models doctor` probe path (where the operator may want
- * to probe any user-supplied id without re-running configure).
- */
-function registerExtendedModel(modelStr: string): void {
-  if (!modelStr) return;
-  try {
-    const { providerId, modelId } = parseModelId(modelStr);
-    let set = _extendedModels.get(providerId);
-    if (!set) {
-      set = new Set();
-      _extendedModels.set(providerId, set);
-    }
-    set.add(modelId);
-  } catch {
-    // Malformed model strings will fail at parseModelId — ignore here;
-    // the actual chat/embed call will surface the error.
-  }
-}
-
-function getExtendedModelsForProvider(providerId: string): ReadonlySet<string> | undefined {
-  return _extendedModels.get(providerId);
 }
 
 /**
@@ -451,6 +423,20 @@ export function resolveNativeBaseUrl(
   return /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`;
 }
 
+/**
+ * Whether an openai-compatible recipe's backend honors OpenAI structured
+ * outputs. Threaded into `createOpenAICompatible`'s `supportsStructuredOutputs`
+ * at the chat + expansion build sites, and consulted by `expand()` to pick the
+ * strict `generateObject` path over the schemaless text path. Single source of
+ * truth read from the chat touchpoint: the backend serves both chat and
+ * expansion, so the capability is declared once.
+ *
+ * @internal exported for tests.
+ */
+export function recipeSupportsStructuredOutputs(recipe: Recipe): boolean {
+  return recipe.touchpoints.chat?.supports_structured_outputs === true;
+}
+
 /** Configure the gateway. Called by cli.ts#connectEngine. Clears cached models. */
 export function configureGateway(config: AIGatewayConfig): void {
   _config = {
@@ -479,19 +465,6 @@ export function configureGateway(config: AIGatewayConfig): void {
   };
   _modelCache.clear();
   _shrinkState.clear();
-  _extendedModels.clear();
-  // Register configured models so assertTouchpoint allows them even when
-  // they aren't in the recipe's declared models: array (v0.31.12).
-  for (const m of [
-    _config.embedding_model,
-    _config.embedding_multimodal_model,
-    _config.expansion_model,
-    _config.chat_model,
-    _config.reranker_model,
-    ...(_config.chat_fallback_chain ?? []),
-  ]) {
-    if (m) registerExtendedModel(m);
-  }
   warnRecipesMissingBatchTokens();
 }
 
@@ -537,35 +510,9 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   const expansionFull = newExpansion.includes(':') ? newExpansion : prefixWithProviderFrom(cfg.expansion_model ?? DEFAULT_EXPANSION_MODEL, newExpansion);
   const chatFull = newChat.includes(':') ? newChat : prefixWithProviderFrom(cfg.chat_model ?? DEFAULT_CHAT_MODEL, newChat);
 
-  // ALSO resolve the four tier models and register them as extended models.
-  // assertTouchpoint's contract (model-resolver.ts) says config-chosen models —
-  // `models.default` and `models.tier.*` included — bypass the native recipe
-  // allowlist, but pre-fix only chat/expansion/embedding/reranker were
-  // registered. A model reachable ONLY through a tier (e.g. `models.tier.deep`
-  // set to an Opus newer than the recipe list) failed `probeChatModel` at call
-  // time and silently degraded think/auto_think to the gather-only stub.
-  // Resolving per-tier also honors `models.default` (it sits above tiers in
-  // the resolveModel chain).
-  const tierModels: string[] = [];
-  for (const tier of ['utility', 'reasoning', 'deep', 'subagent'] as const) {
-    tierModels.push(await resolveModel(engine, { tier, fallback: TIER_DEFAULTS[tier] }));
-  }
-
   _config = { ...cfg, expansion_model: expansionFull, chat_model: chatFull };
   _modelCache.clear();
   _shrinkState.clear();
-  _extendedModels.clear();
-  for (const m of [
-    _config.embedding_model,
-    _config.embedding_multimodal_model,
-    _config.expansion_model,
-    _config.chat_model,
-    _config.reranker_model,
-    ...(_config.chat_fallback_chain ?? []),
-    ...tierModels,
-  ]) {
-    if (m) registerExtendedModel(m);
-  }
   return _config;
 }
 
@@ -627,8 +574,42 @@ function warnRecipesMissingBatchTokens(): void {
   }
 }
 
-/** Reset (for tests). */
-export function resetGateway(): void {
+/**
+ * Test-only reset baseline (#3554). The bunfig preload
+ * (`test/helpers/legacy-embedding-preload.ts`) pins the gateway to the legacy
+ * OpenAI/1536 config at process start, but `resetGateway()` used to wipe that
+ * pin to `_config = null`. The next test file's engine connect then
+ * reconfigured from the SHIPPED default (zembed-1 @ 1280) and every 1536-d
+ * fixture in that file exploded with `expected 1280 dimensions, not 1536` —
+ * a cross-file mine whose placement depended on shard bin-packing.
+ *
+ * When a baseline factory is registered, `resetGateway()` means "back to the
+ * test baseline" instead of "unconfigured": it clears everything as before,
+ * then re-applies the factory's config via `configureGateway()`. A factory
+ * (not a frozen config) so each re-application captures fresh
+ * `process.env`, matching the preload's original `applyLegacy()` semantics.
+ *
+ * Production is untouched: nothing in `src/` calls `resetGateway()` or this
+ * setter, so in production the baseline is never registered and
+ * `resetGateway()` still fully unconfigures. Same `__*ForTests` seam
+ * convention as `__setEmbedTransportForTests` above.
+ */
+let _resetBaseline: (() => AIGatewayConfig) | null = null;
+
+/**
+ * Register (or clear, with `null`) the config factory that `resetGateway()`
+ * re-applies. Called once by the bunfig test preload.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function __setGatewayResetBaselineForTests(
+  factory: (() => AIGatewayConfig) | null,
+): void {
+  _resetBaseline = factory;
+}
+
+/** Clear every piece of module state. Shared by both reset flavors. */
+function clearGatewayState(): void {
   _config = null;
   _modelCache.clear();
   _shrinkState.clear();
@@ -637,7 +618,33 @@ export function resetGateway(): void {
   _embedTransportInstalled = false;
   _chatTransport = null;
   _warnedRecipes.clear();
-  _extendedModels.clear();
+}
+
+/**
+ * Reset (for tests). Clears all module state (config, model cache, shrink
+ * state, transports, warned recipes), then — if a test baseline is
+ * registered — re-applies it so the gateway returns to the process-wide
+ * test default instead of an unconfigured limbo (#3554).
+ */
+export function resetGateway(): void {
+  clearGatewayState();
+  // configureGateway re-clears _modelCache/_shrinkState; transports are NOT
+  // touched by it, so a stale test transport can never leak back in through
+  // this path.
+  if (_resetBaseline) configureGateway(_resetBaseline());
+}
+
+/**
+ * Reset AND stay unconfigured, ignoring any registered baseline. For the
+ * handful of tests that assert genuine no-gateway behavior
+ * (`no_gateway_config` diagnosis, `isAvailable() === false`, graceful
+ * degradation paths). The preload's per-test beforeEach restores the
+ * baseline before the next test, so this cannot leak across tests.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function __unconfigureGatewayForTests(): void {
+  clearGatewayState();
 }
 
 /**
@@ -682,7 +689,10 @@ export function __setChatTransportForTests(
   _chatTransport = fn;
 }
 
-function requireConfig(): AIGatewayConfig {
+/** The live gateway config, or throw if unconfigured. Exported for the
+ *  `models doctor` base-URL probe (which reads the same merged config the
+ *  gateway calls with, inside its own fail-open guard). */
+export function requireConfig(): AIGatewayConfig {
   if (!_config) {
     throw new AIConfigError(
       'AI gateway is not configured. Call configureGateway() during engine connect.',
@@ -1409,7 +1419,7 @@ export const perplexityCompatFetch = (async (input: RequestInfo | URL, init?: Re
 
 async function resolveEmbeddingProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
   const { parsed, recipe } = resolveRecipe(modelStr);
-  assertTouchpoint(recipe, 'embedding', parsed.modelId, getExtendedModelsForProvider(parsed.providerId));
+  assertTouchpoint(recipe, 'embedding', parsed.modelId);
   const cfg = requireConfig();
 
   const cacheKey = `emb:${recipe.id}:${parsed.modelId}:${cfg.base_urls?.[recipe.id] ?? ''}`;
@@ -1875,8 +1885,8 @@ async function embedSubBatch(
 }
 
 /** Embed one text (convenience wrapper). */
-export async function embedOne(text: string): Promise<Float32Array> {
-  const [v] = await embed([text]);
+export async function embedOne(text: string, opts?: EmbedOpts): Promise<Float32Array> {
+  const [v] = await embed([text], opts);
   return v;
 }
 
@@ -2368,7 +2378,7 @@ export async function embedMultimodalSafe(
 
 async function resolveExpansionProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
   const { parsed, recipe } = resolveRecipe(modelStr);
-  assertTouchpoint(recipe, 'expansion', parsed.modelId, getExtendedModelsForProvider(parsed.providerId));
+  assertTouchpoint(recipe, 'expansion', parsed.modelId);
   const cfg = requireConfig();
 
   const cacheKey = `exp:${recipe.id}:${parsed.modelId}:${cfg.base_urls?.[recipe.id] ?? ''}`;
@@ -2418,6 +2428,7 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         baseURL: compat.baseURL,
         ...(compat.fetch ? { fetch: compat.fetch } : {}),
         ...auth,
+        supportsStructuredOutputs: recipeSupportsStructuredOutputs(recipe),
       }).languageModel(modelId);
     }
   }
@@ -2426,6 +2437,20 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
 const ExpansionSchema = z.object({
   queries: z.array(z.string()).min(1).max(5),
 });
+
+/**
+ * Recover expansion queries from a schemaless model response. Used by the
+ * openai-compatible expansion paths: a tolerant JSON decode plus schema
+ * validation pulls the `queries` array out of the model's text (the prompt
+ * pins it to a bare JSON object). Returns null when the text carries no valid
+ * `{ queries: string[] }` object.
+ *
+ * @internal exported for tests.
+ */
+export function parseExpansionResponse(text: string): string[] | null {
+  const parsed = ExpansionSchema.safeParse(parseLlmJson<unknown>(text));
+  return parsed.success ? parsed.data.queries : null;
+}
 
 /**
  * Expand a search query into up to 4 related queries.
@@ -2443,24 +2468,63 @@ export async function expand(query: string): Promise<string[]> {
     metadata: { query_chars: query.length },
   });
 
+  const expansionPrompt = [
+    'Rewrite the search query below into 3-4 different, related queries that would help find relevant documents. Respond with a JSON object in exactly this shape: {"queries": ["rewrite1", "rewrite2", "rewrite3"]}. The JSON key MUST be exactly "queries" (not "rewrites" or any other variation).',
+    'Return ONLY the JSON object. Do NOT include the original query in the result.',
+    'Each rewrite should emphasize different aspects, synonyms, or framings.',
+    '',
+    `Query: ${query}`,
+  ].join('\n');
+
   try {
     const { model, recipe, modelId } = await resolveExpansionProvider(getExpansionModel());
-    const result = await generateObject({
-      model,
-      schema: ExpansionSchema,
-      // v0.42.20.0 (codex P0) — expansion had NO abortSignal; same stalled-socket
-      // class as chat. Default the chat timeout.
-      abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
-      prompt: [
-        'Rewrite the search query below into 3-4 different, related queries that would help find relevant documents.',
-        'Return ONLY the JSON object. Do NOT include the original query in the result.',
-        'Each rewrite should emphasize different aspects, synonyms, or framings.',
-        '',
-        `Query: ${query}`,
-      ].join('\n'),
-    });
 
-    const expansions = result.object?.queries ?? [];
+    let expansions: string[];
+
+    // Schemaless text path for openai-compatible backends whose structured-output
+    // support is unknown: the AI SDK can't send a json_schema response_format
+    // there, so generateObject would warn and silently degrade. generateText + a
+    // tolerant parse recovers the queries instead. Fresh abortSignal per call.
+    const viaText = async (): Promise<string[]> => {
+      const { text } = await generateText({
+        model,
+        abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
+        prompt: expansionPrompt,
+      });
+      return parseExpansionResponse(text) ?? [];
+    };
+
+    if (recipe.implementation !== 'openai-compatible') {
+      // Native providers (Anthropic, OpenAI, Google) support generateObject's
+      // structured output natively — unchanged path.
+      const result = await generateObject({
+        model,
+        schema: ExpansionSchema,
+        abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
+        prompt: expansionPrompt,
+      });
+      expansions = result.object?.queries ?? [];
+    } else if (recipeSupportsStructuredOutputs(recipe)) {
+      // openai-compatible backend that honors strict json_schema: request the
+      // schema (strict validation), and fall back to the text path if it is
+      // rejected at call time so a mis-declared capability never drops expansion.
+      try {
+        const result = await generateObject({
+          model,
+          schema: ExpansionSchema,
+          abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
+          prompt: expansionPrompt,
+        });
+        expansions = result.object?.queries ?? [];
+      } catch {
+        expansions = await viaText();
+      }
+    } else {
+      // openai-compatible backend, structured-output support unknown: skip the
+      // json_schema attempt entirely (no SDK warning, no silent degradation).
+      expansions = await viaText();
+    }
+
     // Deduplicate + include the original query
     const seen = new Set<string>();
     const all = [query, ...expansions].filter(q => {
@@ -2484,7 +2548,7 @@ export async function expand(query: string): Promise<string[]> {
 
 /**
  * Cherry-1: opt-in OCR pass for ingested images. Uses the configured
- * expansion model (default: openai:gpt-4o-mini) with a prompt explicitly
+ * expansion model (default: DEFAULT_EXPANSION_MODEL) with a prompt explicitly
  * instructing the model to NOT interpret instructions embedded in the
  * image (mitigation for OCR-as-prompt-injection).
  *
@@ -2799,20 +2863,27 @@ export interface ChatOpts {
  * (via `probeChatModel`) AND `makeJudgeClient` in `cycle/synthesize.ts`.
  *
  * Validates that a `provider:model` string resolves to a real recipe AND that the
- * recipe supports the chat touchpoint (catches typo'd native models like
- * `anthropic:claude-bogus-9`). Both checks read the recipe REGISTRY, not gateway
- * `_config`, so this works before `configureGateway()` has run — which is why
- * `makeJudgeClient` reuses this layer instead of the full `probeChatModel` (whose
- * `isAvailable` layer would reject non-Anthropic-no-key + unconfigured-gateway).
+ * recipe supports the chat touchpoint (catches chat-less providers like
+ * `voyage:*` / `ollama:*` embeddings-only recipes — NOT model-id typos: there
+ * is no runtime model allowlist, so an unlisted id passes here and a
+ * nonexistent one surfaces as the provider's own model_not_found at call
+ * time). Both checks read the recipe REGISTRY, not gateway `_config`, so this
+ * works before `configureGateway()` has run — which is why `makeJudgeClient`
+ * reuses this layer instead of the full `probeChatModel` (whose `isAvailable`
+ * layer would reject non-Anthropic-no-key + unconfigured-gateway).
  *
  * Order matters: `resolveRecipe` first (unknown_provider), then `assertTouchpoint`
- * (unknown_model). `isAvailable` alone collapses both into a bare `false`.
+ * (unknown_model = provider lacks the touchpoint). `isAvailable` alone collapses
+ * both into a bare `false`.
  */
 export type ModelIdValidity =
   | { ok: true; parsed: ParsedModelId; recipe: Recipe }
   | { ok: false; reason: 'unknown_provider' | 'unknown_model'; detail: string; fix?: string };
 
-export function validateModelId(modelStr: string): ModelIdValidity {
+export function validateModelId(
+  modelStr: string,
+  touchpoint: TouchpointKind = 'chat',
+): ModelIdValidity {
   let parsed: ParsedModelId;
   let recipe: Recipe;
   try {
@@ -2822,7 +2893,7 @@ export function validateModelId(modelStr: string): ModelIdValidity {
     throw e;
   }
   try {
-    assertTouchpoint(recipe, 'chat', parsed.modelId, getExtendedModelsForProvider(parsed.providerId));
+    assertTouchpoint(recipe, touchpoint, parsed.modelId);
   } catch (e) {
     if (e instanceof AIConfigError) return { ok: false, reason: 'unknown_model', detail: e.message, fix: e.fix };
     throw e;
@@ -2876,7 +2947,7 @@ function chatSupportsPromptCache(recipe: Recipe, modelId: string): boolean {
 
 async function resolveChatProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
   const { parsed, recipe } = resolveRecipe(modelStr);
-  assertTouchpoint(recipe, 'chat', parsed.modelId, getExtendedModelsForProvider(parsed.providerId));
+  assertTouchpoint(recipe, 'chat', parsed.modelId);
   const cfg = requireConfig();
 
   const cacheKey = `chat:${recipe.id}:${parsed.modelId}:${cfg.base_urls?.[recipe.id] ?? ''}`;
@@ -2926,6 +2997,7 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
         baseURL: compat.baseURL,
         ...(compat.fetch ? { fetch: compat.fetch } : {}),
         ...auth,
+        supportsStructuredOutputs: recipeSupportsStructuredOutputs(recipe),
       }).languageModel(modelId);
     }
     default:
@@ -3788,9 +3860,10 @@ const DEFAULT_RERANK_TIMEOUT_MS = 5000;
  * the fail-open path so search never throws.
  *
  * Errors classified into RerankError.reason for the caller's fail-open
- * decision table. The model allowlist check is done HERE (not via
- * assertTouchpoint), because assertTouchpoint doesn't enforce allowlists for
- * openai-compatible recipes — CDX2-F11 in the plan.
+ * decision table. The model list check below is rerank-specific and
+ * deliberate (assertTouchpoint never checks model ids): each listed reranker
+ * model maps to a known request/response wire shape, so an unknown id could
+ * mis-parse a response rather than fail cleanly.
  */
 export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   if (!input.query) {
@@ -3859,10 +3932,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   // through `auth.headers` alongside Bearer-style apiKey. The merge below
   // materializes both shapes so static-default-headers ride on the reranker
   // wire path the same way they ride the SDK paths.
-  const authHeaders: Record<string, string> = {
-    ...(auth.apiKey ? { Authorization: `Bearer ${auth.apiKey}` } : {}),
-    ...(auth.headers ?? {}),
-  };
+  const authHeaders = authToHeaders(auth);
   const body = JSON.stringify({
     model: parsed.modelId,
     query: input.query,

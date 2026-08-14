@@ -410,7 +410,33 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // #2825: bumped 11→12 to fold the resolved hard-exclude prefix list
     // (hx=) — cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across
     // processes.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // #3390/#3391: bumped 12→13 for the embedding-provider migration wave —
+    // legacy callers hash prov=default before AND after a provider swap, so
+    // pre-migration cache rows must become unreachable on upgrade.
+    // v0.42.67.x bumped 13→14: the compiled_truth boost no longer applies at
+    // detail=medium (#3430). Cached rows were ranked under the old semantics,
+    // so they must become unreachable rather than be served under the new ones.
+    // Bumped 14→15 to fold the resolved FTS configuration name (fts=) —
+    // GBRAIN_FTS_LANGUAGE retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language must
+    // not survive a `reindex-search-vector` switch.
+    // #3515: bumped 15→16 to fold the effective detail level (det=) — a
+    // detail=low write must not be served to a detail=medium lookup.
+    expect(KNOBS_HASH_VERSION).toBe(16);
+  });
+
+  test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
+    const knobs = resolveSearchMode({ mode: 'balanced' });
+    const low = knobsHash(knobs, { detail: 'low' });
+    const medium = knobsHash(knobs, { detail: 'medium' });
+    const high = knobsHash(knobs, { detail: 'high' });
+    const unset = knobsHash(knobs);
+    expect(low).not.toBe(medium);
+    expect(medium).not.toBe(high);
+    expect(low).not.toBe(high);
+    // Undefined falls back to 'medium' — the documented default — so legacy
+    // callers that don't thread detail share the default-detail rows.
+    expect(unset).toBe(medium);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -575,8 +601,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 12 (11→12 hard-exclude fold, #2825)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(12);
+  test('KNOBS_HASH_VERSION is 16 (15→16 detail fold #3515)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(16);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

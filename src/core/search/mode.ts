@@ -25,6 +25,7 @@
 
 import { createHash } from 'crypto';
 import { CR_MODES, type CRMode } from '../types.ts';
+import { getFtsLanguage } from '../fts-language.ts';
 import { getRecipe } from '../ai/recipes/index.ts';
 
 /**
@@ -756,7 +757,40 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // slugs written by a process without it, and vice versa. Same one-time
 // global cold-miss pattern as the bumps above; refills within
 // cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 12;
+//
+// bump 12→13 (#3390/#3391): embedding-provider migration wave. The `prov=`
+// component only isolates callers that thread KnobsHashContext.embeddingModel;
+// legacy callers hash `prov=default` before AND after a provider swap, so a
+// cache row computed against the pre-migration embedding space could be
+// served post-migration. `gbrain migrate embeddings` purges query_cache
+// directly at swap time; this version bump is the belt-and-braces for rows
+// written between the #3391 stale-fix (which changes which chunks count as
+// current) and the operator's migration run. Same one-time global cold-miss
+// pattern as the bumps above.
+//
+// bump 14→15: the FTS configuration name (GBRAIN_FTS_LANGUAGE, resolved by
+// getFtsLanguage()) folds into the key via the `fts=` part. It reaches BOTH
+// engines' keyword SQL (websearch_to_tsquery/to_tsvector in postgres-engine
+// and pglite-engine) and the two search_vector trigger functions, so it
+// changes which rows the keyword arm returns — but it only applied at
+// DB-query build time (cache miss). Switching language and running
+// `gbrain reindex-search-vector` therefore left every pre-switch query_cache
+// row reachable: the freshly retokenized index was silently bypassed for up
+// to cache.ttl_seconds, with no warning and no way for an operator to tell.
+// Same one-time global cold-miss pattern as the bumps above; refills within
+// cache.ttl_seconds (3600s default).
+//
+// bump 15→16 (#3515): `detail` folds into the key via ctx.detail (det=).
+// detail is result-affecting by design — it gates dedup, chunk-source
+// filtering, and the compiled_truth boost — but was absent from the key, so
+// a `--detail low` write (compiled-truth-only result set) was served to a
+// default `medium` lookup for the whole TTL. Same contamination class as
+// [CDX-4], floor_ratio (v=3), and relationalRetrieval (v=10). v=14 was
+// claimed by #3514 (compiled_truth boost scope, #3430) and v=15 by the
+// `fts=` fold (#3677), so this lands as v=16 per the D8 sequencing
+// convention (see the v=4/v=5 note above). Same one-time global cold-miss
+// pattern as the bumps above.
+export const KNOBS_HASH_VERSION = 16;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -795,6 +829,17 @@ export interface KnobsHashContext {
    * 'none' for legacy callers that don't thread excludes.
    */
   hardExcludes?: string[];
+  /**
+   * v=16 (#3515): the EFFECTIVE detail level for this call — per-call
+   * SearchOpts.detail, or the auto-detected level when the caller didn't
+   * specify (hybridSearchCached threads `opts.detail ?? autoDetectDetail(query)`,
+   * matching what bare hybridSearch resolves). detail gates dedup,
+   * chunk-source filtering, and the compiled_truth boost, so a detail=low
+   * write must never be served to a detail=medium lookup. Lives in ctx (not
+   * ResolvedSearchKnobs) because it's per-call, not a mode knob — same path
+   * as col=/prov=. Undefined falls back to 'medium' (the documented default).
+   */
+  detail?: 'low' | 'medium' | 'high';
 }
 
 export function knobsHash(
@@ -888,6 +933,21 @@ export function knobsHash(
     // across processes. Sorted copy so ['a/','b/'] and ['b/','a/'] hash
     // identically; undefined falls back to 'none' for legacy callers.
     `hx=${ctx?.hardExcludes ? [...ctx.hardExcludes].sort().join(',') : 'none'}`,
+    // v=15 addition (append-only): the resolved FTS configuration name. Read
+    // from getFtsLanguage() rather than threaded through KnobsHashContext on
+    // purpose — the language is a process-global env read with no per-call
+    // dimension, and the `prov=` bump note above records what threading costs:
+    // a ctx field only isolates callers that pass it, so legacy callers keep
+    // hashing the fallback literal on both sides of a switch. Reading it here
+    // covers every knobsHash() caller, present and future. getFtsLanguage()
+    // memoizes and validates against /^[a-z][a-z0-9_]*$/, so this stays a
+    // cheap, bounded string.
+    `fts=${getFtsLanguage()}`,
+    // v=16 addition (#3515, append-only): effective detail level. detail
+    // gates dedup, chunk-source filtering, and the compiled_truth boost, so
+    // a low write (compiled-truth-only set) must never be served to a
+    // medium/high lookup. Undefined falls back to 'medium' (the default).
+    `det=${ctx?.detail ?? 'medium'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

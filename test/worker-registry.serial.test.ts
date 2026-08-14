@@ -43,6 +43,22 @@ describe('classifyLiveness (Codex #9)', () => {
   });
 });
 
+describe('parseProcessElapsedMs', () => {
+  test('parses every ps etime shape', async () => {
+    const { parseProcessElapsedMs } = await reg();
+    expect(parseProcessElapsedMs('07:08')).toBe((7 * 60 + 8) * 1000);
+    expect(parseProcessElapsedMs('03:04:05')).toBe(((3 * 60 + 4) * 60 + 5) * 1000);
+    expect(parseProcessElapsedMs('2-03:04:05')).toBe((((2 * 24 + 3) * 60 + 4) * 60 + 5) * 1000);
+  });
+
+  test('rejects malformed or out-of-range etime values', async () => {
+    const { parseProcessElapsedMs } = await reg();
+    for (const value of ['', '7:8', '1:60', '24:00:00', '1-24:00:00', '1-02:03', '1-2-03:04:05']) {
+      expect(parseProcessElapsedMs(value)).toBeNull();
+    }
+  });
+});
+
 describe('register + read round trip', () => {
   test('registerWorker writes under gbrainPath; readWorkers returns the live worker', async () => {
     const { registerWorker, readWorkers, workerRegistryDir } = await reg();

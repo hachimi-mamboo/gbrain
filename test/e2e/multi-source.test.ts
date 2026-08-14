@@ -34,17 +34,9 @@ const describeE2E = SKIP ? describe.skip : describe;
 describeE2E('v0.18.0 multi-source — Postgres schema shape (fresh install)', () => {
   beforeAll(async () => {
     await setupDB();
-    // sources + file_migration_ledger are not in helpers.ALL_TABLES, so
-    // residual rows from prior test runs can shadow new INSERTs. Wipe
-    // non-default sources at the top of every describe to keep each
-    // block hermetic. file_migration_ledger cascades from files which
-    // setupDB already truncates, but wipe explicitly in case files did
-    // not cascade it.
-    // Also reset the default source's name + config to the canonical
-    // seed shape — storage-tiering.test.ts writes name='Default' (capital
-    // D) when it runs first against the same Postgres DB and leaves no
-    // cleanup behind, leaking that capitalization into our schema-shape
-    // assertions. Reset here so we are order-independent.
+    // setupDB resets sources and re-seeds the canonical default. Keep the
+    // explicit cleanup and normalization below as a local migration-suite
+    // defense; file_migration_ledger is not in helpers.ALL_TABLES.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
@@ -142,17 +134,9 @@ describeE2E('v0.18.0 multi-source — Postgres schema shape (fresh install)', ()
 describeE2E('v0.18.0 multi-source — composite UNIQUE semantics on real Postgres', () => {
   beforeAll(async () => {
     await setupDB();
-    // sources + file_migration_ledger are not in helpers.ALL_TABLES, so
-    // residual rows from prior test runs can shadow new INSERTs. Wipe
-    // non-default sources at the top of every describe to keep each
-    // block hermetic. file_migration_ledger cascades from files which
-    // setupDB already truncates, but wipe explicitly in case files did
-    // not cascade it.
-    // Also reset the default source's name + config to the canonical
-    // seed shape — storage-tiering.test.ts writes name='Default' (capital
-    // D) when it runs first against the same Postgres DB and leaves no
-    // cleanup behind, leaking that capitalization into our schema-shape
-    // assertions. Reset here so we are order-independent.
+    // setupDB resets sources and re-seeds the canonical default. Keep the
+    // explicit cleanup and normalization below as a local migration-suite
+    // defense; file_migration_ledger is not in helpers.ALL_TABLES.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
@@ -220,17 +204,9 @@ describeE2E('v0.18.0 multi-source — composite UNIQUE semantics on real Postgre
 describeE2E('v0.18.0 multi-source — cascade delete covers every dependent row', () => {
   beforeAll(async () => {
     await setupDB();
-    // sources + file_migration_ledger are not in helpers.ALL_TABLES, so
-    // residual rows from prior test runs can shadow new INSERTs. Wipe
-    // non-default sources at the top of every describe to keep each
-    // block hermetic. file_migration_ledger cascades from files which
-    // setupDB already truncates, but wipe explicitly in case files did
-    // not cascade it.
-    // Also reset the default source's name + config to the canonical
-    // seed shape — storage-tiering.test.ts writes name='Default' (capital
-    // D) when it runs first against the same Postgres DB and leaves no
-    // cleanup behind, leaking that capitalization into our schema-shape
-    // assertions. Reset here so we are order-independent.
+    // setupDB resets sources and re-seeds the canonical default. Keep the
+    // explicit cleanup and normalization below as a local migration-suite
+    // defense; file_migration_ledger is not in helpers.ALL_TABLES.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
@@ -338,17 +314,9 @@ describeE2E('v0.18.0 multi-source — cascade delete covers every dependent row'
 describeE2E('v0.18.0 multi-source — sync --source routes through sources table', () => {
   beforeAll(async () => {
     await setupDB();
-    // sources + file_migration_ledger are not in helpers.ALL_TABLES, so
-    // residual rows from prior test runs can shadow new INSERTs. Wipe
-    // non-default sources at the top of every describe to keep each
-    // block hermetic. file_migration_ledger cascades from files which
-    // setupDB already truncates, but wipe explicitly in case files did
-    // not cascade it.
-    // Also reset the default source's name + config to the canonical
-    // seed shape — storage-tiering.test.ts writes name='Default' (capital
-    // D) when it runs first against the same Postgres DB and leaves no
-    // cleanup behind, leaking that capitalization into our schema-shape
-    // assertions. Reset here so we are order-independent.
+    // setupDB resets sources and re-seeds the canonical default. Keep the
+    // explicit cleanup and normalization below as a local migration-suite
+    // defense; file_migration_ledger is not in helpers.ALL_TABLES.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
@@ -414,17 +382,9 @@ describeE2E('v0.18.0 multi-source — sync --source routes through sources table
 describeE2E('v0.18.0 multi-source — sources table surface', () => {
   beforeAll(async () => {
     await setupDB();
-    // sources + file_migration_ledger are not in helpers.ALL_TABLES, so
-    // residual rows from prior test runs can shadow new INSERTs. Wipe
-    // non-default sources at the top of every describe to keep each
-    // block hermetic. file_migration_ledger cascades from files which
-    // setupDB already truncates, but wipe explicitly in case files did
-    // not cascade it.
-    // Also reset the default source's name + config to the canonical
-    // seed shape — storage-tiering.test.ts writes name='Default' (capital
-    // D) when it runs first against the same Postgres DB and leaves no
-    // cleanup behind, leaking that capitalization into our schema-shape
-    // assertions. Reset here so we are order-independent.
+    // setupDB resets sources and re-seeds the canonical default. Keep the
+    // explicit cleanup and normalization below as a local migration-suite
+    // defense; file_migration_ledger is not in helpers.ALL_TABLES.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);
@@ -446,9 +406,8 @@ describeE2E('v0.18.0 multi-source — sources table surface', () => {
     const defConfig = typeof def[0].config === 'string' ? JSON.parse(def[0].config) : def[0].config;
     expect(defConfig.federated).toBe(true);
 
-    // Defensive cleanup: sources isn't in helpers.ALL_TABLES, so residual
-    // rows from prior test runs can shadow this INSERT via ON CONFLICT
-    // DO NOTHING. Delete first, then create.
+    // Defensive local cleanup before the ON CONFLICT insert, even though
+    // setupDB already reset the source table for this describe.
     await conn.unsafe(`DELETE FROM sources WHERE id = 'isolatedsrc'`);
     await runSources(engine as unknown as Parameters<typeof runSources>[0], ['add', 'isolatedsrc']);
     const iso = await conn.unsafe(`SELECT config FROM sources WHERE id = 'isolatedsrc'`);
@@ -487,17 +446,9 @@ describeE2E('v0.18.0 multi-source — sources table surface', () => {
 describeE2E('v0.18.0 multi-source — storage backfill against file_migration_ledger', () => {
   beforeAll(async () => {
     await setupDB();
-    // sources + file_migration_ledger are not in helpers.ALL_TABLES, so
-    // residual rows from prior test runs can shadow new INSERTs. Wipe
-    // non-default sources at the top of every describe to keep each
-    // block hermetic. file_migration_ledger cascades from files which
-    // setupDB already truncates, but wipe explicitly in case files did
-    // not cascade it.
-    // Also reset the default source's name + config to the canonical
-    // seed shape — storage-tiering.test.ts writes name='Default' (capital
-    // D) when it runs first against the same Postgres DB and leaves no
-    // cleanup behind, leaking that capitalization into our schema-shape
-    // assertions. Reset here so we are order-independent.
+    // setupDB resets sources and re-seeds the canonical default. Keep the
+    // explicit cleanup and normalization below as a local migration-suite
+    // defense; file_migration_ledger is not in helpers.ALL_TABLES.
     const conn = getConn();
     await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
     await conn.unsafe(`DELETE FROM file_migration_ledger`);

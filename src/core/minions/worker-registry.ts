@@ -142,6 +142,23 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
   }
 }
 
+/** Parse the POSIX `ps etime` shape (`[[dd-]hh:]mm:ss`) into milliseconds. */
+export function parseProcessElapsedMs(value: string): number | null {
+  const trimmed = value.trim();
+  const match = /^(?:(\d+)-(\d{2}):(\d{2}):(\d{2})|(\d{2}):(\d{2}):(\d{2})|(\d{2}):(\d{2}))$/.exec(trimmed);
+  if (!match) return null;
+
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? match[5] ?? 0);
+  const minutes = Number(match[3] ?? match[6] ?? match[8]);
+  const seconds = Number(match[4] ?? match[7] ?? match[9]);
+  if (![days, hours, minutes, seconds].every(Number.isSafeInteger)) return null;
+  if (hours > 23 || minutes > 59 || seconds > 59) return null;
+
+  const elapsedMs = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+  return Number.isSafeInteger(elapsedMs) ? elapsedMs : null;
+}
+
 /**
  * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
@@ -150,14 +167,19 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
  */
 function processStartMs(pid: number): number | null {
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    // `lstart` has no timezone suffix. Parsing it in a process whose TZ differs
+    // from the host (for example a UTC test runner on an Asia/Shanghai Mac)
+    // shifts the result and can misclassify the current process as PID reuse.
+    // `etime` is a timezone-free [[dd-]hh:]mm:ss duration on both BSD and GNU ps.
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const elapsedMs = parseProcessElapsedMs(out);
+    if (elapsedMs === null) return null;
+    return Date.now() - elapsedMs;
   } catch {
     return null;
   }

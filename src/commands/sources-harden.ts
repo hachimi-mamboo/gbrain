@@ -17,10 +17,8 @@ import {
   hardenBrainRepo, unhardenBrainRepo, acceptPat,
   type DurabilityReport,
 } from '../core/brain-repo-durability.ts';
-import { divergenceSafePull, detectDefaultBranch } from '../core/git-remote.ts';
+import { divergenceSafePull, detectDefaultBranch, isInsideGitRepo } from '../core/git-remote.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
-import { existsSync } from 'fs';
-import { join } from 'path';
 import {
   assertClientBrainRepoCheckout,
   assertClientBrainRepoRoot,
@@ -147,7 +145,9 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
         await prepareClientSourceBinding(engine, row.id);
       }
       const repoPath = clientPath ?? row.local_path;
-      if (!repoPath || !existsSync(join(repoPath, '.git'))) {
+      // A source may be a subdirectory of a Git repo; the durability core
+      // resolves the root itself, so the gate only needs "inside a repo".
+      if (!repoPath || !isInsideGitRepo(repoPath)) {
         console.error(`[${row.id}] skipped — no local git repo at ${repoPath ?? '(none)'}`);
         continue;
       }
@@ -223,7 +223,7 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
     repoPath = resolvedPath;
   }
 
-  if (!existsSync(join(repoPath, '.git'))) {
+  if (!isInsideGitRepo(repoPath)) {
     console.error(`[gbrain] not a git repo: ${repoPath}`);
     process.exit(1);
   }

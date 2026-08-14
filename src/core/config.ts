@@ -27,6 +27,10 @@ function getConfigPath() { return configPath(); }
 
 export interface GBrainConfig {
   engine: 'postgres' | 'pglite';
+  /** File-plane hook-lane keys (read by engine-free hook/push children).
+   * `gbrain config set` routes these two dotted keys here, not to the DB. */
+  push?: { allow_unverified_remote?: boolean };
+  hooks?: { stop_push_debounce_min?: number | string };
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
@@ -63,6 +67,29 @@ export interface GBrainConfig {
    * config.json file-plane route is wired through today.
    */
   voyage_api_key?: string;
+  /**
+   * Alibaba DashScope API key (#3500). File-plane slot so config.json's
+   * `dashscope_api_key` reaches the dashscope / dashscope-rerank recipes:
+   * file plane → buildGatewayConfig env dict → recipe reads
+   * DASHSCOPE_API_KEY. Same fold pattern (and same DB-plane caveat) as
+   * voyage_api_key above.
+   */
+  dashscope_api_key?: string;
+  /**
+   * Google Gemini API key (#3500). File-plane slot folded into the gateway
+   * env as GOOGLE_GENERATIVE_AI_API_KEY (the name the google recipe reads).
+   * buildGatewayConfig also accepts process-env GEMINI_API_KEY — the name
+   * Google's own docs/SDKs use — as an alias for
+   * GOOGLE_GENERATIVE_AI_API_KEY. Same fold pattern (and same DB-plane
+   * caveat) as voyage_api_key above.
+   */
+  google_api_key?: string;
+  /** Azure OpenAI (keyless/Entra). Non-secret endpoint + deployment + Entra opt-in,
+   * folded into the gateway env so the azure-openai recipe works in any shell.
+   * The bearer token is minted at request time via `az` — no secret stored here. */
+  azure_openai_endpoint?: string;
+  azure_openai_deployment?: string;
+  azure_openai_use_entra?: string;
   /** AI gateway config (v0.14+). v0.36+ default: "zeroentropyai:zembed-1" / 1280 / "anthropic:claude-haiku-4-5-20251001". */
   embedding_model?: string;
   embedding_dimensions?: number;
@@ -91,6 +118,17 @@ export interface GBrainConfig {
   provider_base_urls?: Record<string, string>;
   /** Optional chat request providerOptions overrides keyed by recipe id or "recipe:modelId". */
   provider_chat_options?: Record<string, Record<string, unknown>>;
+  /**
+   * MEMORY_VERBS v1 (Cathedral 1): default MCP tool surface for `gbrain serve`.
+   * 'verbs' = exactly the 5 protocol verbs (the quickstart surface);
+   * 'full' (default) = every operation. The `--surface` flag overrides per-run.
+   */
+  mcp_surface?: 'verbs' | 'full';
+  /**
+   * MEMORY_VERBS v1 [D6C]: ISO timestamp stamped by `gbrain init` so
+   * `gbrain protocol stats` can derive real TTHW (install → first verb call).
+   */
+  protocol_installed_at?: string;
   /**
    * Optional storage backend config (S3/Supabase/local). Shape matches
    * `StorageConfig` in `./storage.ts`. Typed as `unknown` here to avoid
@@ -913,6 +951,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'zeroentropy_api_key',
   'openrouter_api_key',
   'voyage_api_key',
+  'dashscope_api_key',
+  'google_api_key',
+  'azure_openai_endpoint',
+  'azure_openai_deployment',
+  'azure_openai_use_entra',
   'embedding_model',
   'embedding_dimensions',
   'embedding_disabled',
@@ -920,6 +963,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'chat_model',
   'chat_fallback_chain',
   'provider_base_urls',
+  // MEMORY_VERBS v1 (Cathedral 1)
+  'mcp_surface',
+  'protocol_installed_at',
   'provider_chat_options',
   'storage',
   'eval',
@@ -942,6 +988,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'agent.use_gateway_loop',
   // #2778: per-turn output-token cap for the subagent loop (default 8192).
   'agent.max_output_tokens',
+  // File-plane bootstrap hook-lane keys (routed to ~/.gbrain/config.json by
+  // `config set` — engine-free hook/push children read loadConfigFileOnly).
+  'push.allow_unverified_remote',
+  'hooks.stop_push_debounce_min',
   // DB-plane (v0.32.3 search modes + related)
   'search.mode',
   'search.cache.enabled',
@@ -975,12 +1025,17 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.think',
   'models.subagent',
   'models.expansion',
+  'models.contextual_synopsis',
   'models.chat',
   'models.brainstorm.judge',
   'models.eval.longmemeval',
   'facts.extraction_model',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
+  // [ENG-8] Brain-level default visibility for facts writes when the caller
+  // didn't specify one: 'private' (default) | 'world'. Resolved by
+  // src/core/facts/visibility.ts; explicit caller values always win.
+  'facts.default_visibility',
   // Conversation parser LLM fallback. Deliberately register the exact key,
   // not a conversation_parser.* prefix: fallback is the only live opt-in
   // consumer, while the polish scaffold remains unwired.
@@ -1050,6 +1105,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // operator had to discover --force by reading source. Same class as the
   // spend-controls registration above.
   'auto_chronicle',
+  // Auto-link toggle read by the put_page post-hook (link-extraction.ts),
+  // reconcile-links, and sweep. The documented off-switch is `gbrain config
+  // set auto_link false` — same unregistered-key class as auto_chronicle.
+  'auto_link',
   // #2606: chronicle judge output-token cap (default 4000). Event-dense
   // pages overflowed the old hardcoded 1500 and were misrecorded as
   // no_events; the cap is now configurable and truncation is surfaced.
@@ -1058,11 +1117,26 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // consent reads this key, and enabling it is the documented path to
   // `gbrain takes extract --from-pages` — same unregistered-key class.
   'takes.bootstrap_enabled',
+  // Orphan reporting scope. These are consumed by core/orphan-policy.ts and
+  // documented there as the per-brain override path.
+  'orphans.exclude_prefixes',
+  'orphans.exclude_slugs',
   'sync.cost_gate_min_usd',
   'sync.federated_v2',
+  // #2179: clamp window for DCR-requested per-client token TTLs. Read by
+  // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
+  // defaults fail-closed to max(--token-ttl, min).
+  'oauth.dcr_ttl_min_seconds',
+  'oauth.dcr_ttl_max_seconds',
   'embed.backfill_cooldown_min',
   'embed.backfill_max_usd_per_source_24h',
   'embed.backfill_max_usd',
+  // Brain-level default source. Read by source-resolver.ts tier 5
+  // (`engine.getConfig('sources.default')`) and written by
+  // `gbrain sources default <id>`. Listed here so `gbrain config set`
+  // stops claiming "Nothing in gbrain reads this" for a key the resolver
+  // reads on every unqualified call.
+  'sources.default',
 ];
 
 /**
@@ -1084,6 +1158,27 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
 ];
+
+/**
+ * Canonical truthiness for DB-plane boolean config values (#2753).
+ *
+ * Config values arrive as opaque strings from `gbrain config set`, so every
+ * reader has to decide what counts as "on". Left to each call site those sets
+ * drift, and the drift is silent in the worst possible way: the doctor accepted
+ * `yes`/`on` while the subagent worker accepted only `true`/`1`, so
+ * `gbrain config set agent.use_gateway_loop yes` produced a healthy doctor
+ * report AND a runtime refusal of the very job the setting was supposed to
+ * enable. One parser, used by every reader, is what keeps a green health check
+ * honest.
+ *
+ * Accepts `true` / `1` / `yes` / `on` (case-insensitive, surrounding whitespace
+ * trimmed). Everything else — including `null`, non-strings, and the empty
+ * string — is false, so an unset or garbled value fails closed.
+ */
+export function isConfigTruthy(raw: unknown): boolean {
+  return typeof raw === 'string'
+    && ['true', '1', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
 
 export function saveConfig(config: GBrainConfig): void {
   mkdirSync(getConfigDir(), { recursive: true });

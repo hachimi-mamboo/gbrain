@@ -29,6 +29,7 @@ import {
   BUILTIN_PATTERNS,
   cleanSpeaker,
 } from './builtins.ts';
+import { normalizeBlockConversation } from './normalize-block.ts';
 import type {
   DateContext,
   MatchedMessage,
@@ -391,7 +392,7 @@ function getNonBlankLines(body: string, headCap?: number): string[] {
  * window) and `scorePatternFull` (whole body) delegate here so the
  * quick_reject + regex loop lives in one place. Reused by
  * `parseConversation`'s fallback path which pre-splits ONCE and
- * passes the array to all 17 candidates (saves 16 redundant body
+ * passes the array to all 18 candidates (saves 17 redundant body
  * splits per fallback pass).
  */
 function scoreFromLines(
@@ -472,6 +473,12 @@ export function parseConversation(
   if (!body) {
     return { messages: [], phase: 'no_match' };
   }
+
+  // Pre-pass: collapse block-format chat exports (header + indented body, e.g.
+  // the Slack collector's `- **Name** (Mon 11:18)\n  body…`) into the canonical
+  // single-line shape the built-in patterns recognize. Strict no-op when no
+  // block header is present, so already-canonical content is untouched.
+  body = normalizeBlockConversation(body);
 
   const dateCtx = deriveDateContext(opts);
 

@@ -69,6 +69,8 @@ import type { Page } from '../core/types.ts';
 import {
   extractFactsFromTurnWithOutcome,
   isFactsExtractionEnabled,
+  type ExtractInput,
+  type ExtractedFact,
 } from '../core/facts/extract.ts';
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
 import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
@@ -148,6 +150,40 @@ export const ALLOWED_TYPES = [
   'imessage-daily',
 ] as const;
 export type AllowedType = (typeof ALLOWED_TYPES)[number];
+
+/**
+ * Granular collector page-types that alias into each canonical conversation
+ * bucket. The v2 type-consolidation pack retypes these to the canonical names
+ * (`slack-dm-day`/`slack-thread` → `slack`, `email-digest` → `email`), but a
+ * brain that hasn't run that pack still carries the collector's granular types
+ * in `pages.type`. Without this expansion, `listPages({ type: 'slack' })`
+ * matches zero rows on such brains and the whole comms corpus is silently
+ * skipped (facts stay empty → `find_trajectory` returns nothing). The canonical
+ * name is always included first so consolidated brains keep working unchanged.
+ */
+export const ALLOWED_TYPE_ALIASES: Record<AllowedType, readonly string[]> = {
+  conversation: ['conversation'],
+  meeting: ['meeting'],
+  slack: ['slack', 'slack-dm-day', 'slack-thread'],
+  email: ['email', 'email-digest'],
+  imessage: ['imessage'],
+  'imessage-daily': ['imessage-daily'],
+};
+
+/**
+ * Expand the requested logical types to the concrete `pages.type` values to
+ * enumerate, canonical-first and de-duplicated. Unknown types pass through
+ * unchanged so an explicit override is never dropped.
+ */
+export function pageTypesForAllowed(types: readonly AllowedType[]): string[] {
+  const out: string[] = [];
+  for (const t of types) {
+    for (const concrete of ALLOWED_TYPE_ALIASES[t] ?? [t]) {
+      if (!out.includes(concrete)) out.push(concrete);
+    }
+  }
+  return out;
+}
 
 /**
  * Pagination batch size for listPages enumeration. Per-batch memory
@@ -252,6 +288,14 @@ export interface ExtractConversationFactsCoreOpts {
    * if you need exact-ceiling compliance.
    */
   workers?: number;
+  /**
+   * Injectable per-segment extractor (BrainBench decision 15). When unset,
+   * the production path is `extractFactsFromTurnWithOutcome` (fail-hard: a
+   * per-segment extraction failure aborts the page). The bench's deterministic
+   * CI mode injects a gold-facts extractor here so segmentation → insertFacts →
+   * dedup → provenance all execute THIS production pipeline with zero LLM calls.
+   */
+  extractor?: (input: ExtractInput) => Promise<ExtractedFact[]>;
 }
 
 export interface ExtractConversationFactsResult {
@@ -637,6 +681,12 @@ interface ExtractCoreState {
   types: AllowedType[];
   signal: AbortSignal | undefined;
   /**
+   * Injected per-segment extractor (BrainBench decision 15). ONLY set when a
+   * caller overrides; when undefined the production fail-hard
+   * `extractFactsFromTurnWithOutcome` path runs.
+   */
+  extractor?: (input: ExtractInput) => Promise<ExtractedFact[]>;
+  /**
    * v0.41.15.0 (D11): shared per-(sourceId, slug) checkpoint map mutated
    * in place from processPage callers. Map.set is atomic in JS's single-
    * threaded event loop so parallel workers (D9) don't clobber each
@@ -945,22 +995,38 @@ async function processPage(
     const text = renderSegmentForExtraction(page.title || page.slug, seg);
     const sessionId = `${PER_SEGMENT_SOURCE_PREFIX}:${page.slug}`;
 
-    const extraction = await extractFactsFromTurnWithOutcome({
-      turnText: text,
-      sessionId,
-      source: PER_SEGMENT_SOURCE_PREFIX,
-      engine: state.engine,
-      abortSignal: state.signal,
-    });
-    if (!extraction.ok) {
-      const detail = extraction.error instanceof Error
-        ? `: ${extraction.error.message}`
-        : '';
-      throw new Error(
-        `segment ${seg.startIso}..${seg.endIso} extraction failed (${extraction.reason})${detail}`,
-      );
+    // BrainBench (decision 15) may inject a deterministic extractor; when it
+    // does, use it (returns facts directly — the hermetic gold path). The
+    // DEFAULT production path is master's fail-hard-with-reason contract: a
+    // per-segment extraction failure aborts the page rather than silently
+    // dropping facts.
+    let extracted: ExtractedFact[];
+    if (state.extractor) {
+      extracted = await state.extractor({
+        turnText: text,
+        sessionId,
+        source: PER_SEGMENT_SOURCE_PREFIX,
+        engine: state.engine,
+        abortSignal: state.signal,
+      });
+    } else {
+      const extraction = await extractFactsFromTurnWithOutcome({
+        turnText: text,
+        sessionId,
+        source: PER_SEGMENT_SOURCE_PREFIX,
+        engine: state.engine,
+        abortSignal: state.signal,
+      });
+      if (!extraction.ok) {
+        const detail = extraction.error instanceof Error
+          ? `: ${extraction.error.message}`
+          : '';
+        throw new Error(
+          `segment ${seg.startIso}..${seg.endIso} extraction failed (${extraction.reason})${detail}`,
+        );
+      }
+      extracted = extraction.facts;
     }
-    const extracted = extraction.facts;
 
     state.result.segments_processed++;
     segmentsThisPage++;
@@ -1189,6 +1255,7 @@ export async function runExtractConversationFactsCore(
     segmentLimit,
     types,
     signal,
+    extractor: opts.extractor,
     cpMap: new Map(),
     llmFallbackModel,
   };
@@ -1264,13 +1331,18 @@ export async function runExtractConversationFactsCore(
       }
     };
 
+    // Expand logical types (conversation/meeting/slack/email) to the concrete
+    // `pages.type` values to enumerate, so brains on the granular collector
+    // types are not silently skipped (see ALLOWED_TYPE_ALIASES).
+    const concreteTypes = pageTypesForAllowed(types);
+
     if (opts.slug) {
       const page = await engine.getPage(opts.slug, { sourceId });
       if (!page) {
         result.pages_skipped_disappeared++;
         return;
       }
-      if (!types.includes(page.type as AllowedType)) {
+      if (!concreteTypes.includes(page.type)) {
         result.pages_skipped++;
         return;
       }
@@ -1284,7 +1356,7 @@ export async function runExtractConversationFactsCore(
       // honors AbortSignal at each claim boundary and threads
       // BudgetExhausted abort (D13) automatically.
       let processedPagesCount = 0;
-      pageLoop: for (const type of types) {
+      pageLoop: for (const type of concreteTypes) {
         let offset = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {

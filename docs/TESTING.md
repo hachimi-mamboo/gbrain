@@ -11,20 +11,46 @@ Seven test command tiers, each with a clear scope:
 
 | Command | What it runs | Wallclock | When to use |
 |---|---|---|---|
-| `bun run test` | Parallel unit-test fast loop. 8-shard fan-out via `scripts/run-unit-parallel.sh`, then a serial pass over `*.serial.test.ts`. Excludes `*.slow.test.ts` and `test/e2e/*`. No pre-checks, no typecheck. | ~85s on a Mac dev box (3650+ tests) | Inner edit loop. Default. |
-| `bun run verify` | CI's authoritative pre-test gate set, fanned out in parallel by `scripts/run-verify-parallel.sh`: the full `check:*` battery (~30 checks — privacy, jsonb, progress, source-id, test-isolation, wasm, …) plus `bun run typecheck`. The `CHECKS` array in that script is the single source of truth — CI literally calls `bun run verify` in a dedicated job. | ~16s (parallel; typecheck dominates) | Before pushing; before `/ship`. |
+| `bun run test` | Parallel unit-test fast loop. Sharded fan-out via `scripts/run-unit-parallel.sh` (default 4 shards — CPU-detected, clamped to a max of 8; 4 matches CI's fan-out and avoids PGLite WASM-init contention), then a serial pass over `*.serial.test.ts`. Excludes `*.slow.test.ts` and `test/e2e/*`. No pre-checks, no typecheck. Memory-safe by default: total concurrency (shards × intra-shard files) is capped to available memory at `GBRAIN_TEST_MEM_PER_FILE_MB` (default 1536 — a PGLite WASM instance) per concurrent file, and two phantom-failure classes are automatically re-run serially (the rescue pass): failures carrying the WASM out-of-memory signature, and shards killed externally (SIGTERM/SIGKILL well before the shard timeout — sibling workspaces' process cleanup, memory jetsam). Phantoms pass serially and the run goes green with an `oom_rescued` note; real failures fail again serially and stay red. Knobs: `GBRAIN_TEST_NO_MEM_ADAPT=1`, `GBRAIN_TEST_NO_OOM_FALLBACK=1`, `GBRAIN_TEST_MAX_CONCURRENCY` (intra-shard, default 4), `GBRAIN_TEST_SHARD_TIMEOUT` / `GBRAIN_TEST_SHARD_KILL_AFTER`, plus `--shards N` / `--max-concurrency N` / `--dry-run` script args. | a few minutes on a Mac dev box | Inner edit loop. Default. |
+| `bun run verify` | CI's authoritative pre-test gate set, fanned out in parallel by `scripts/run-verify-parallel.sh`: the full `check:*` battery (privacy, jsonb, progress, source-id, test-isolation, wasm, …) plus `bun run typecheck`. The `CHECKS` array in that script is the single source of truth — CI literally calls `bun run verify` in a dedicated job. | ~16s (parallel; typecheck dominates) | Before pushing; before `/ship`. |
 | `bun run test:full` | `verify && bun run test && bun run test:slow && [smart e2e]`. The local equivalent of "everything CI runs." Smart e2e: runs e2e only when `DATABASE_URL` is set; else loud skip notice to stderr. | ~3-5min depending on slow + e2e | Pre-merge sanity, before opening a PR. |
 | `bun run test:slow` | Just the `*.slow.test.ts` set (intentional cold-path correctness checks). | seconds-to-minutes | When touching slow-path code. |
 | `bun run test:serial` | Just the `*.serial.test.ts` set (cross-file-contention quarantine; one bun process per file for true module-registry isolation). | ~1s per quarantined file | Debugging a specific quarantined file. |
 | `bun run test:e2e` | Real Postgres E2E. Requires Docker + `DATABASE_URL`. Sequential. | ~5-10min | Pre-ship; nightly. |
-| `bun run check:all` | The historical pre-check scripts (22, chained sequentially in package.json). Overlaps `verify` heavily but is NOT a superset — `verify`'s `CHECKS` array in `scripts/run-verify-parallel.sh` (~30 entries incl. typecheck) is the authoritative gate; `check:all` keeps a few local-only extras (trailing-newline, exports-count, no-legacy-getconnection). | ~10s | Local-only sweep for the extras. |
+| `bun run check:all` | The historical pre-check scripts (chained sequentially in package.json). Overlaps `verify` heavily but is NOT a superset — `verify`'s `CHECKS` array in `scripts/run-verify-parallel.sh` is the authoritative gate; `check:all` keeps a few local-only extras (trailing-newline, exports-count, no-legacy-getconnection). | ~10s | Local-only sweep for the extras. |
+
+### Shell dispatch and Windows
+
+All four of `test`, `verify`, `ci:local` and `test:e2e` hand off to shell scripts
+under `scripts/`, so every `check:*` entry in `package.json` invokes its script as
+`bash scripts/<name>.sh` instead of relying on the shebang — bun on Windows cannot
+exec a `.sh` directly. Add a new shell-script check with that same prefix. The
+`scripts/*.ts` entries run under bun and take no prefix.
+
+The scripts must also be on disk with Unix line endings. A strict bash (WSL, Linux
+CI, macOS) rejects CRLF and dies on the script's first meaningful line; the Cygwin
+bash that ships with Git for Windows tolerates it, so a green local run is not by
+itself evidence that a script is CRLF-clean.
+The root `.gitattributes` pins `*.sh text eol=lf`, which overrides the
+`core.autocrlf=true` default that Git for Windows installs. It pins `*.md` the
+same way, because the frontmatter readers anchor on a `---` fence followed by a
+Unix line ending and a CRLF checkout makes a document parse as having no
+frontmatter, silently. Working copies cloned
+before those pins need a one-time `git rm --cached -r . -q && git reset --hard` to
+pick them up; see the Windows section of `CONTRIBUTING.md`.
+
+Wallclock figures in the table above are from a Mac dev box. Windows is
+substantially slower because each check pays full process-creation cost, and three
+tree-walking checks (`check:privacy`, `check:test-names`, `check:test-isolation`)
+plus `typecheck` can exceed the 120s per-check cap in `run-verify-parallel.sh`
+there even though they pass on Linux and macOS.
 
 ### CI vs local: intentionally divergent file sets
 
-- **CI matrix** (`.github/workflows/test.yml`) runs `scripts/test-shard.sh` across 10 matrix shards partitioned by weight-aware LPT bin-packing (`scripts/sharding.ts`) and INCLUDES `*.slow.test.ts` (the two outlier slow files run as dedicated jobs alongside the matrix). CI EXCLUDES `*.serial.test.ts` from the shards and runs them in a dedicated job via `bun run test:serial`, one bun process per file — keeping serial files out of the shard processes is what preserves the `mock.module` quarantine (a top-level mock in one file leaks into every other file sharing its process). `bun run verify` gets its own job too. CI is the ground truth for "did everything pass."
+- **CI matrix** (`.github/workflows/test.yml`) runs `scripts/test-shard.sh` across 10 matrix shards partitioned by weight-aware LPT bin-packing (`scripts/sharding.ts`) and INCLUDES `*.slow.test.ts` (the two outlier slow files run as dedicated jobs alongside the matrix). CI EXCLUDES `*.serial.test.ts` from the shards and runs them in a dedicated job via `bun run test:serial`, one bun process per file — keeping serial files out of the shard processes is what preserves the `mock.module` quarantine (a top-level mock in one file leaks into every other file sharing its process). `bun run verify` gets its own job too, as does the BrainBench memory-conformance gate (`brainbench` job → `scripts/ci-brainbench-gate.sh`, hermetic in-memory PGLite, ~15s), which compares HEAD's fresh run against master's committed baseline (`evals/brainbench/baselines/main.json`) — the `test-status` aggregate checks its result explicitly. CI is the ground truth for "did everything pass."
 - **Local fast loop** (`scripts/run-unit-shard.sh` via the parallel wrapper) uses round-robin-by-index sharding and EXCLUDES `*.slow.test.ts` AND `*.serial.test.ts`. Local trades coverage for inner-loop speed; CI catches what local skips.
 
-This divergence is intentional. Don't try to make them equal — the two scripts deliberately solve different problems. The regression test at `test/scripts/run-unit-shard.test.ts` pins what the local fast loop should and shouldn't include.
+This divergence is intentional. Don't try to make them equal — the two scripts deliberately solve different problems. The regression test at `test/scripts/run-unit-shard.test.ts` pins what the local fast loop should and shouldn't include; `test/scripts/run-unit-parallel.test.ts` pins the wrapper's memory-adaptive concurrency and the OOM/external-kill serial rescue pass.
 
 ### Failure-first logging
 
@@ -35,18 +61,34 @@ When `bun run test` finds any failure, the wrapper:
 3. Writes a one-line-per-shard summary to `.context/test-summary.txt` (`shard N/M: pass=X fail=Y skip=Z rc=W`).
 4. Exits non-zero. Empty failure log + non-zero exit = infrastructure problem (wedged shard, killed child); the banner says so.
 
-If a shard wedges (per-shard `GBRAIN_TEST_SHARD_TIMEOUT` cap, default 600s), the wrapper writes `--- shard N: WEDGED after ${SHARD_TIMEOUT}s ---` to the failure log, includes the last 50 lines of the shard log, and proceeds with other shards' results.
+If a shard hits the per-shard `GBRAIN_TEST_SHARD_TIMEOUT` cap (default 3000s — sized so the heaviest count-balanced shard finishes under 4-way contention; `GBRAIN_TEST_SHARD_KILL_AFTER` sets the grace after TERM before KILL, default 30s), the wrapper classifies the kill one of two ways:
+
+- **EXIT-HANG → warn-pass.** If the shard's log had been silent for ≥300s at kill time AND shows zero `(fail)` markers, the shard finished all its work, leaked a handle, and never exited (a pre-existing, master-reproducible PGLite-adjacent leak — see TODOS.md "unit-shard exit hang"). The wrapper prints a `⚠️ shard N/M: EXIT-HANG ... Treating as pass-with-warning` banner, writes `EXIT-HANG (idle Ns, 0 fails) ... warn-pass` to the summary, and does NOT fail the run. Its pass counts are undercounted (bun never printed its final summary). Bun's per-test `--timeout` turns a genuinely hung TEST into a printed `(fail)` — new output — so this classification cannot mask a hung test; the residual maskable case is a file-level import hang in the very last file, which the banner keeps visible.
+- **WEDGED → hard failure.** Anything else (failures present, or the log was still growing) writes `--- shard N: WEDGED after ${SHARD_TIMEOUT}s ---` to the failure log with the last 50 lines of the shard log, marks the run failed, and proceeds with other shards' results.
+
+Triage rule: a `warn-pass` EXIT-HANG line in `.context/test-summary.txt` is NOT a test failure — don't burn time bisecting it; a `WEDGED` line is.
 
 ### File taxonomy
 
-- `*.test.ts` → fast loop (parallel 8-shard fan-out).
+- `*.test.ts` → fast loop (parallel up-to-4-shard fan-out, memory-adaptive).
 - `*.slow.test.ts` → run via `bun run test:slow` only (intentional cold-path tests; would dominate the fast loop's wallclock).
 - `*.serial.test.ts` → run via `bun run test:serial` after the parallel pass completes; one bun process per file (`--max-concurrency=1` within a shared process is not enough — the module registry still leaks `mock.module`). Quarantine for tests that share file-wide state and race when run alongside other files in the same `bun test` process. Several dozen files, discovered by the `*.serial.test.ts` glob — no list to maintain. Typical residents: `mock.module(...)` users (top-level mocks leak across files in a shard process, e.g. `test/embed.serial.test.ts`), env-coupled files (e.g. `test/brain-registry.serial.test.ts`), and process-lifecycle suites that assert on `process.exitCode` (e.g. `test/pglite-engine-disconnect.serial.test.ts`). **Do not put the parallelism back on a serial file unless you've fixed the contention root cause** (it just re-introduces the flake).
 - `test/e2e/*.test.ts` → real-Postgres E2E. Skipped when `DATABASE_URL` is unset.
 - `tests/heavy/*.sh` → ops-shape shell scripts. Cost minutes per run; NOT in default `bun test`. Run via `bun run test:heavy` or scheduled nightly via `.github/workflows/heavy-tests.yml`. Examples: pg_upgrade matrix (boot legacy brain → walk to head), RSS budget gate (measure peak worker RSS vs committed baseline), read-latency-under-sync (p50/p95/p99 under concurrent writer load), sync lock regression (N concurrent syncs assert 1 winner + N-1 lock-busy + zero leaked `gbrain_cycle_locks` rows). See `tests/heavy/README.md` for when to add a script here vs `*.slow.test.ts`. Files prefixed with `_` (e.g. `tests/heavy/_build_legacy_fixtures.sh`) are helpers/libs invoked by sibling tests — the runner skips them.
 - `test/fuzz/*.test.ts` → property-based fuzz harness. Pure-validator targets in `pure-validators.test.ts` are guarded by `scripts/check-fuzz-purity.sh` (in `bun run verify`), which `bun build --target=bun` bundles each target and greps the resulting bundle for banned transitive imports (`node:fs`, `node:child_process`, engine modules). Anything that fails the guard moves to `mixed-validators.test.ts` (still property-tested, but no purity guarantee) or `filesystem-validators.test.ts` (fs-backed, uses temp dirs). Fuzz tests run in the default `bun test` loop because they're fast (~3s for ~12 properties × 1000 runs each).
 
+### Skills-manifest freshness guard
+
+`skills/skills.lock.json` is a committed sha256 inventory of every bundled file under
+`skills/` (tamper evidence, not signatures — see `src/core/skills-integrity.ts`).
+Any change under `skills/` must regenerate it: `bun run scripts/generate-skills-manifest.ts`.
+`scripts/check-skills-manifest-fresh.sh` (`bun run check:skills-manifest`, wired into
+`bun run verify`) regenerates to a tmp file and diffs, failing CI on drift; at runtime
+`gbrain doctor` reports the same drift as a warn-only `skills_manifest_integrity` check.
+
 ### Test-isolation lint and helpers
+
+**This section is the canonical home of the test-isolation discipline** — CONTRIBUTING.md and other docs link here rather than restating the rules.
 
 The cross-file flake class is enforced statically by `scripts/check-test-isolation.sh`, wired into `bun run verify` and `bun run check:all`. Rules (non-serial unit files only; `*.serial.test.ts` and `test/e2e/*` are skipped):
 
@@ -117,6 +159,41 @@ The quarantine has grown to dozens of files — treat it as debt: every addition
 
 ### Unit test inventory
 
+#### Shared checkout and client-binding regression cluster
+
+`test/helpers/client-binding-preload.ts` must remain the first preload in
+`bunfig.toml`. It clears inherited `GBRAIN_SOURCE`, `GBRAIN_SOURCE_PATH`, and
+`GBRAIN_BRAIN_REPO_PATH` before test modules load, while the later preloads keep
+their existing responsibilities. This prevents a developer's live checkout
+binding from changing test routing or making local absolute paths enter fixtures.
+
+The focused cluster for the shared multi-source projection and client-local path
+boundary is:
+
+- `test/brain-repo-layout.test.ts` and `test/source-resolver.test.ts` — layout,
+  markers, mutually exclusive bindings, exact Git-root and remote validation.
+- `test/sources-ops.test.ts` and
+  `test/e2e/client-source-binding-postgres.test.ts` — transactional client
+  preparation, idempotency, stable-state preservation, and real-Postgres parity.
+- `test/write-through.test.ts`,
+  `test/ingestion/put-page-write-through.test.ts`, and
+  `test/sync-brain-repo-projection.serial.test.ts` — per-source projection,
+  symlink-escape rejection, write-through, discovery, and fresh-checkout sync.
+- `test/brain-repo-durability.serial.test.ts` and `test/durability-cron.test.ts`
+  — marker hardening, canonical confinement, absolute scheduled invocation, and
+  quiet successful pulls.
+- `test/import-repo-path-guard.test.ts` and `test/e2e/sync.test.ts` — explicit
+  checkout imports do not write the checkout path into shared DB state, a
+  pathless Git commit bookmark rejects a checkout that does not contain the
+  saved commit, ambient Git object-store overrides cannot forge membership,
+  non-missing-table database lookup errors fail closed, and legacy path
+  anchors remain compatible.
+- `test/destructive-guard.test.ts` — archive, restore, purge, and Git-first
+  retirement behavior under the shared binding.
+- `test/minions.test.ts`, `test/serve-http-client-binding-audit.test.ts`, and
+  `test/http-transport.test.ts` — structured queue, worker, request-log, and
+  admin-event path sanitation.
+
 `bun test` runs all tests without a database. E2E tests skip gracefully when `DATABASE_URL` is not set.
 
 Unit tests and what they cover:
@@ -133,6 +210,9 @@ Unit tests and what they cover:
 - `test/volunteer-context.test.ts` — push-based context core (#2095), hermetic in-memory PGLite: `parseWindow` lenient `user:`/`assistant:` parsing, multi-turn window extraction, confidence-gated volunteering (arm confidences, multi-turn/newest-turn boosts, `min_confidence` gate, max-pages cap), slug-only suppression, privacy (rationales are deterministic templates; synopses pass the takes/facts fence), and the approximate usage-stats join.
 - `test/watch-command.test.ts` — `gbrain watch` push transport (#2095): streaming loop, rolling window, session dedupe, `--json` JSONL shape, `channel: 'watch'` event logging, clean EOF return. Hermetic PGLite + injected line/write deps (no subprocess, no real stdin).
 - `test/watch-sigint.serial.test.ts` — `gbrain watch` SIGINT lifecycle against a real spawned CLI subprocess with a tmpdir brain. SERIAL: parallel unit shards flake on concurrent subprocess spawns (same rationale as `apply-migrations-pglite-spawn.serial.test.ts`).
+- `test/autopilot-launchd-lifecycle.serial.test.ts` — autopilot lifecycle behavior, not generated-string assertions: the full install → self-disable → status → reinstall → uninstall arc with `launchctl` replaced by an argv recorder and the generated wrapper executed by a REAL bash against a genuinely deleted repo (every platform), plus a darwin-only fail-SKIP describe against the real launchd under a per-run unique label (`GBRAIN_AUTOPILOT_LABEL`) so it can never collide with — or tear down — a real install on the host. Serial: spawns subprocesses and pins HOME/GBRAIN_HOME for the whole file.
+- `test/autopilot-fanout.test.ts` — Autopilot fan-out and #4046 policy regression: targeted idempotency keys reopen per dispatch interval while stable doctor/remediate keys remain unchanged; the 60-minute full-cycle floor wins with a remaining small plan, and an all-fresh restart check advances the process-local clock without masking failed stale-source submissions.
+- `test/agent-scheduler-contract.serial.test.ts` — the documented external agent-scheduler shell chain (`gbrain sync --repo X && gbrain embed --stale`, live-sync.md / INSTALL_FOR_AGENTS.md Step 7) driven end-to-end through a real `/bin/sh` against a keyless PGLite brain: the `&&` short-circuit IS the contract (argv arrays can't exercise it), the keyless bare stale embed exits 0, and the pull-failure case that must break the chain does. Anti-vacuity: the fixture commits a real page and every read-back asserts pages >= 1. Serial: real spawned CLI + tmpdir HOME.
 - `test/cli-format-volunteer.test.ts` — `formatResult`'s `volunteer_context` human rendering: pointer lines with confidence/arm/rationale, the empty-result message, the approximate stats summary.
 - `test/config.test.ts` — config redaction.
 - `test/files.test.ts` — MIME/hash.
@@ -166,6 +246,8 @@ Unit tests and what they cover:
 - `test/dedup.test.ts` — source-aware dedup, compiled truth guarantee, layer interactions.
 - `test/intent.test.ts` — query intent classification: entity/temporal/event/general.
 - `test/eval.test.ts` — retrieval metrics: `precisionAtK`, `recallAtK`, `mrr`, `ndcgAtK`, `parseQrels`.
+- `test/brainbench-fixtures.test.ts` / `test/brainbench-generator.test.ts` / `test/brainbench-metrics.test.ts` / `test/brainbench-continuity.test.ts` / `test/brainbench-writeback.test.ts` / `test/brainbench-adapters.test.ts` / `test/brainbench-scoreboard.test.ts` — the BrainBench memory-conformance unit suites (`src/eval/brainbench/`): fixture loader/validator + the sealed-gold seal (a `gold` key inside a fixture must reject) and committed-corpus integrity; generator determinism (the committed corpus is exactly what `gen.ts` produces, holdout discipline, category counts); metric formulas over hand-built turn rows (zero should-retrieve turns, empty injections, acceptable-vs-gold asymmetry, micro-averaging); cross-harness continuity (writer's decision persists through the production write-back pipeline, reader recalls on the SAME brain); write-back grading the PRODUCTION conversation→facts pipeline via the injected gold extractor; adapter seam contracts over hermetic PGLite (budget caps, suppression modes); scoreboard + gate governance (baseline determinism, count-aware gating, corpus-bless modes, justification flow, isolation gates-at-zero).
+- `test/eval-brainbench-e2e.test.ts` — BrainBench CLI end-to-end via subprocess against a small tmp corpus: the literal exit codes (0 pass / 1 regression / 2 error-or-inconclusive — the CI product), `--out` artifact validity incl. `_meta.metric_glossary`, byte-deterministic `--update-baseline`, anti-vacuous-pass, and the `eval run-all` in-process wiring.
 - `test/check-resolvable.test.ts` — resolver reachability, MECE overlap, gap detection, proximity-based DRY detection, `extractDelegationTargets` coverage.
 - `test/dry-fix.test.ts` — auto-fix: three shape-aware expander pure-function tests; five guards (working-tree-dirty, no-git-backup, inside-code-fence, already-delegated within 40 lines, ambiguous-multi-match, block-is-callout).
 - `test/doctor-fix.test.ts` — `gbrain doctor --fix` CLI integration: dry-run preview, apply path, JSON output shape.
@@ -192,6 +274,7 @@ Unit tests and what they cover:
 - `test/sync-pull-failed-anchor.serial.test.ts` — #3068 regression: a failed internal `git pull` (local-path origin vs `protocol.file.allow=never`) with zero imports returns `partial`/`pull_failed` (not `up_to_date`), freezes `last_commit` + `last_sync_at`, recovers after a manual pull; fall-through import of local commits preserved. Serial: pins `GBRAIN_HOME` to a temp dir for the whole file.
 - `test/sync-concurrency.test.ts` — `autoConcurrency()` thresholds + PGLite-forces-serial + explicit-override clamping; `shouldRunParallel()` explicit-bypasses-floor contract; `parseWorkers()` validation rejecting `'0'`/`'-3'`/`'foo'`/`'1.5'`/trailing chars.
 - `test/sync-parallel.test.ts` — PGLite-routed coverage of the bookmark gate under concurrency, head-drift gate, vanished-file failure capture, PGLite-stays-serial, and the `gbrain-sync` writer-lock contract.
+- `test/sync-all-missing-path.test.ts` — `sync --all --missing-path <fail|skip>` pure helpers: `parseMissingPathMode` (default fail, explicit values, loud rejection of bad/dangling values, never swallows a following flag) and `partitionMissingPathSources` (classification driven only by the injected pathExists predicate — no fs; null `local_path` passes through runnable; order preserved).
 - `test/sync-failures.test.ts` — `classifyErrorCode` regex coverage for all 12 codes against literal production message strings from `markdown.ts` and `import-file.ts`; `summarizeFailuresByCode` sort + pre-classified-honor; `recordSyncFailures` code-field persistence; `acknowledgeSyncFailures` `AcknowledgeResult` shape + backfill on legacy entries.
 - `test/doctor.test.ts` — doctor command; assertions that `jsonb_integrity` scans the four JSONB write sites and `markdown_body_completeness` is present.
 - `test/utils.test.ts` — shared SQL utilities + `tryParseEmbedding` null-return and single-warn semantics.

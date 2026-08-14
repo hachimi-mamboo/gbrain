@@ -388,7 +388,36 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
         i += 2;
         break;
       }
-      case '--scopes': out.scopes = requireValue(); i += 2; break;
+      case '--scopes': {
+        // v0.42.x: accept comma-separated input (`--scopes read,write,admin`)
+        // in addition to the space-separated OAuth wire form
+        // (`--scopes "read write admin"`). init.ts's own registration hint
+        // (line ~730) recommends the comma form, but the parser previously
+        // only split on whitespace, so a comma-joined string fell through
+        // as a single unrecognized token and registerClientManual's
+        // assertAllowedScopes rejected it as `Unknown scope
+        // "read,write,admin"` — self-contradicting the hint. Normalizing
+        // here (rather than in the shared parseScopeString) keeps that
+        // function's OAuth-wire-format (RFC 6749 space-delimited) contract
+        // intact for DCR/refresh/request-scope parsing, which stays
+        // comma-agnostic on purpose.
+        const v = requireValue();
+        const normalized = v.split(/[\s,]+/).filter(Boolean).join(' ');
+        // Zero-token input (`--scopes ","`, `--scopes ",,,"`, `--scopes "  "`,
+        // `--scopes ""`) collapses to an empty string under the split above.
+        // parseScopeString('') returns [] downstream, and
+        // assertAllowedScopes([]) passes vacuously on an empty list — so
+        // without this guard, registerClientManual would silently register
+        // a client with no usable scopes instead of reporting malformed
+        // input. Reject here, at the parser boundary, with a clear message
+        // rather than relying on whatever downstream error the raw string
+        // happens to produce.
+        if (!normalized) {
+          throw new Error(`--scopes requires at least one scope (got ${JSON.stringify(v)})`);
+        }
+        out.scopes = normalized;
+        i += 2; break;
+      }
       case '--source': out.sourceId = requireValue(); i += 2; break;
       case '--federated-read': {
         const v = requireValue();
@@ -524,13 +553,17 @@ async function registerClient(name: string, args: string[]) {
  * /admin/api/rescope-client endpoint.
  */
 async function rescopeClient(clientId: string, args: string[]) {
-  const usage = 'Usage: auth rescope-client <client_id> [--source SOURCE] [--federated-read SRC1,SRC2,...]';
+  const usage = 'Usage: auth rescope-client <client_id> [--source SOURCE] [--federated-read SRC1,SRC2,...] [--bound-slug-prefixes P1,P2|none]';
   if (!clientId) {
     console.error(usage);
     process.exit(1);
   }
   let sourceId: string | undefined;
   let federatedRead: string[] | undefined;
+  // v0.42.72.0: tri-state — undefined = untouched, null = clear ('none'),
+  // array = replace. Lets roster churn (channel joins/leaves) update the
+  // write fence in place instead of register+rotate.
+  let boundSlugPrefixes: string[] | null | undefined;
   for (let i = 0; i < args.length; i += 2) {
     const flag = args[i];
     const value = args[i + 1];
@@ -542,14 +575,18 @@ async function rescopeClient(clientId: string, args: string[]) {
     if (flag === '--source') sourceId = value;
     else if (flag === '--federated-read') {
       federatedRead = value.split(',').map(s => s.trim()).filter(Boolean);
+    } else if (flag === '--bound-slug-prefixes') {
+      boundSlugPrefixes = value === 'none'
+        ? null
+        : value.split(',').map(s => s.trim()).filter(Boolean);
     } else {
       console.error(`Error: Unknown flag: ${flag}`);
       console.error(usage);
       process.exit(1);
     }
   }
-  if (sourceId === undefined && federatedRead === undefined) {
-    console.error('Error: pass --source and/or --federated-read');
+  if (sourceId === undefined && federatedRead === undefined && boundSlugPrefixes === undefined) {
+    console.error('Error: pass --source, --federated-read, and/or --bound-slug-prefixes');
     console.error(usage);
     process.exit(1);
   }
@@ -557,10 +594,13 @@ async function rescopeClient(clientId: string, args: string[]) {
     await withConfiguredSql(async (sql) => {
       const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
       const provider = new GBrainOAuthProvider({ sql });
-      const result = await provider.rescopeClient(clientId, { sourceId, federatedRead });
+      const result = await provider.rescopeClient(clientId, { sourceId, federatedRead, boundSlugPrefixes });
       console.log(`OAuth client rescoped: "${result.clientName}" (${result.clientId})\n`);
       console.log(`  Write source:        ${result.sourceId}`);
       console.log(`  Federated reads:     ${result.federatedRead.join(', ') || '<none>'}`);
+      if (result.boundSlugPrefixes !== undefined) {
+        console.log(`  Bound slug prefixes: ${result.boundSlugPrefixes?.join(', ') ?? '<none — full-source write authority>'}`);
+      }
       console.log('\nTakes effect on the client\'s next request (existing tokens included).');
     });
   } catch (e: any) {
@@ -645,14 +685,22 @@ Usage:
      --bound-tools <tool1,tool2>                           Bind submit_agent to an allow-list of tools
      --bound-source <id>                                   Bind submit_agent jobs to a source id
      --bound-brain <id>                                    Bind submit_agent jobs to a brain id
-     --bound-slug-prefixes <prefix1,prefix2>               Bind submit_agent writes to slug prefixes
+     --bound-slug-prefixes <prefix1,prefix2>               Fence ALL direct slug writes (put_page, delete_page,
+                                                          tags, links, timeline, revert, raw data) AND
+                                                          submit_agent to these prefixes. Each MUST end with
+                                                          '/' or '/*' — a boundary-less 'emp-alice' would also
+                                                          name 'emp-alice-2/...'. Ops that write by something
+                                                          other than a slug (extract_*, forget_fact,
+                                                          ontology_propose, sources_*) and POST /ingest become
+                                                          unavailable to a bound client. Omit = full-source writes.
      --bound-max-concurrent <n>                            Bound submit_agent concurrency (default: 1)
      --budget-usd-per-day <usd>                            Bound submit_agent daily spend cap
   gbrain auth rescope-client <client_id> [options]        Change an existing client's source scope (e.g. a DCR
                                                           client stuck on the 'default' source). Only the flags
-                                                          you pass change; the other axis is left as-is.
+                                                          you pass change; the other axes are left as-is.
      --source <id>                                        New write source
      --federated-read <id1,id2,...>                       New read-scope source list
+     --bound-slug-prefixes <p1,p2|none>                   Replace the slug-prefix write fence ('none' clears it)
   gbrain auth revoke-client <client_id>                   Hard-delete an OAuth 2.1 client (cascades to tokens + codes)
   gbrain auth test <url> --token <token>                  Smoke-test a remote MCP server
 `);

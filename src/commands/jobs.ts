@@ -23,6 +23,16 @@ function hasFlag(args: string[], flag: string): boolean {
 }
 
 /**
+ * Resolve the canonical positive-polarity pull flag while preserving queued
+ * jobs that still carry the legacy inverse `noPull` key.
+ */
+export function resolveJobPull(data: Record<string, unknown>): boolean {
+  if (typeof data.pull === 'boolean') return data.pull;
+  if (typeof data.noPull === 'boolean') return !data.noPull;
+  return true;
+}
+
+/**
  * Long-lived workers outlive operator config changes. Re-stamp the AI gateway
  * from DB-backed model config immediately before queued jobs enter gateway-backed
  * paths, so a stale process-level default cannot route new work to the wrong
@@ -143,6 +153,31 @@ export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv 
   return parsed;
 }
 
+/**
+ * #3026: the thin-client `list`/`get` branches receive jobs as parsed JSON
+ * off the MCP wire, where every timestamp is an ISO string — but formatJob /
+ * formatJobDetail (and the stalled-detection comparison) hold a Date
+ * contract, hydrated locally by MinionQueue.rowToJob. Rehydrate once at the
+ * unpack boundary so both paths hand the formatters real Dates. Exported for
+ * unit tests.
+ */
+const JOB_DATE_FIELDS = [
+  'created_at', 'updated_at', 'started_at', 'finished_at', 'lock_until', 'delay_until',
+] as const;
+
+export function rehydrateJobDates<T>(job: T): T {
+  if (!job || typeof job !== 'object') return job;
+  const rec = job as { [k: string]: unknown };
+  for (const field of JOB_DATE_FIELDS) {
+    const v = rec[field];
+    if (typeof v === 'string') {
+      const d = new Date(v);
+      if (!Number.isNaN(d.getTime())) rec[field] = d;
+    }
+  }
+  return job;
+}
+
 function formatJob(job: MinionJob): string {
   const dur = job.finished_at && job.started_at
     ? `${((job.finished_at.getTime() - job.started_at.getTime()) / 1000).toFixed(1)}s`
@@ -208,7 +243,7 @@ USAGE
   gbrain jobs get <id>
   gbrain jobs cancel <id>
   gbrain jobs retry <id>
-  gbrain jobs prune [--older-than 30d]
+  gbrain jobs prune [--older-than 30d] [--dry-run]
   gbrain jobs delete <id>
   gbrain jobs stats
   gbrain jobs smoke
@@ -496,7 +531,7 @@ HANDLER TYPES (built in)
         const raw = await callRemoteTool(cfg!, 'list_jobs', {
           status, queue: queueName, limit,
         }, { timeoutMs: 30_000 });
-        jobs = unpackToolResult<MinionJob[]>(raw);
+        jobs = unpackToolResult<MinionJob[]>(raw).map((j) => rehydrateJobDates(j));
       } else {
         try { await queue.ensureSchema(); }
         catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
@@ -525,7 +560,7 @@ HANDLER TYPES (built in)
       if (isThinClient(cfg)) {
         try {
           const raw = await callRemoteTool(cfg!, 'get_job', { id }, { timeoutMs: 30_000 });
-          job = unpackToolResult<MinionJob | null>(raw);
+          job = rehydrateJobDates(unpackToolResult<MinionJob | null>(raw));
         } catch (e) {
           // The remote op throws `invalid_params` on not-found; surface as
           // the same "Job not found" exit-1 the local path produces.
@@ -608,8 +643,15 @@ HANDLER TYPES (built in)
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
-      const count = await queue.prune({ olderThan: new Date(Date.now() - days * 86400000) });
-      console.log(`Pruned ${count} jobs older than ${days} days.`);
+      // #2712: --dry-run previews the count without deleting. It used to be
+      // silently ignored (the destructive default ran anyway).
+      const dryRun = hasFlag(args, '--dry-run');
+      const count = await queue.prune({ olderThan: new Date(Date.now() - days * 86400000), dryRun });
+      if (dryRun) {
+        console.log(`[dry-run] Would prune ${count} jobs older than ${days} days. Nothing deleted.`);
+      } else {
+        console.log(`Pruned ${count} jobs older than ${days} days.`);
+      }
       break;
     }
 
@@ -1382,7 +1424,7 @@ export async function registerBuiltinHandlers(
   worker.register('sync', async (job) => {
     const { performSync } = await import('./sync.ts');
     const repoPath = typeof job.data.repoPath === 'string' ? job.data.repoPath : undefined;
-    const noPull = !!job.data.noPull;
+    const noPull = !resolveJobPull(job.data);
     // noEmbed defaults to true (embed is a separate job — submit `embed --stale`
     // after sync, OR run via the autopilot cycle which has its own embed phase).
     // Caller can opt in by passing { noEmbed: false } in job params.
@@ -1488,11 +1530,16 @@ export async function registerBuiltinHandlers(
     // readable via `gbrain jobs get <id>`). Stderr from the worker daemon
     // only emits coarse job-start / job-done lines; per-page detail lives
     // in the DB. Per Codex review #20.
-    await runEmbedCore(engine, {
+    const embedResult = await runEmbedCore(engine, {
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
       all: !!job.data.all,
       stale: job.data.all ? false : (job.data.stale !== false),
+      // `embed --background` serializes dryRun into the payload (embed.ts's
+      // job-args builder). Not reading it back here meant a backgrounded
+      // preview embedded for real: API spend and NULL->vector writes from an
+      // invocation whose whole point was to do neither.
+      dryRun: !!job.data.dryRun,
       sourceId: typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined,
       // CX1+CX5: pace overrides ride in the job payload as explicit overrides
       // only; runEmbedCore re-resolves env > config > bundle at execution so
@@ -1511,7 +1558,16 @@ export async function registerBuiltinHandlers(
         job.updateProgress({ done, total, embedded, phase: 'embed.pages' }).catch(() => {});
       },
     });
-    return { embedded: true };
+    // Report what happened, not a constant. `embedded: true` claimed a dry run
+    // had embedded, which is the same lie in miniature: `gbrain jobs get`
+    // showed it. `embedded` stays the key it always was and stays truthy on a
+    // real run (it is now the count, 0 on a dry run).
+    return {
+      embedded: embedResult.embedded,
+      dry_run: !!embedResult.dryRun,
+      would_embed: embedResult.would_embed,
+      failures: embedResult.failures,
+    };
   });
 
   worker.register('lint', async (job) => {
@@ -1652,7 +1708,44 @@ export async function registerBuiltinHandlers(
   });
 
   worker.register('extract', async (job) => {
-    const { runExtractCore } = await import('./extract.ts');
+    const { runExtractCore, extractStaleFromDB, STALE_TIME_BUDGET_MS } = await import('./extract.ts');
+    // #2849: stale mode — the durable follow-up for extraction deferred by
+    // performSync's size gate (totalChanges > 100). Runs the same DB-source
+    // watermark sweep as `gbrain extract --stale`, scoped to the source the
+    // sync that deferred it was scoped to (job.data.sourceId; absent =
+    // unscoped, matching what the CLI hint tells a default-brain operator
+    // to run). The sweep is checkout-less + idempotent, so retries and
+    // overlapping submissions converge.
+    if (job.data.stale === true) {
+      const sourceIdFilter = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+      const r = await extractStaleFromDB(engine, {
+        dryRun: !!job.data.dryRun,
+        jsonMode: false,
+        includeFrontmatter: false,
+        sourceIdFilter,
+        catchUp: false,
+      });
+      // Internal 30-min budget hit with work remaining → chain a
+      // continuation job so a very large deferred backlog converges without
+      // waiting for the next sync. Forward-progress guard (pagesProcessed >
+      // 0) prevents an infinite chain if the sweep can't advance.
+      if (!job.data.dryRun && r.staleRemaining > 0 && r.pagesProcessed > 0) {
+        try {
+          const queue = new MinionQueue(engine);
+          // NO maxWaiting: with an unscoped (NULL-sourceId) payload the
+          // coalesce filter matches ANY waiting 'extract' job and would
+          // swallow the continuation. Each completed sweep chains at most
+          // one continuation and the sweep is an idempotent watermark scan,
+          // so there is no pile-up to guard against.
+          await queue.add(
+            'extract',
+            { ...job.data, continuation_of: job.id },
+            { timeout_ms: STALE_TIME_BUDGET_MS + 5 * 60 * 1000 },
+          );
+        } catch { /* best-effort: next sync/manual sweep picks up the rest */ }
+      }
+      return { stale: true, source_id: sourceIdFilter ?? null, ...r };
+    }
     const mode = (typeof job.data.mode === 'string' && ['links', 'timeline', 'all'].includes(job.data.mode))
       ? (job.data.mode as 'links' | 'timeline' | 'all')
       : 'all';
@@ -1823,8 +1916,7 @@ export async function registerBuiltinHandlers(
       ? (job.data.phases as string[]).filter(p => validPhases.has(p as any))
       : undefined;
 
-    // Pull default: legacy `true` for back-compat; explicit boolean wins.
-    const pull = typeof job.data.pull === 'boolean' ? job.data.pull : true;
+    const pull = resolveJobPull(job.data);
 
     // #2194 fix #2 / codex #5 (D4): claim-time cooldown guard. A job already
     // queued or retrying (max_attempts:2) can reach the worker after the
@@ -2162,8 +2254,9 @@ export async function registerBuiltinHandlers(
   // migration that retypes 25K+ pages, creates alias rows, converts edge-
   // shaped pages to link rows, AND flips the active pack at end of run.
   // manual_only via src/core/onboard/render.ts:MANUAL_ONLY_PROTECTED_JOBS.
-  // Operator path: `gbrain jobs submit unify-types --allow-protected --params
-  // '{"target_pack":"gbrain-base-v2"}'`.
+  // Dry-run preview: `gbrain jobs submit unify-types --allow-protected
+  // --params '{"target_pack":"gbrain-base-v2"}'`; apply with
+  // '{"target_pack":"gbrain-base-v2","apply":true}'.
   worker.register('unify-types', async (job) => {
     const { runUnifyTypes } = await import('../core/schema-pack/unify-types-handler.ts');
     const data = (job.data ?? {}) as {
@@ -2181,7 +2274,11 @@ export async function registerBuiltinHandlers(
     } as unknown as import('../core/operations.ts').OperationContext;
     return await runUnifyTypes(ctx, {
       target_pack: data.target_pack,
-      apply: data.apply ?? true,
+      // #1575: default matches the handler interface's "Default false
+      // (dry-run)" — a destructive one-shot migration must be opted into
+      // with apply:true (the onboard remediation + the printed migration
+      // command both carry it explicitly).
+      apply: data.apply ?? false,
       sourceId: data.sourceId,
       onProgress: (msg: string) => {
         job.updateProgress({ phase: 'unify-types', message: msg }).catch(() => {});

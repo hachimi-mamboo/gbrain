@@ -11,6 +11,8 @@
  *   await worker.start(); // polls until SIGTERM
  */
 
+import { existsSync } from 'fs';
+import { autopilotPausedMarkerPath } from '../autopilot-paths.ts';
 import type { BrainEngine } from '../engine.ts';
 import type {
   MinionJob, MinionJobContext, MinionHandler, MinionWorkerOpts,
@@ -29,6 +31,7 @@ import {
 } from './lock-renewal-tick.ts';
 import { lockRenewalAudit } from '../audit/lock-renewal-audit.ts';
 import { isRetryableConnError } from '../retry-matcher.ts';
+import { reconnectAfterConnectionError as reconnectEngineAfterConnError } from './reconnect.ts';
 
 /**
  * Abort reasons that signal infrastructure failure (PgBouncer outage,
@@ -152,6 +155,8 @@ export class MinionWorker extends EventEmitter {
   private queue: MinionQueue;
   private handlers = new Map<string, MinionHandler>();
   private running = false;
+  /** Log the pause/resume transition once each, not every poll. */
+  private pausedByMarkerAnnounced = false;
   private inFlight = new Map<number, InFlightJob>();
   private workerId = randomUUID();
 
@@ -295,18 +300,32 @@ export class MinionWorker extends EventEmitter {
     // so a stalled job (lock_until expired) gets requeued before handleTimeouts'
     // `lock_until > now()` guard would skip it. Stall → retry, timeout → dead.
     const stalledTimer = setInterval(async () => {
+      // issue #1720: a dead pool used to spray "Stall detection error: write
+      // CONNECTION_CLOSED ..." every tick forever — this interval was the only
+      // background loop without the #1491-style reconnect. Rebuild the
+      // worker-owned pool AT MOST ONCE per tick, shared across the three
+      // sweeps: a dead pool fails all three, and one rebuild is enough (three
+      // back-to-back connect attempts would just add pooler pressure).
+      let reconnectedThisTick = false;
+      const recoverConnection = async (site: string, e: unknown): Promise<void> => {
+        if (reconnectedThisTick || !isRetryableConnError(e)) return;
+        reconnectedThisTick = true;
+        await this.reconnectAfterConnectionError(site, e);
+      };
       try {
         const { requeued, dead } = await this.queue.handleStalled();
         if (requeued.length > 0) console.log(`Stall detector: requeued ${requeued.length} jobs`);
         if (dead.length > 0) console.log(`Stall detector: dead-lettered ${dead.length} jobs`);
       } catch (e) {
         console.error('Stall detection error:', e instanceof Error ? e.message : String(e));
+        await recoverConnection('handleStalled', e);
       }
       try {
         const timedOut = await this.queue.handleTimeouts();
         if (timedOut.length > 0) console.log(`Timeout detector: dead-lettered ${timedOut.length} jobs (timeout exceeded)`);
       } catch (e) {
         console.error('Timeout detection error:', e instanceof Error ? e.message : String(e));
+        await recoverConnection('handleTimeouts', e);
       }
       try {
         const wallClockTimedOut = await this.queue.handleWallClockTimeouts(this.opts.lockDuration);
@@ -315,6 +334,7 @@ export class MinionWorker extends EventEmitter {
         }
       } catch (e) {
         console.error('Wall-clock timeout detection error:', e instanceof Error ? e.message : String(e));
+        await recoverConnection('handleWallClockTimeouts', e);
       }
     }, this.opts.stalledInterval);
 
@@ -520,7 +540,24 @@ export class MinionWorker extends EventEmitter {
           }
         }
 
-        // Claim jobs up to concurrency limit
+        // Claim jobs up to concurrency limit — unless the system-wide pause
+        // marker is parked. `gbrain migrate` quiesces writers for the copy
+        // window; the marker stops the autopilot dispatch loop, and gating
+        // the CLAIM here extends that fence to queued jobs (an already
+        // in-flight job finishes and is waited on by the migrate drain).
+        // Checked at claim time only: one existsSync per poll tick.
+        if (existsSync(autopilotPausedMarkerPath())) {
+          if (!this.pausedByMarkerAnnounced) {
+            console.log('[worker] pause marker present — not claiming new jobs until it clears.');
+            this.pausedByMarkerAnnounced = true;
+          }
+          await new Promise(resolve => setTimeout(resolve, this.opts.pollInterval));
+          continue;
+        }
+        if (this.pausedByMarkerAnnounced) {
+          console.log('[worker] pause marker cleared — resuming job claims.');
+          this.pausedByMarkerAnnounced = false;
+        }
         if (this.inFlight.size < this.opts.concurrency) {
           const lockToken = `${this.workerId}:${Date.now()}`;
           let job: MinionJob | null;
@@ -548,6 +585,16 @@ export class MinionWorker extends EventEmitter {
           }
 
           if (job) {
+            // Post-claim fence re-check: the pre-claim marker check above
+            // races migrate's marker write — this claim may have committed
+            // after migrate's drain probe counted zero active jobs. A job
+            // claimed into that window is released back (delayed, un-run)
+            // instead of executed; the poll loop then parks on the marker.
+            if (existsSync(autopilotPausedMarkerPath())) {
+              console.log(`[worker] pause marker appeared after claim — releasing ${job.name} (id=${job.id}) un-run.`);
+              await this.releaseClaimForPause(job, lockToken);
+              continue;
+            }
             // Quiet-hours gate: evaluated at claim time, not dispatch.
             // Config lives on the job record (jsonb column added in
             // schema migration v12). Worker releases the job back to the
@@ -614,6 +661,31 @@ export class MinionWorker extends EventEmitter {
    * 'skip' → status='cancelled', final_status='skipped_quiet_hours'. The
    *   event is dropped.
    */
+  /**
+   * Release a just-claimed job back to the queue un-run because the
+   * system-wide pause marker appeared between our pre-claim check and the
+   * claim committing. Same conditional-release SQL shape as the quiet-hours
+   * defer, but with a short delay: the poll loop parks on the marker, so the
+   * job re-enters waiting and is picked up as soon as the pause clears.
+   */
+  private async releaseClaimForPause(job: MinionJob, lockToken: string): Promise<void> {
+    try {
+      await this.engine.executeRaw(
+        `UPDATE minion_jobs
+         SET status = 'delayed', lock_token = NULL, lock_until = NULL,
+             delay_until = now() + interval '1 minute',
+             updated_at = now()
+         WHERE id = $1 AND lock_token = $2`,
+        [job.id, lockToken],
+      );
+    } catch (e) {
+      // Fail-open: if the release UPDATE itself fails, the claim lock simply
+      // expires and the stall detector requeues the row — slower, same end
+      // state, and never a reason to crash the worker.
+      console.error(`[worker] pause release failed for job ${job.id}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   private async handleQuietHoursDefer(job: MinionJob, lockToken: string, verdict: 'skip' | 'defer'): Promise<void> {
     try {
       if (verdict === 'skip') {
@@ -664,18 +736,10 @@ export class MinionWorker extends EventEmitter {
 
   /**
    * Rebuild the worker-owned DB pool after a retryable connection failure.
-   *
-   * PostgresEngine exposes reconnect(); PGLite and test doubles may not. Absence
-   * is a no-op so non-Postgres workers preserve their legacy behavior.
+   * Shared with the inline child drain (#2050) via minions/reconnect.ts.
    */
   private async reconnectAfterConnectionError(site: string, error: unknown): Promise<void> {
-    const reconnect = (this.engine as { reconnect?: (ctx?: { error?: unknown }) => Promise<void> }).reconnect;
-    if (!reconnect) return;
-    try {
-      await reconnect.call(this.engine, { error });
-    } catch (re) {
-      console.error(`[worker] reconnect after ${site} error failed: ${re instanceof Error ? re.message : String(re)}`);
-    }
+    await reconnectEngineAfterConnError(this.engine, site, error);
   }
 
   /** RSS watchdog. Called from the per-job finally and the periodic timer.
@@ -1119,7 +1183,34 @@ export class MinionWorker extends EventEmitter {
         attempts_made: job.attempts_made + 1,
       }) : 0;
 
-      const failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs);
+      // issue #1720: failJob can itself throw during the same DB outage that
+      // failed the job. Pre-fix the rejection escaped to launchJob's .catch
+      // and the ORIGINAL job error was never logged anywhere — the recording
+      // error masked it. Log the original FIRST (it must survive no matter
+      // what), then reconnect + retry the recording once. If it still fails,
+      // leave the row to the stall detector: the lock has stopped renewing,
+      // so handleStalled requeues it cleanly on a live pool (the D8a path).
+      let failed: MinionJob | null;
+      try {
+        failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs);
+      } catch (recordErr) {
+        const recordMsg = recordErr instanceof Error ? recordErr.message : String(recordErr);
+        console.error(
+          `Job ${job.id} (${job.name}) failed with: ${errorText} — and recording the failure threw: ${recordMsg}`,
+        );
+        if (!isRetryableConnError(recordErr)) throw recordErr;
+        await this.reconnectAfterConnectionError('failJob', recordErr);
+        try {
+          failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs);
+        } catch (retryErr) {
+          console.error(
+            `Job ${job.id} (${job.name}) failure-recording retry also failed ` +
+            `(${retryErr instanceof Error ? retryErr.message : String(retryErr)}); ` +
+            `leaving the row for the stall detector to requeue after lock expiry`,
+          );
+          return;
+        }
+      }
       if (!failed) {
         console.warn(`Job ${job.id} failure dropped (lock token mismatch)`);
         return;

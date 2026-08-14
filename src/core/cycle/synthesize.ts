@@ -31,16 +31,18 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
-import { normalizeModelId } from '../model-id.ts';
+import { normalizeModelId, splitProviderModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
-import { join, dirname, isAbsolute, resolve } from 'node:path';
+import { basename, join, dirname, isAbsolute, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
+import { reconnectAfterConnectionError } from '../minions/reconnect.ts';
+import { isRetryableConnError } from '../retry-matcher.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import { makeSubagentHandler } from '../minions/handlers/subagent.ts';
 import type { MinionJobInput, MinionJobContext, MinionHandler, SubagentHandlerData } from '../minions/types.ts';
-import { discoverTranscripts, type DiscoveredTranscript } from './transcript-discovery.ts';
+import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
@@ -48,8 +50,9 @@ import { safeSplitIndex } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
 
 // Slug grammar from validatePageSlug — shared via PAGE_SLUG_SEG (#738).
-// Used for the orchestrator-written summary index slug.
-const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`);
+// Used for the orchestrator-written summary index slug. `u` flag required
+// by PAGE_SLUG_SEG's \p{...} classes (#3417).
+const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, 'u');
 
 // ── Model context budget (D1, D5, D7, D9) ─────────────────────────────
 
@@ -61,6 +64,10 @@ const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`);
  * resolver returns for known Anthropic aliases.
  */
 const MODEL_CONTEXT_TOKENS: Record<string, number> = {
+  'claude-fable-5': 1_000_000,
+  'claude-opus-5': 1_000_000,
+  'claude-sonnet-5': 1_000_000,
+  'claude-opus-4-8': 1_000_000,
   'claude-opus-4-7': 1_000_000,
   'claude-opus-4-6': 1_000_000,
   'claude-sonnet-4-6': 200_000,
@@ -94,14 +101,21 @@ const DEFAULT_SUBAGENT_WAIT_TIMEOUT_MS = 35 * 60 * 1000;
  * accumulation is out of scope for v0.30.2 (terminal-error classification
  * catches turn-N blowups; per-turn budget guard is a v0.31+ follow-up).
  */
-function computeChunkCharBudget(
+export function computeChunkCharBudget(
   model: string,
   configMaxPromptTokens: number | null,
 ): number {
   if (configMaxPromptTokens !== null) {
     return Math.floor(configMaxPromptTokens * CHARS_PER_TOKEN);
   }
-  const ctx = MODEL_CONTEXT_TOKENS[model];
+  // Lookup keyed on the bare model name (after prefix strip), mirroring
+  // ANTHROPIC_OUTPUT_CAPS in brainstorm/judges.ts: resolveModel returns
+  // provider-prefixed strings when TIER_DEFAULTS / config values carry a
+  // prefix (the current tier defaults all do), so a raw keyed lookup sent
+  // every tier-resolved brain to the unknown-model fallback — a 5x budget
+  // cut on 1M-context models.
+  const bare = splitProviderModelId(model).model || model;
+  const ctx = MODEL_CONTEXT_TOKENS[bare];
   if (ctx === undefined) {
     warnUnknownModelOnce(model);
     return Math.floor(UNKNOWN_MODEL_BUDGET_TOKENS * CHARS_PER_TOKEN);
@@ -264,39 +278,101 @@ export interface SynthesizePhaseOpts {
   once?: boolean;
 }
 
-const INLINE_PGLITE_LOCK_MS = 30_000;
+const INLINE_LOCK_MS = 30_000;
 
 /**
- * PGLite cannot be served by a separate Minions worker process: the embedded
- * data-dir holds an exclusive file lock, so subagent children enqueued by the
- * synth parent would sit in 'waiting' until waitForCompletion times out.
- * Drive the same claim → run → complete/fail loop a worker would perform,
- * inline, against this phase's private child queue.
+ * Drain this phase's private child queue inline: drive the same claim → run →
+ * complete/fail loop a worker would perform, from the parent's own slot.
+ *
+ * Why inline on BOTH engines:
+ *   - PGLite: no separate Minions worker can run at all (the embedded
+ *     data-dir holds an exclusive file lock), so children would sit in
+ *     'waiting' until waitForCompletion times out.
+ *   - Postgres (#2050): the parent phase itself runs as a job inside a
+ *     `jobs work` process. A worker whose slots are all occupied by such
+ *     parents (autopilot spawns its drain worker at the default
+ *     concurrency=1) can never claim the child the parent is blocking on —
+ *     a structural self-deadlock. Running children inline means a child
+ *     never needs a worker slot, so the deadlock is impossible at ANY
+ *     concurrency, and no extra DB-pool pressure is added: the child's work
+ *     replaces the parent's idle waitForCompletion polling in the slot the
+ *     parent already holds.
  *
  * `yieldDuringPhase` is ticked on a 60s interval while a child runs so the
  * 5-min cycle lock TTL keeps refreshing during long (up to 30-min) children.
+ * The child's own claim lock is heartbeated at lockMs/3 (worker cadence
+ * parity) — on Postgres a concurrent worker sweeps handleStalled() across
+ * ALL queues, so without renewal any child running longer than lockMs would
+ * be requeued mid-run and stall-churned to dead.
  */
-async function runPgliteSubagentsInline(
+export async function runSubagentsInline(
   engine: BrainEngine,
   queue: MinionQueue,
   queueName: string,
   yieldDuringPhase?: () => Promise<void>,
   handler: MinionHandler = makeSubagentHandler({ engine }),
+  lockMs: number = INLINE_LOCK_MS,
 ): Promise<void> {
-  if (engine.kind !== 'pglite') return;
+  // #3555 interaction: the drain's queue ops used to be bare awaits, so a
+  // transient pooler reap mid-drain threw out of the loop and stranded the
+  // remaining children in this per-run private queue — which no worker will
+  // ever claim. Mirror the worker's recovery: on a retryable connection
+  // error, rebuild the pool (shared reconnectAfterConnectionError) and retry
+  // the loop; non-retryable errors still propagate (real bug → phase fails).
+  const MAX_CONN_ERROR_STREAK = 5;
+  let connErrorStreak = 0;
+  let sawConnError = false;
+  const recoverOrThrow = async (site: string, e: unknown): Promise<void> => {
+    if (!isRetryableConnError(e) || ++connErrorStreak > MAX_CONN_ERROR_STREAK) throw e;
+    sawConnError = true;
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`[dream] inline drain ${site} hit a connection error; reconnecting and retrying: ${msg}\n`);
+    await reconnectAfterConnectionError(engine, `inline-${site}`, e);
+    // Small cooperative backoff (setTimeout keeps the cycle-lock keepalive
+    // and any concurrent timers firing) before the loop retries.
+    await new Promise((r) => setTimeout(r, Math.min(1000, Math.max(50, Math.floor(lockMs / 3)))));
+  };
 
   while (true) {
-    // Housekeeping a worker would normally perform, so child rows can reach
-    // terminal states (delayed retries promoted, timeouts dead-lettered)
-    // before the synth parent enters waitForCompletion polling.
-    await queue.promoteDelayed();
-    await queue.handleStalled();
-    await queue.handleTimeouts();
-    await queue.handleWallClockTimeouts(INLINE_PGLITE_LOCK_MS);
-
     const lockToken = randomUUID();
-    const job = await queue.claim(lockToken, INLINE_PGLITE_LOCK_MS, queueName, ['subagent']);
-    if (!job) return;
+    let job: Awaited<ReturnType<MinionQueue['claim']>>;
+    try {
+      // Housekeeping a worker would normally perform, so child rows can reach
+      // terminal states (delayed retries promoted, timeouts dead-lettered)
+      // before the synth parent enters waitForCompletion polling.
+      await queue.promoteDelayed();
+      await queue.handleStalled();
+      await queue.handleTimeouts();
+      await queue.handleWallClockTimeouts(lockMs);
+
+      job = await queue.claim(lockToken, lockMs, queueName, ['subagent']);
+    } catch (e) {
+      await recoverOrThrow('queue-ops', e);
+      continue;
+    }
+    connErrorStreak = 0;
+    if (!job) {
+      if (!sawConnError) return;
+      // A connection-error window may have left a child 'active' under a
+      // lock nobody renews (a claim that committed but whose row never
+      // reached us, or a lost outcome write below). handleStalled() at the
+      // loop top requeues it once the lock expires (≤ lockMs), so only exit
+      // once the queue is actually quiet.
+      let active = 0;
+      try {
+        const rows = await engine.executeRaw<{ n: number }>(
+          `SELECT count(*)::int AS n FROM minion_jobs WHERE queue = $1 AND status = 'active'`,
+          [queueName],
+        );
+        active = rows[0]?.n ?? 0;
+      } catch (e) {
+        await recoverOrThrow('active-check', e);
+        continue;
+      }
+      if (active === 0) return;
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
 
     const abort = new AbortController();
     const shutdown = new AbortController();
@@ -346,18 +422,45 @@ async function runPgliteSubagentsInline(
     const keepalive = yieldDuringPhase
       ? setInterval(() => { yieldDuringPhase().catch(() => { /* best-effort */ }); }, 60_000)
       : null;
+    // #2050: heartbeat the child's claim lock while the handler runs so a
+    // concurrent Postgres worker's handleStalled() sweep (all queues, not
+    // just its own) can't requeue a live child. A false return means the row
+    // was cancelled or reclaimed — abort the handler. Errors are swallowed
+    // (best-effort; the next tick retries), never an unhandledRejection.
+    const renewTimer = setInterval(() => {
+      queue.renewLock(job.id, lockToken, lockMs)
+        .then((ok) => {
+          if (!ok && !abort.signal.aborted) abort.abort(new Error('lock-renewal-failed'));
+        })
+        .catch(() => { /* best-effort; next tick retries */ });
+    }, Math.max(50, Math.floor(lockMs / 3)));
+    // Run, then record — separated so a completeJob connection error can't
+    // masquerade as a handler failure, and a failJob connection error can't
+    // escape the drain and strand the remaining children (worker.ts #1720
+    // parity: reconnect + retry the recording once; if it still fails, leave
+    // the row for the loop's own handleStalled to requeue after lock expiry).
+    let result: unknown;
+    let handlerErr: unknown;
+    let handlerRan = false;
     try {
-      const result = await handler(context);
-      await queue.completeJob(
-        job.id,
-        lockToken,
-        result != null ? (typeof result === 'object' ? result as Record<string, unknown> : { value: result }) : undefined,
-      );
+      result = await handler(context);
+      handlerRan = true;
     } catch (e) {
+      handlerErr = e;
+    }
+    const record = async (): Promise<void> => {
+      if (handlerRan) {
+        await queue.completeJob(
+          job.id,
+          lockToken,
+          result != null ? (typeof result === 'object' ? result as Record<string, unknown> : { value: result }) : undefined,
+        );
+        return;
+      }
       // Timeout is terminal (handleTimeouts parity: stall → retry,
       // timeout → dead), never a delayed retry.
       const timedOut = abort.signal.aborted;
-      const errorText = timedOut ? 'timeout exceeded' : (e instanceof Error ? e.message : String(e));
+      const errorText = timedOut ? 'timeout exceeded' : (handlerErr instanceof Error ? handlerErr.message : String(handlerErr));
       const attemptsExhausted = job.attempts_made + 1 >= job.max_attempts;
       await queue.failJob(
         job.id,
@@ -366,9 +469,30 @@ async function runPgliteSubagentsInline(
         timedOut || attemptsExhausted ? 'dead' : 'delayed',
         0,
       );
+    };
+    try {
+      try {
+        await record();
+      } catch (recordErr) {
+        if (!isRetryableConnError(recordErr)) throw recordErr;
+        sawConnError = true;
+        const msg = recordErr instanceof Error ? recordErr.message : String(recordErr);
+        process.stderr.write(`[dream] inline drain: recording job ${job.id} outcome hit a connection error; reconnecting and retrying once: ${msg}\n`);
+        await reconnectAfterConnectionError(engine, 'inline-record', recordErr);
+        try {
+          await record();
+        } catch (retryErr) {
+          // Leave the row to the loop's own handleStalled: the claim lock
+          // stops renewing (finally clears renewTimer), expires within
+          // lockMs, and the next iteration requeues it on a live pool.
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          process.stderr.write(`[dream] inline drain: outcome recording retry for job ${job.id} also failed (${retryMsg}); leaving the row for stall requeue\n`);
+        }
+      }
     } finally {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (keepalive) clearInterval(keepalive);
+      clearInterval(renewTimer);
     }
   }
 }
@@ -484,7 +608,22 @@ export async function runPhaseSynthesize(
       }
       try {
         const verdict = await judgeSignificance(judge, t, config.verdictModel);
-        await engine.putDreamVerdict(t.filePath, t.contentHash, verdict);
+        if (verdict.unreliable) {
+          // Degenerate judgement (truncated, refused/content-filtered, or
+          // unparseable LLM output). Do
+          // NOT write it to dream_verdicts: a cached `worth_processing:
+          // false` is permanent for this content hash, and a brain whose
+          // verdict model reliably truncates (e.g. a reasoning model under
+          // a tight budget) would silently reject every transcript forever.
+          // Log + skip so the next cycle re-judges.
+          process.stderr.write(
+            `[dream] verdict for ${t.basename} was ${verdict.unreliable} ` +
+            `(${verdict.reasons.join('; ')}); not caching in dream_verdicts — ` +
+            `next cycle will re-judge ${t.filePath}\n`,
+          );
+        } else {
+          await engine.putDreamVerdict(t.filePath, t.contentHash, verdict);
+        }
         verdicts.push({ filePath: t.filePath, worth: verdict.worth_processing, reasons: verdict.reasons, cached: false });
         if (verdict.worth_processing) worthProcessing.push(t);
       } catch (e) {
@@ -539,12 +678,11 @@ export async function runPhaseSynthesize(
     }
 
     const queue = new MinionQueue(engine);
-    // PGLite children drain inline (no separate worker can open the embedded
-    // data-dir), so give them a private per-run queue: the inline drain must
-    // never claim unrelated 'default'-queue jobs a Postgres worker owns.
-    const childQueueName = engine.kind === 'pglite'
-      ? `dream-inline-${Date.now()}-${randomUUID().slice(0, 8)}`
-      : 'default';
+    // #2050: children drain inline on BOTH engines (see runSubagentsInline),
+    // so give them a private per-run queue: the inline drain must never claim
+    // unrelated 'default'-queue jobs, and a 'default'-queue worker must never
+    // claim a child this parent is about to run itself.
+    const childQueueName = `dream-inline-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const childIds: number[] = [];
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
@@ -554,20 +692,31 @@ export async function runPhaseSynthesize(
     const skipReports: Array<{ filePath: string; reason: string }> = [];
 
     const maxCharsPerChunk = computeChunkCharBudget(config.model, config.maxPromptTokens);
+    const successfulLegacyKeys = await loadSuccessfulLegacySynthesisKeys(
+      engine,
+      opts.sourceId ?? 'default',
+    );
 
     for (const t of worthProcessing) {
       const hash16 = t.contentHash.slice(0, 16);
       const hash6 = t.contentHash.slice(0, 6);
 
-      // D8: single→multi-chunk migration safety. If a completed legacy
-      // single-chunk job exists for this content_hash, treat as already-
-      // synthesized and skip. Prevents duplicate writes when a transcript
-      // that was previously single-chunk now multi-chunks (because budget
-      // shrank or model changed).
-      if (await hasLegacySingleChunkCompletion(engine, t.filePath, hash16)) {
+      // D8: legacy-key migration safety. If this content hash already
+      // completed under the pre-v2 path-based key family — single-chunk OR
+      // a full chunked set — treat as already-synthesized and skip.
+      // Prevents a full paid re-synthesis when the corpus root moves or
+      // the chunking outcome changes across versions.
+      const legacyCompletion = findLegacyCompletion(
+        successfulLegacyKeys,
+        t.filePath,
+        hash16,
+      );
+      if (legacyCompletion) {
         skipReports.push({
           filePath: t.filePath,
-          reason: 'already_synthesized_legacy_single_chunk',
+          reason: legacyCompletion === 'chunked'
+            ? 'already_synthesized_legacy_chunked'
+            : 'already_synthesized_legacy_single_chunk',
         });
         continue;
       }
@@ -611,15 +760,15 @@ export async function runPhaseSynthesize(
           // so put_page writes land there instead of the hardcoded 'default'.
           ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
         };
-        // Idempotency key parity:
-        //   - single-chunk → legacy `dream:synth:<filePath>:<hash16>` (byte-
-        //     equivalent across versions; preserves dedup for unchanged
-        //     transcripts on upgrade).
-        //   - multi-chunk → `<legacy>:c<i>of<n>` per chunk; durable across
-        //     runs because D9 splitTranscriptByBudget is hash-deterministic.
+        // Keep producer identity stable when the corpus root moves. Source and
+        // complete filename remain explicit so equal bytes in different source
+        // or filename namespaces do not collide.
+        const synthesisKey =
+          `dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+          `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}`;
         const idempotency_key = isChunked
-          ? `dream:synth:${t.filePath}:${hash16}:c${i}of${chunks.length}`
-          : `dream:synth:${t.filePath}:${hash16}`;
+          ? `${synthesisKey}:c${i}of${chunks.length}`
+          : synthesisKey;
         const submitOpts: Partial<MinionJobInput> = {
           max_stalled: 3,
           on_child_fail: 'continue',
@@ -641,11 +790,11 @@ export async function runPhaseSynthesize(
       }
     }
 
-    // PGLite cannot run a separate Minions worker because the embedded DB
-    // holds an exclusive file lock. Drain this phase's private child queue
-    // inline so the parent observes terminal child states instead of polling
-    // waiters until subagentWaitTimeoutMs expires. No-op on Postgres.
-    await runPgliteSubagentsInline(engine, queue, childQueueName, opts.yieldDuringPhase);
+    // Drain this phase's private child queue inline so the parent observes
+    // terminal child states instead of polling waiters until
+    // subagentWaitTimeoutMs expires. Runs on BOTH engines — on Postgres the
+    // parent job otherwise deadlocks a fully-occupied worker (#2050).
+    await runSubagentsInline(engine, queue, childQueueName, opts.yieldDuringPhase);
 
     // Wait for every child to reach a terminal state. Tick yieldDuringPhase
     // every 5 min so the cycle lock TTL refreshes.
@@ -786,7 +935,6 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
   // Explicit enabled=false still wins for pausing synthesis without removing corpus config.
   const enabled = enabledRaw === 'false' ? false : (enabledRaw === 'true' || !!corpusDir);
   const meetingTranscriptsDir = await engine.getConfig('dream.synthesize.meeting_transcripts_dir');
-  const minCharsStr = await engine.getConfig('dream.synthesize.min_chars');
   const excludeStr = await engine.getConfig('dream.synthesize.exclude_patterns');
   // v0.28: resolveModel() unifies CLI flag > new key > deprecated key > models.default > env > fallback
   const { resolveModel } = await import('../model-config.ts');
@@ -802,7 +950,10 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     tier: 'utility',
     fallback: 'haiku',
   });
-  const cooldownHoursStr = await engine.getConfig('dream.synthesize.cooldown_hours');
+  // getNumberConfig (not `parseInt(str, 10) || N`) so a configured 0 is honored — a bare
+  // `|| N` coerces an explicit 0 back to the default (cooldown 0 = "no cooldown").
+  const cooldownHours = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.cooldown_hours', 12));
+  const minChars = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.min_chars', 2000));
   const maxPromptTokensStr = await engine.getConfig('dream.synthesize.max_prompt_tokens');
   const maxChunksStr = await engine.getConfig('dream.synthesize.max_chunks_per_transcript');
   const subagentTimeoutMs = await getNumberConfig(
@@ -816,7 +967,7 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     DEFAULT_SUBAGENT_WAIT_TIMEOUT_MS,
   );
 
-  let excludePatterns: string[] = ['medical', 'therapy'];
+  let excludePatterns: string[] = [...DEFAULT_EXCLUDE_PATTERNS];
   if (excludeStr) {
     try {
       const parsed = JSON.parse(excludeStr);
@@ -845,11 +996,11 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     enabled,
     corpusDir: corpusDir ?? null,
     meetingTranscriptsDir: meetingTranscriptsDir ?? null,
-    minChars: minCharsStr ? Math.max(0, parseInt(minCharsStr, 10) || 2000) : 2000,
+    minChars,
     excludePatterns,
     model,
     verdictModel,
-    cooldownHours: cooldownHoursStr ? Math.max(0, parseInt(cooldownHoursStr, 10) || 12) : 12,
+    cooldownHours,
     maxPromptTokens,
     maxChunksPerTranscript,
     outputRoot: await loadOutputRoot(engine),
@@ -954,7 +1105,8 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
   const modelStr = normalizeModelId(verdictModel);
 
   // #1698 (C1): id-validity via the shared `validateModelId` core (resolveRecipe +
-  // assertTouchpoint) — catches unknown provider AND typo'd native model. We do NOT
+  // assertTouchpoint) — catches unknown provider AND chat-less provider (model-id
+  // typos pass locally and fail at the provider; no runtime allowlist). We do NOT
   // use the full `probeChatModel` here: its `isAvailable` layer would reject
   // non-Anthropic-no-key providers and an unconfigured gateway, breaking the
   // deliberate per-transcript-degrade contract (and test A9). validateModelId reads
@@ -998,15 +1150,36 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
       });
 
       // Map gateway.ChatResult → Anthropic.Message shape. judgeSignificance
-      // reads `.content[0].type === 'text'` and `.content[0].text`; other
-      // fields are best-effort for downstream telemetry parity.
+      // reads `.content[0].type === 'text'`, `.content[0].text`, and
+      // `.stop_reason`; other fields are best-effort for downstream
+      // telemetry parity. The stopReason mapping is load-bearing:
+      // 'length' → 'max_tokens' lets judgeSignificance detect a truncated
+      // verdict (reasoning models can burn the whole max_tokens budget on
+      // reasoning tokens, leaving empty/partial text) and
+      // 'refusal'/'content_filter' → 'refusal' surfaces a blocked response,
+      // instead of silently treating either as a clean end-of-turn.
+      // 'other' (gateway's mapStopReason catch-all — unknown provider
+      // finish reasons, which includes both non-standard SUCCESSFUL stops
+      // and the AI SDK's 'error'/'unknown' labels) maps to 'end_turn'
+      // deliberately. Rationale: (a) treating 'other' as abnormal would
+      // permanently disable verdict caching on providers whose successful
+      // stops the gateway doesn't recognize; (b) the residual risk is
+      // narrow — an errored response only gets cached if it still contains
+      // a complete, parseable JSON object with a boolean worth_processing
+      // (unparseable output is never cached), and such a complete verdict
+      // is trustworthy regardless of the finish label. Distinguishing
+      // error/unknown from benign-unknown belongs in gateway.ts's
+      // mapStopReason (out of scope here — see PR notes).
       return {
         id: '',
         type: 'message',
         role: 'assistant',
         model: modelStr,
         content: [{ type: 'text', text: result.text }],
-        stop_reason: 'end_turn',
+        stop_reason: result.stopReason === 'length' ? 'max_tokens'
+          : result.stopReason === 'tool_calls' ? 'tool_use'
+          : (result.stopReason === 'refusal' || result.stopReason === 'content_filter') ? 'refusal'
+          : 'end_turn',
         stop_sequence: null,
         usage: {
           input_tokens: result.usage.input_tokens,
@@ -1020,6 +1193,21 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
 interface VerdictResult {
   worth_processing: boolean;
   reasons: string[];
+  /**
+   * Set when the judgement is degenerate and must NOT be cached in
+   * dream_verdicts:
+   *   'truncated'   — the response hit max_tokens (reasoning models can spend
+   *                   the whole budget on reasoning tokens before emitting the
+   *                   verdict JSON), so the verdict is unreliable;
+   *   'refusal'     — the model refused or a provider content filter blocked
+   *                   the response (stop_reason=refusal);
+   *   'unparseable' — no JSON object with a boolean `worth_processing` could
+   *                   be parsed out of the response.
+   * The synthesize verdict loop skips putDreamVerdict for these so the next
+   * cycle re-judges the transcript instead of permanently trusting a
+   * degenerate `worth_processing: false`.
+   */
+  unreliable?: 'truncated' | 'refusal' | 'unparseable';
 }
 
 export async function judgeSignificance(
@@ -1070,10 +1258,31 @@ Two reasons max, one phrase each.`;
 
   const msg = await client.create({
     model: verdictModel,
-    max_tokens: 200,
+    // 1024, not the 200 this call shipped with for a year: the verdict JSON
+    // itself needs <100 tokens, but reasoning models spend output budget on
+    // reasoning tokens BEFORE the visible text, so a 200-token cap gets
+    // eaten whole and the verdict comes back empty/truncated. Matches the
+    // judge-call ballpark elsewhere in the repo (grade-takes.ts: 600,
+    // eval-contradictions/judge.ts: 1024).
+    max_tokens: 1024,
     system: sys,
     messages: [{ role: 'user', content: `Transcript ${t.basename}:\n\n${trimmed}` }],
   });
+
+  // stop_reason === 'max_tokens' means the response was cut off; 'refusal'
+  // means the model refused or a content filter blocked it. Even if a
+  // parseable JSON object survives either condition, don't trust it as a
+  // durable verdict — mark it unreliable so the caller skips the
+  // dream_verdicts write and the next cycle re-judges. (Legacy SDK-shape
+  // clients and mocks without a stop_reason field land on undefined here,
+  // which is treated as a clean stop — preserves the pre-existing contract.)
+  // Widen: the pinned Anthropic SDK's stop_reason union predates 'refusal',
+  // but the gateway adapter (and newer SDKs) can emit it.
+  const stopReasonRaw = (msg as { stop_reason?: string | null }).stop_reason;
+  const truncated = stopReasonRaw === 'max_tokens';
+  const refused = stopReasonRaw === 'refusal';
+  const abnormalStop: VerdictResult['unreliable'] | undefined =
+    truncated ? 'truncated' : refused ? 'refusal' : undefined;
 
   for (const block of msg.content) {
     if (block.type === 'text') {
@@ -1082,16 +1291,41 @@ Two reasons max, one phrase each.`;
       if (!m) continue;
       try {
         const parsed = JSON.parse(m[0]) as { worth_processing?: unknown; reasons?: unknown };
-        const worth = parsed.worth_processing === true;
+        // A JSON object without a boolean worth_processing (`{}`,
+        // `{"worth_processing": "true"}`) is NOT a verdict — fall through to
+        // the unparseable branch rather than coercing to a cacheable false.
+        if (typeof parsed.worth_processing !== 'boolean') continue;
+        const worth = parsed.worth_processing;
         const reasons = Array.isArray(parsed.reasons)
           ? parsed.reasons.filter((r): r is string => typeof r === 'string').slice(0, 4)
           : [];
-        return { worth_processing: worth, reasons };
+        return abnormalStop
+          ? { worth_processing: worth, reasons, unreliable: abnormalStop }
+          : { worth_processing: worth, reasons };
       } catch { /* fall through */ }
     }
   }
-  // Couldn't parse — default to NOT processing (cheap fallback).
-  return { worth_processing: false, reasons: ['judge response unparseable'] };
+  // Couldn't parse — default to NOT processing this cycle, but flag the
+  // result unreliable so it is never cached as a permanent verdict.
+  if (truncated) {
+    return {
+      worth_processing: false,
+      reasons: ['judge response truncated (stop_reason=max_tokens)'],
+      unreliable: 'truncated',
+    };
+  }
+  if (refused) {
+    return {
+      worth_processing: false,
+      reasons: ['judge response refused or content-filtered (stop_reason=refusal)'],
+      unreliable: 'refusal',
+    };
+  }
+  return {
+    worth_processing: false,
+    reasons: ['judge response unparseable'],
+    unreliable: 'unparseable',
+  };
 }
 
 // ── Subagent prompt ──────────────────────────────────────────────────
@@ -1245,7 +1479,7 @@ async function collectChildPutPageSlugs(
   // cycle's resolved source via SubagentHandlerData.source_id, and stamps
   // the SAME source here so reverseWriteRefs / provenance reads target the
   // correct (source_id, slug) row. Unset → legacy 'default'.
-  const rows = await engine.executeRaw<{ job_id: number; slug: string }>(
+  const rows = await engine.executeRaw<{ job_id: number | bigint; slug: string }>(
     `SELECT job_id,
             COALESCE(input->>'slug', (input #>> '{}')::jsonb->>'slug') AS slug
        FROM subagent_tool_executions
@@ -1259,10 +1493,13 @@ async function collectChildPutPageSlugs(
   const rewritten = new Map<string, string | undefined>();
   for (const r of rows) {
     if (typeof r.slug !== 'string' || r.slug.length === 0) continue;
-    const ci = chunkInfo.get(r.job_id);
+    // Postgres decodes the BIGINT FK as bigint; both metadata maps are keyed
+    // by the INTEGER minion job id represented as a JavaScript number.
+    const jobId = Number(r.job_id);
+    const ci = chunkInfo.get(jobId);
     const slug = ci ? rewriteChunkedSlug(r.slug, ci.hash6, ci.idx) : r.slug;
     if (!rewritten.has(slug) || rewritten.get(slug) === undefined) {
-      rewritten.set(slug, jobRawSource?.get(r.job_id));
+      rewritten.set(slug, jobRawSource?.get(jobId));
     }
   }
   return Array.from(rewritten.keys()).sort().map(slug => {
@@ -1272,29 +1509,73 @@ async function collectChildPutPageSlugs(
 }
 
 /**
- * D8: query for any `completed` legacy single-chunk job at the canonical
- * idempotency key shape `dream:synth:<filePath>:<hash16>`. Used at fan-out
- * time to detect transcripts that were synthesized under the pre-chunking
- * code path; those should NOT be re-submitted under chunked keys.
+ * D8: load every `completed` legacy job key in the pre-v2 path-based
+ * family `dream:synth:<filePath>:<hash16>[:c<i>of<n>]`. Used at fan-out
+ * time to detect transcripts already synthesized under an old key shape;
+ * those should NOT be re-submitted under v2 keys. (v2 keys start with
+ * `dream:synth-v2:` and don't match the LIKE prefix — the queue's own
+ * idempotency dedupe already covers them.)
  *
- * Reuses the existing `minion_jobs.idempotency_key` index — no schema
- * additions. One indexed lookup per worth-processing transcript.
+ * Plain `status = 'completed'` deliberately mirrors the queue-level
+ * idempotency semantics the legacy keys relied on: a completed job blocks
+ * re-submission regardless of `result.stop_reason` (pinned in
+ * test/minions.test.ts). Filtering on stop_reason here would re-pay for
+ * transcripts the old code path never re-ran, and reading `result` at all
+ * would need the `(result #>> '{}')` double-encoded-jsonb defense.
+ *
+ * Loads source-scoped completions once per phase; no schema additions
+ * and no repeated history scan for each transcript.
  */
-async function hasLegacySingleChunkCompletion(
+async function loadSuccessfulLegacySynthesisKeys(
   engine: BrainEngine,
+  sourceId: string,
+): Promise<string[]> {
+  const rows = await engine.executeRaw<{ idempotency_key: string }>(
+    `SELECT idempotency_key
+       FROM minion_jobs
+      WHERE name = 'subagent'
+        AND status = 'completed'
+        AND COALESCE(NULLIF(data->>'source_id', ''), 'default') = $1
+        AND idempotency_key LIKE 'dream:synth:%'`,
+    [sourceId],
+  );
+  return rows.map(row => row.idempotency_key);
+}
+
+/**
+ * Match a transcript (by filename + content hash) against completed legacy
+ * keys. `'single'` when a `dream:synth:<path>:<hash16>` completion exists;
+ * `'chunked'` when a FULL chunk set `:c0of<n>`..`:c<n-1>of<n>` completed
+ * (chunk indices are 0-based). Partial chunk sets return null so the
+ * transcript gets a fresh v2 synthesis instead of shipping with holes.
+ */
+function findLegacyCompletion(
+  successfulKeys: string[],
   filePath: string,
   hash16: string,
-): Promise<boolean> {
-  const legacyKey = `dream:synth:${filePath}:${hash16}`;
-  const rows = await engine.executeRaw<{ status: string }>(
-    `SELECT status
-       FROM minion_jobs
-      WHERE idempotency_key = $1
-        AND status = 'completed'
-      LIMIT 1`,
-    [legacyKey],
-  );
-  return rows.length > 0;
+): 'single' | 'chunked' | null {
+  const filename = basename(filePath);
+  const hashSuffix = `:${hash16}`;
+  /** total chunk count n → completed 0-based chunk indices */
+  const chunkSets = new Map<number, Set<number>>();
+  for (const key of successfulKeys) {
+    const chunk = /:c(\d+)of(\d+)$/.exec(key);
+    const base = chunk ? key.slice(0, -chunk[0].length) : key;
+    if (!base.endsWith(hashSuffix)) continue;
+    const historicalPath = base.slice('dream:synth:'.length, -hashSuffix.length);
+    if (basename(historicalPath) !== filename) continue;
+    if (!chunk) return 'single';
+    const i = Number(chunk[1]);
+    const n = Number(chunk[2]);
+    if (n < 1 || i < 0 || i >= n) continue;
+    let seen = chunkSets.get(n);
+    if (!seen) chunkSets.set(n, seen = new Set());
+    seen.add(i);
+  }
+  for (const [n, seen] of chunkSets) {
+    if (seen.size === n) return 'chunked';
+  }
+  return null;
 }
 
 // ── Dream-provenance DB stamp (#2569) ────────────────────────────────
@@ -1533,5 +1814,6 @@ export const __testing = {
   buildSynthesisPrompt,
   stampDreamProvenance,
   reverseWriteRefs,
-  runPgliteSubagentsInline,
+  runSubagentsInline,
+  loadSynthConfig,
 };

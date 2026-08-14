@@ -11,12 +11,15 @@
  *   pathToSlug()  →  convert file paths to page slugs
  */
 
-import { CJK_SLUG_CHARS } from './cjk.ts';
+import { SLUG_WORD_CHARS } from './cjk.ts';
 // v0.37.7.0 #1169 submodule-detection helpers. Bottom-of-file already
 // aliases existsSync as `_existsSync` for other purposes; the top-of-file
 // import keeps the pruneDir helper's deps near its callsite.
-import { existsSync, statSync } from 'fs';
-import { join as pathJoin } from 'path';
+import { existsSync, statSync, realpathSync } from 'fs';
+import { join as pathJoin, resolve as pathResolve } from 'path';
+import { execFileSync } from 'child_process';
+import type { BrainEngine } from './engine.ts';
+import { isUndefinedTableError } from './utils.ts';
 
 export interface SyncManifest {
   added: string[];
@@ -99,9 +102,80 @@ const CODE_EXTENSIONS = new Set<string>([
  * Input format (tab-separated):
  *   A       path/to/new-file.md
  *   M       path/to/modified-file.md
+ *   T       path/to/retyped-file.md      (file <-> symlink; content changed)
  *   D       path/to/deleted-file.md
  *   R100    old/path.md     new/path.md
+ *
+ * Status coverage, against the options gbrain actually passes (name-status with
+ * `-M` only, see `sync-delta.ts` — note NO `-C` copy detection):
+ *   A/M/D/R — the everyday statuses.
+ *   T       — TYPECHANGE. Reachable in normal operation: replacing a file with
+ *             a symlink (or vice versa) emits `T`, and it was silently dropped,
+ *             so the change never reached the index until something else
+ *             touched the path. Treated as `modified`: the path still exists and
+ *             its blob changed, which is exactly what re-import handles. (When a
+ *             file becomes a symlink, import-file SKIPS symlinks by design —
+ *             the exfil guard — so the old regular-file content stays indexed;
+ *             routing the typechange to delete-then-skip is a filed follow-up.)
+ *   C       — COPY. Unreachable without `-C`, handled defensively.
+ *   U       — UNMERGED. Only in a conflicted worktree, which sync does not run
+ *             against; handled defensively so a conflicted tree degrades to
+ *             "re-import this path" rather than silently skipping it.
+ *
+ * NOTE for future editors: git option names appear here WITHOUT the leading
+ * double-dash on purpose. The CLI flag-registry generator string-scans module
+ * source including comments, so a bare double-dash token in prose registers as
+ * a real, accepted CLI flag on every command that imports this file. Pinned by
+ * `test/cli-flag-validation.test.ts`.
  */
+/**
+ * Undo git's C-style path quoting.
+ *
+ * git quotes any path containing `"`, `\` or a control character, and it does
+ * so unconditionally: `core.quotepath=false` (buildGitInvocation in
+ * commands/sync.ts, #119) only suppresses octal-escaping of NON-ASCII bytes.
+ * A path like `people/Jason "Jay" Strand.md` therefore reaches
+ * buildSyncManifest as `"people/Jason \"Jay\" Strand.md"` — surrounding quotes
+ * included — so it ends `.md"`, fails isMarkdownFilePath(), and is dropped from
+ * the manifest with no error and no counter.
+ *
+ * Octal escapes are decoded as BYTES and utf-8 decoded once at the end: a
+ * single codepoint can span several \NNN escapes, so per-escape decoding
+ * produces mojibake.
+ *
+ * An unquoted path is returned unchanged, so this is a no-op for the common
+ * case.
+ */
+export function unquoteGitPath(raw: string): string {
+  if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) return raw;
+  const body = raw.slice(1, -1);
+  const simple: Record<string, number> = {
+    n: 10, t: 9, r: 13, '"': 34, '\\': 92, a: 7, b: 8, f: 12, v: 11,
+  };
+  const bytes: number[] = [];
+  let i = 0;
+  while (i < body.length) {
+    const c = body[i];
+    if (c === '\\' && i + 1 < body.length) {
+      const nxt = body[i + 1];
+      if (nxt in simple) {
+        bytes.push(simple[nxt]);
+        i += 2;
+        continue;
+      }
+      const trio = body.slice(i + 1, i + 4);
+      if (trio.length === 3 && /^[0-7]{3}$/.test(trio)) {
+        bytes.push(parseInt(trio, 8));
+        i += 4;
+        continue;
+      }
+    }
+    for (const b of new TextEncoder().encode(c)) bytes.push(b);
+    i += 1;
+  }
+  return new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+}
+
 export function buildSyncManifest(gitDiffOutput: string): SyncManifest {
   const manifest: SyncManifest = {
     added: [],
@@ -120,20 +194,30 @@ export function buildSyncManifest(gitDiffOutput: string): SyncManifest {
     if (parts.length < 2) continue;
 
     const action = parts[0];
-    const path = parts[parts.length === 3 ? 2 : 1]; // For renames, new path is 3rd column
 
+    // Unquote at the single point every path enters the manifest, so the
+    // extension filter and every downstream consumer (slug resolution, file
+    // reads) all see the real name. (#3897)
     if (action === 'A') {
-      manifest.added.push(path);
-    } else if (action === 'M') {
-      manifest.modified.push(path);
+      manifest.added.push(unquoteGitPath(parts[1]));
+    } else if (action === 'M' || action === 'T' || action === 'U') {
+      // T (typechange) and U (unmerged) both mean "this path exists and its
+      // content is not what we imported" — the same remedy as M.
+      manifest.modified.push(unquoteGitPath(parts[1]));
     } else if (action === 'D') {
-      manifest.deleted.push(parts[1]);
-    } else if (action.startsWith('R')) {
-      // Rename: R100\told-path\tnew-path
-      const oldPath = parts[1];
-      const newPath = parts[2];
+      manifest.deleted.push(unquoteGitPath(parts[1]));
+    } else if (action.startsWith('R') || action.startsWith('C')) {
+      // Rename/copy: R100\told-path\tnew-path. Copy is unreachable without -C,
+      // but if the flags ever change, the destination must still be imported.
+      const oldPath = unquoteGitPath(parts[1]);
+      const newPath = unquoteGitPath(parts[2]);
       if (oldPath && newPath) {
-        manifest.renamed.push({ from: oldPath, to: newPath });
+        if (action.startsWith('C')) {
+          // A copy leaves the source in place — only the destination is new.
+          manifest.added.push(newPath);
+        } else {
+          manifest.renamed.push({ from: oldPath, to: newPath });
+        }
       }
     }
   }
@@ -396,8 +480,10 @@ export function unsyncableReason(path: string, opts: SyncableOptions = {}): Sync
 
 /**
  * Character class for the lowercase-canonical form of a slug segment after
- * slugifySegment() has run. Lowercase letters, digits, dots, underscores,
- * hyphens. Exposed so adjacent code (e.g. takes-fence holder validation,
+ * slugifySegment() has run. Letters/numbers in any script (lowercase where
+ * the script has case — #3417), dots, underscores, hyphens. Uses \p{...}
+ * classes, so composed regexes need the `u` flag (this one carries it).
+ * Exposed so adjacent code (e.g. takes-fence holder validation,
  * v0.32 EXP-4) can reuse the actual repo slug grammar instead of inventing
  * a stricter parallel one and emitting false-positive warnings on legitimate
  * `companies/acme.io` / `people/foo_bar` slugs (codex review #3).
@@ -405,15 +491,18 @@ export function unsyncableReason(path: string, opts: SyncableOptions = {}): Sync
  * Pattern is the inner character class only (no anchors); callers wrap it
  * in `^...$` or compose it with prefixes like `(?:people|companies)/...`.
  */
-export const SLUG_SEGMENT_PATTERN = new RegExp(`[a-z0-9._\\-${CJK_SLUG_CHARS}]+`);
+export const SLUG_SEGMENT_PATTERN = new RegExp(`[${SLUG_WORD_CHARS}._\\-]+`, 'u');
 
 /**
  * Slugify a single path segment: lowercase, strip special chars, spaces → hyphens.
- * CJK ranges (Han / Hiragana / Katakana / Hangul Syllables) are preserved (v0.32.7).
- * NFC re-normalize after the NFD-strip-accents pass so Hangul Jamo recomposes back
- * into precomposed syllables that fall inside the whitelist.
+ * Letters and numbers from EVERY script are preserved (#3417): previously only
+ * Latin + CJK survived, so Hebrew/Arabic/Cyrillic/Greek/Thai/... filenames
+ * collapsed to empty segments and distinct files silently merged onto one slug.
+ * NFC re-normalize after the NFD-strip-accents pass so Hangul Jamo recomposes
+ * back into precomposed syllables, and so NFD filenames (macOS) and NFC
+ * filenames (Linux/git) of the same name produce the SAME slug.
  */
-const SLUGIFY_KEEP_RE = new RegExp(`[^a-z0-9.\\s_\\-${CJK_SLUG_CHARS}]`, 'g');
+const SLUGIFY_KEEP_RE = new RegExp(`[^${SLUG_WORD_CHARS}.\\s_\\-]`, 'gu');
 
 export function slugifySegment(segment: string): string {
   return segment
@@ -533,3 +622,155 @@ export type {
   SyncGateInput,
   SyncGateOutcome,
 } from './sync-failure-ledger.ts';
+
+/**
+ * #2114 — same-directory check for the global sync-anchor ownership guard.
+ * Best-effort realpath so symlinked spellings (macOS `/tmp` vs `/private/tmp`)
+ * and relative invocations compare as the same repo. `realpathSync.native`
+ * first: unlike the JS implementation it canonicalizes path CASE on
+ * case-insensitive filesystems (APFS `/users/x` vs `/Users/x`), so a
+ * case-variant spelling cannot false-refuse the user's own brain repo.
+ */
+export function sameRepoDir(a: string, b: string): boolean {
+  const norm = (p: string): string => {
+    const abs = pathResolve(p);
+    try {
+      return realpathSync.native(abs);
+    } catch {
+      // fall through
+    }
+    try {
+      return realpathSync(abs);
+    } catch {
+      return abs;
+    }
+  };
+  return norm(a) === norm(b);
+}
+
+export interface GlobalAnchorOwnership {
+  owns: boolean;
+  /** The path ownership was judged against (global key first, else the
+   * default source's local_path), or null when pathless. */
+  configured: string | null;
+  /** Existing pathless commit identity, when ownership could not be judged
+   * from a legacy persisted path. */
+  anchorCommit: string | null;
+}
+
+/**
+ * A shared brain may retain a Git bookmark but no checkout path. Prove that
+ * the candidate checkout contains that commit without persisting a new local
+ * path. Object membership (rather than ancestry) deliberately permits a
+ * rebased or force-pushed branch when the old bookmarked object is still in
+ * the repository.
+ */
+function repoContainsCommit(dir: string, commit: string): boolean {
+  // Accept both SHA-1 and SHA-256 object formats; reject arbitrary revisions.
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit)) return false;
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    // This is an ownership read, not a fetch. It must stay local and
+    // non-interactive even for a partial clone.
+    GIT_NO_LAZY_FETCH: '1',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    GCM_INTERACTIVE: 'never',
+    GIT_OPTIONAL_LOCKS: '0',
+  };
+  // Ambient repository/object-store overrides can make `git -C dir` inspect
+  // another checkout or borrow its objects. Strip every such selector before
+  // treating object membership as an ownership signal.
+  for (const key of [
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_INDEX_FILE',
+    'GIT_SHALLOW_FILE',
+    'GIT_REPLACE_REF_BASE',
+  ]) {
+    delete env[key];
+  }
+  try {
+    execFileSync('git', ['-C', dir, 'cat-file', '-e', `${commit}^{commit}`], {
+      stdio: 'ignore',
+      timeout: 30_000,
+      env,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #2114 — may an import/sync of `dir` move the GLOBAL sync anchors
+ * (`sync.repo_path` / `sync.last_commit`)?
+ *
+ * The globals describe THE brain repo — the default source's working tree
+ * (source-resolver.ts documents `sync.repo_path` as the legacy pre-v0.18
+ * default-source key; migration v16 seeds the `default` source row FROM it).
+ * Ownership therefore requires BOTH:
+ *   1. the operation resolves to the default source (or the legacy
+ *      no-sourceId path, which is default-by-definition), AND
+ *   2. `dir` matches the brain repo's configured identity — the global key
+ *      when set, else the default source row's `local_path` when set, else
+ *      membership of the existing commit bookmark in the candidate repo.
+ *      The commit fallback preserves ownership without persisting a client
+ *      checkout path in shared state.
+ * Only when neither path nor commit identity exists is this a fresh brain,
+ * and bootstrap is allowed.
+ */
+export async function ownsGlobalSyncAnchor(
+  engine: BrainEngine,
+  sourceId: string | undefined,
+  dir: string,
+): Promise<GlobalAnchorOwnership> {
+  if (sourceId && sourceId !== 'default') {
+    return { owns: false, configured: null, anchorCommit: null };
+  }
+  const globalPath = await engine.getConfig('sync.repo_path');
+  if (globalPath) {
+    return { owns: sameRepoDir(globalPath, dir), configured: globalPath, anchorCommit: null };
+  }
+  const globalCommit = await engine.getConfig('sync.last_commit');
+  // Global unset — the brain identity may still live on the default source
+  // row (modern sync writes anchors there). Best-effort: a query failure
+  // still permits the global commit fallback on pre-sources-table brains.
+  let defaultCommit: string | null = null;
+  try {
+    const rows = await engine.executeRaw<{
+      local_path: string | null;
+      last_commit: string | null;
+    }>(
+      `SELECT local_path, last_commit FROM sources WHERE id = 'default'`,
+    );
+    const defaultLocal = rows[0]?.local_path ?? null;
+    if (defaultLocal) {
+      return {
+        owns: sameRepoDir(defaultLocal, dir),
+        configured: defaultLocal,
+        anchorCommit: null,
+      };
+    }
+    defaultCommit = rows[0]?.last_commit ?? null;
+  } catch (error) {
+    // Only a genuinely pre-sources-table brain may use the global fallback.
+    // Connection, permission, timeout, and other database errors must fail
+    // closed rather than masquerading as a fresh brain.
+    if (!isUndefinedTableError(error)) throw error;
+  }
+  const anchorCommit = sourceId === 'default'
+    ? defaultCommit ?? globalCommit
+    : globalCommit ?? defaultCommit;
+  if (anchorCommit) {
+    return {
+      owns: repoContainsCommit(dir, anchorCommit),
+      configured: null,
+      anchorCommit,
+    };
+  }
+  return { owns: true, configured: null, anchorCommit: null };
+}
